@@ -100,6 +100,15 @@ def test_schema_numeric_overflow_is_reported_as_value_error():
     to_jsonable(oversized)
 
 
+def test_schema_rejects_integer_leaves_that_json_cannot_encode():
+  oversized = 10**10000
+
+  with pytest.raises(ValueError, match="JSON"):
+    _object(metadata={"oversized": oversized})
+  with pytest.raises(ValueError, match="JSON"):
+    to_jsonable(oversized)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -373,9 +382,17 @@ def test_schema_mappings_reject_non_string_keys_consistently(build):
     build()
 
 
-@pytest.mark.parametrize("path", [{"a", "b"}, frozenset(("a", "b")), iter(("a", "b"))])
+@pytest.mark.parametrize(
+    "path",
+    [
+        {"a", "b"},
+        frozenset(("a", "b")),
+        iter(("a", "b")),
+        np.array(["a", "b"]),
+    ],
+)
 def test_ground_truth_rejects_unordered_or_non_sequence_propagation_paths(path):
-  with pytest.raises(TypeError, match="ordered sequence"):
+  with pytest.raises(ValueError, match="ordered sequence"):
     GroundTruth(
         graph_delta=GraphEdgeDelta(),
         propagation_path={"b": path},

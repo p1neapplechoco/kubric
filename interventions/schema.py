@@ -14,7 +14,7 @@ import numbers
 from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping, Optional, Tuple
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 
 SCHEMA_VERSION = "1.0"
@@ -40,6 +40,15 @@ def _validate_mapping_keys(value: Mapping[Any, Any]) -> None:
     raise ValueError("mapping keys must be strings")
 
 
+def _json_integer(value: numbers.Integral) -> int:
+  result = int(value)
+  try:
+    json.dumps(result)
+  except (TypeError, ValueError, OverflowError) as error:
+    raise ValueError("integer is not JSON-encodable") from error
+  return result
+
+
 def to_jsonable(value: Any) -> Any:
   """Recursively converts schemas and common containers to JSON-safe values.
 
@@ -55,7 +64,7 @@ def to_jsonable(value: Any) -> Any:
   if value is None or isinstance(value, (str, bool)):
     return value
   if isinstance(value, numbers.Integral):
-    return int(value)
+    return _json_integer(value)
   if isinstance(value, numbers.Real):
     try:
       result = float(value)
@@ -134,7 +143,10 @@ def _real(value: Any, name: str) -> float:
 def _integer(value: Any, name: str) -> int:
   if isinstance(value, bool) or not isinstance(value, numbers.Integral):
     raise TypeError("{} must be an integer".format(name))
-  return int(value)
+  try:
+    return _json_integer(value)
+  except ValueError as error:
+    raise ValueError("{} must be JSON-encodable".format(name)) from error
 
 
 def _vector(value: Any, length: int, name: str) -> Tuple[float, ...]:
@@ -535,7 +547,9 @@ def _affected_ids(value: Iterable[str], name: str) -> Tuple[str, ...]:
   return tuple(sorted(normalized))
 
 
-def _propagation_paths(value: Mapping[str, Iterable[str]]) -> Mapping[str, Tuple[str, ...]]:
+def _propagation_paths(
+    value: Mapping[str, Sequence[str]],
+) -> Mapping[str, Tuple[str, ...]]:
   if not isinstance(value, Mapping):
     raise TypeError("propagation_path must be a mapping")
   _validate_mapping_keys(value)
@@ -544,7 +558,7 @@ def _propagation_paths(value: Mapping[str, Iterable[str]]) -> Mapping[str, Tuple
     normalized_key = _nonempty_string(key, "propagation_path key")
     path = value[key]
     if isinstance(path, (str, bytes)) or not isinstance(path, SequenceABC):
-      raise TypeError("propagation paths must be an ordered sequence, not a string")
+      raise ValueError("propagation paths must be an ordered sequence, not a string")
     normalized_path = tuple(
         _nonempty_string(item, "propagation path item") for item in path
     )
@@ -554,12 +568,16 @@ def _propagation_paths(value: Mapping[str, Iterable[str]]) -> Mapping[str, Tuple
 
 @dataclass(frozen=True)
 class GroundTruth(_SchemaMixin):
-  """Expected graph changes, affected objects, and ordered propagation paths."""
+  """Expected graph changes, affected objects, and ordered propagation paths.
+
+  Each ``propagation_path`` value must be an ordered non-string ``Sequence``;
+  generators, sets, and NumPy arrays are rejected.
+  """
 
   graph_delta: GraphEdgeDelta
   hard_affected: Tuple[str, ...] = ()
   soft_affected: Tuple[str, ...] = ()
-  propagation_path: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+  propagation_path: Mapping[str, Sequence[str]] = field(default_factory=dict)
   schema_version: str = SCHEMA_VERSION
 
   def __post_init__(self) -> None:

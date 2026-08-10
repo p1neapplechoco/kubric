@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import numbers
+import warnings
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
@@ -202,12 +203,26 @@ def build_path(
   positions = source[:, :3]
   if method == "linear":
     output_positions = _linear_interpolate(source_times, positions, output_times)
+  elif len(source) == 2:
+    output_positions = _linear_interpolate(source_times, positions, output_times)
   else:
     try:
       from scipy.interpolate import CubicSpline
     except ImportError as error:  # pragma: no cover - exercised only without SciPy.
       raise ImportError("method='spline' requires SciPy") from error
-    output_positions = CubicSpline(source_times, positions, axis=0)(output_times)
+    scales = np.max(np.abs(positions), axis=0)
+    safe_scales = np.where(scales == 0.0, 1.0, scales)
+    scaled_positions = positions / safe_scales
+    try:
+      with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        scaled_output = CubicSpline(
+            source_times, scaled_positions, axis=0
+        )(output_times)
+    except (FloatingPointError, RuntimeWarning, ValueError) as error:
+      raise ValueError("spline interpolation failed") from error
+    with np.errstate(over="ignore", invalid="ignore"):
+      output_positions = scaled_output * safe_scales
 
   if source.shape[1] == 3:
     result = np.asarray(output_positions, dtype=float)
@@ -296,15 +311,19 @@ def _segment_intersects_aabb(
     end_value = float(end[axis])
     minimum_value = float(minimum[axis])
     maximum_value = float(maximum[axis])
+    segment_minimum = min(start_value, end_value)
+    segment_maximum = max(start_value, end_value)
+    if segment_maximum < minimum_value or segment_minimum > maximum_value:
+      return False
     if start_value == end_value:
-      if start_value < minimum_value or start_value > maximum_value:
-        return False
       continue
+    clipped_minimum = max(minimum_value, segment_minimum)
+    clipped_maximum = min(maximum_value, segment_maximum)
     scale = max(
         abs(start_value),
         abs(end_value),
-        abs(minimum_value),
-        abs(maximum_value),
+        abs(clipped_minimum),
+        abs(clipped_maximum),
     )
     if scale == 0.0:
       continue
@@ -312,13 +331,9 @@ def _segment_intersects_aabb(
     scaled_end = end_value / scale
     delta = scaled_end - scaled_start
     if delta == 0.0:
-      if max(start_value, end_value) < minimum_value:
-        return False
-      if min(start_value, end_value) > maximum_value:
-        return False
       continue
-    first = (minimum_value / scale - scaled_start) / delta
-    second = (maximum_value / scale - scaled_start) / delta
+    first = (clipped_minimum / scale - scaled_start) / delta
+    second = (clipped_maximum / scale - scaled_start) / delta
     entry = max(entry, min(first, second))
     exit_ = min(exit_, max(first, second))
     if entry > exit_:
@@ -332,6 +347,8 @@ def _validate_geometry(
     static_aabbs: np.ndarray,
     clearance: float,
 ) -> None:
+  if not np.isfinite(positions).all():
+    raise ValueError("path positions must be finite")
   if bounds is not None:
     if np.any(positions < bounds[0]) or np.any(positions > bounds[1]):
       raise ValueError("path positions fall outside bounds")
@@ -487,9 +504,10 @@ def _spatial_candidate(
     profile = np.sin(np.pi * times) ** 2
   else:  # maintain_contact
     profile = np.sin(np.pi * times)
-  displacement = amplitude * profile[:, None] * direction[None, :]
   result = np.array(path, dtype=float, copy=True)
-  result[:, :3] += displacement
+  with np.errstate(over="ignore", invalid="ignore"):
+    displacement = amplitude * profile[:, None] * direction[None, :]
+    result[:, :3] = result[:, :3] + displacement
   result[0] = path[0]
   result[-1] = path[-1]
   return result

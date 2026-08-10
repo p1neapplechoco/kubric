@@ -66,6 +66,27 @@ def test_build_spline_path_preserves_waypoints_endpoints():
   assert np.isfinite(path).all()
 
 
+def test_build_two_waypoint_spline_uses_overflow_safe_linear_interpolation():
+  waypoints = np.array([[1e308, 0.0, 0.0], [-1e308, 0.0, 0.0]])
+
+  spline = build_path(waypoints, 5, method="spline")
+  linear = build_path(waypoints, 5, method="linear")
+
+  assert np.isfinite(spline).all()
+  np.testing.assert_array_equal(spline, linear)
+
+
+def test_build_spline_scales_three_extreme_waypoints_before_interpolation():
+  waypoints = np.array(
+      [[1e308, 0.0, 0.0], [0.0, 1.0, 0.0], [-1e308, 0.0, 0.0]]
+  )
+
+  path = build_path(waypoints, 7, method="spline")
+
+  assert np.isfinite(path).all()
+  np.testing.assert_array_equal(path[[0, -1]], waypoints[[0, -1]])
+
+
 @pytest.mark.parametrize("method", ["linear", "spline"])
 def test_build_pose_path_uses_unit_sign_continuous_quaternions(method):
   root_half = np.sqrt(0.5)
@@ -186,6 +207,21 @@ def test_validate_path_rejects_segment_crossing_static_aabb():
     )
 
 
+def test_extreme_segment_aabb_test_avoids_false_positive():
+  path = np.array([[0.0, 0.0, 0.0], [1e-320, 1.0, 0.0]])
+  aabb = ((5e-321, -0.1, -1.0), (1e308, 0.1, 1.0))
+
+  validate_path(path, static_aabbs=(aabb,))
+
+
+def test_extreme_segment_aabb_test_avoids_false_negative():
+  path = np.array([[-1e-200, 0.0, -1e100], [1.0, 0.0, 1e308]])
+  aabb = ((-1e300, -1.0, -5e-324), (1e-320, 1.0, 1e-200))
+
+  with pytest.raises(ValueError, match="AABB"):
+    validate_path(path, static_aabbs=(aabb,))
+
+
 def test_perturb_path_raises_when_no_collision_free_candidate_exists():
   factual = _curved_path(5)
   enclosing_box = (((-2.0, -2.0, -2.0), (2.0, 2.0, 2.0)),)
@@ -295,6 +331,27 @@ def test_spatial_perturbation_normalizes_huge_finite_rng_direction():
 
   assert np.isfinite(perturbed).all()
   assert max_position_deviation(factual, perturbed) == pytest.approx(0.1)
+
+
+def test_spatial_candidate_overflow_resamples_without_runtime_warning():
+  class PositiveXRng:
+    def normal(self, size):
+      assert size == 3
+      return np.array([1.0, 0.0, 0.0])
+
+    def uniform(self, *unused_args):
+      return 1.0
+
+  factual = np.array([[0.0, 0.0, 0.0], [1e308, 0.0, 0.0], [0.0, 0.0, 0.0]])
+
+  with pytest.raises(ValueError, match="max_attempts"):
+    perturb_path(
+        factual,
+        "remove_collision",
+        1e308,
+        PositiveXRng(),
+        max_attempts=2,
+    )
 
 
 @pytest.mark.parametrize(
