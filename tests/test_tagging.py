@@ -57,15 +57,12 @@ def test_derive_tags_identifies_environment_only_delta():
   assert tags == ("contact_added", "environment_only", "target_only")
 
 
-def test_derive_tags_target_only_allows_target_incident_non_environment_delta():
+def test_derive_tags_target_only_rejects_target_incident_dynamic_delta():
   truth = GroundTruth(
       graph_delta=GraphEdgeDelta(removed=(_edge("target", "object"),)),
   )
 
-  assert derive_tags(truth, target_id="target") == (
-      "contact_removed",
-      "target_only",
-  )
+  assert derive_tags(truth, target_id="target") == ("contact_removed",)
 
 
 def test_derive_tags_target_only_rejects_non_environment_edge_away_from_target():

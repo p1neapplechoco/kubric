@@ -1,11 +1,14 @@
 """Tests for simulator-independent contact and state logging."""
 
+import io
 import json
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+import interventions.logging as logging_module
 from interventions.logging import (
     ANGULAR_VELOCITY_SLICE,
     LINEAR_VELOCITY_SLICE,
@@ -193,6 +196,10 @@ def test_simulation_log_defensively_copies_and_freezes_arrays_and_metadata():
   assert not log.commanded_path.flags.writeable
   with pytest.raises(ValueError):
     log.states[0, 0, 0] = 1
+  with pytest.raises(ValueError):
+    log.states.setflags(write=True)
+  with pytest.raises(ValueError):
+    log.commanded_path.setflags(write=True)
   with pytest.raises(TypeError):
     log.metadata["new"] = 1
   assert state_index("position") == POSITION_SLICE == slice(0, 3)
@@ -224,6 +231,41 @@ def test_simulation_log_rejects_invalid_alignment_and_values(overrides):
     _simulation_log(**overrides)
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"object_ids": {"a", "b"}},
+        {"object_ids": frozenset(("a", "b"))},
+        {"steps": {2, 3, 5}},
+        {"steps": frozenset((2, 3, 5))},
+    ],
+)
+def test_simulation_log_rejects_unordered_object_and_step_associations(overrides):
+  with pytest.raises((TypeError, ValueError), match="ordered"):
+    _simulation_log(**overrides)
+
+
+@pytest.mark.parametrize(
+    "states",
+    [
+        _states().astype(str),
+        _states().astype(object),
+    ],
+)
+def test_simulation_log_rejects_nonnumeric_source_dtypes(states):
+  with pytest.raises((TypeError, ValueError), match="numeric|real"):
+    _simulation_log(states=states)
+
+
+def test_simulation_log_rejects_nonnumeric_commanded_path_dtype():
+  path = np.array(
+      [[0, 0, 0], [0.5, 0, 0], [1, 0, 0]], dtype=float
+  ).astype(str)
+
+  with pytest.raises((TypeError, ValueError), match="numeric|real"):
+    _simulation_log(commanded_path=path)
+
+
 def test_simulation_log_roundtrip_and_overwrite_refusal(tmp_path):
   log = _simulation_log()
   directory = tmp_path / "artifact"
@@ -243,12 +285,94 @@ def test_simulation_log_roundtrip_and_overwrite_refusal(tmp_path):
   metadata = json.loads((directory / "metadata.json").read_text())
   assert metadata["schema_version"] == "1.0"
   assert json.loads((directory / "contacts.jsonl").read_text()) == log.contacts[0].to_dict()
+  before_refusal = {
+      filename: (directory / filename).read_bytes()
+      for filename in ("contacts.jsonl", "states.npy", "metadata.json")
+  }
   with pytest.raises(FileExistsError):
     write_simulation_log(log, directory)
+  assert before_refusal == {
+      filename: (directory / filename).read_bytes()
+      for filename in before_refusal
+  }
+  assert sorted(path.name for path in directory.iterdir()) == [
+      "contacts.jsonl",
+      "metadata.json",
+      "states.npy",
+  ]
 
   replacement = _simulation_log(branch="counterfactual", contacts=())
   write_simulation_log(replacement, directory, overwrite=True)
   assert read_simulation_log(directory).branch == "counterfactual"
+
+
+def test_states_npy_is_deterministic_across_input_memory_layouts(tmp_path):
+  values = _states()
+  c_log = _simulation_log(states=np.ascontiguousarray(values), contacts=())
+  f_log = _simulation_log(states=np.asfortranarray(values), contacts=())
+
+  c_directory = write_simulation_log(c_log, tmp_path / "c")
+  f_directory = write_simulation_log(f_log, tmp_path / "f")
+
+  assert (c_directory / "states.npy").read_bytes() == (
+      f_directory / "states.npy"
+  ).read_bytes()
+
+
+def test_write_simulation_log_finalizes_each_temp_file_with_replace(
+    tmp_path, monkeypatch
+):
+  replacements = []
+  real_replace = logging_module.os.replace
+
+  def tracked_replace(source, destination):
+    replacements.append((Path(source), Path(destination)))
+    return real_replace(source, destination)
+
+  monkeypatch.setattr(logging_module.os, "replace", tracked_replace)
+  directory = tmp_path / "artifact"
+
+  write_simulation_log(_simulation_log(), directory)
+
+  assert [destination.name for _, destination in replacements] == [
+      "contacts.jsonl",
+      "states.npy",
+      "metadata.json",
+  ]
+  assert all(source.parent == directory for source, _ in replacements)
+  assert all(source.name.startswith(".") for source, _ in replacements)
+  assert all(source != destination for source, destination in replacements)
+
+
+@pytest.mark.parametrize("corruption", ["trailing", "concatenated"])
+def test_read_simulation_log_rejects_bytes_after_npy_payload(tmp_path, corruption):
+  directory = write_simulation_log(_simulation_log(), tmp_path / corruption)
+  states_path = directory / "states.npy"
+  if corruption == "trailing":
+    extra = b"trailing bytes"
+  else:
+    stream = io.BytesIO()
+    np.save(stream, _states(), allow_pickle=False)
+    extra = stream.getvalue()
+  with states_path.open("ab") as stream:
+    stream.write(extra)
+
+  with pytest.raises(ValueError, match="trailing|payload"):
+    read_simulation_log(directory)
+
+
+@pytest.mark.parametrize("dtype", [str, object])
+def test_read_simulation_log_rejects_nonnumeric_or_pickled_states(
+    tmp_path, dtype
+):
+  directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
+  states_path = directory / "states.npy"
+  values = _states().astype(dtype)
+  with states_path.open("wb") as stream:
+    np.save(stream, values, allow_pickle=dtype is object)
+
+  with pytest.raises(ValueError, match="numeric|object|NumPy"):
+    read_simulation_log(directory)
 
 
 def test_read_simulation_log_rejects_corrupt_artifacts(tmp_path):

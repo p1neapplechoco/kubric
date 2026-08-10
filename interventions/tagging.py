@@ -59,22 +59,15 @@ def derive_tags(
     tags.add("cascade")
 
   no_affected = not ground_truth.hard_affected and not ground_truth.soft_affected
-  has_non_environment_edge_away_from_target = any(
-      target not in (record["object_a"], record["object_b"])
-      and not (
-          record["object_a"] in environment
-          and record["object_b"] in environment
-      )
-      for record in records
-  )
-  if no_affected and not has_non_environment_edge_away_from_target:
-    tags.add("target_only")
-
-  if records and all(
+  only_target_or_environment_endpoints = all(
       endpoint == target or endpoint in environment
       for record in records
       for endpoint in (record["object_a"], record["object_b"])
-  ):
+  )
+  if no_affected and only_target_or_environment_endpoints:
+    tags.add("target_only")
+
+  if records and only_target_or_environment_endpoints:
     tags.add("environment_only")
   if not records and no_affected:
     tags.add("null_effect")

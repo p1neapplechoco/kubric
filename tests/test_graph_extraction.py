@@ -125,7 +125,7 @@ def test_aggregate_zero_force_fallback_is_finite_and_order_independent():
 
   assert forward == reverse
   assert forward[0].position == pytest.approx((1.0, 0.0, 0.0))
-  assert np.isfinite(forward[0].normal).all()
+  assert forward[0].normal == (0.0, 0.0, 0.0)
 
 
 def test_contact_log_to_temporal_graph_collapses_consecutive_thresholded_steps():
@@ -258,6 +258,40 @@ def test_temporal_reachability_chooses_earliest_then_shortest_lexical_path():
   assert paths["destination"] == ("target", "a", "c", "destination")
 
 
+def test_temporal_reachability_preserves_later_shorter_intermediate_label():
+  graph = _graph(
+      _edge("target", "x", 0),
+      _edge("x", "a", 0),
+      _edge("target", "a", 1),
+      _edge("a", "d", 2),
+  )
+
+  affected, paths = temporal_reachability(
+      graph, TemporalGraph(), "target", intervention_start=0
+  )
+
+  assert affected == ("a", "d", "x")
+  assert paths["a"] == ("target", "x", "a")
+  assert paths["d"] == ("target", "a", "d")
+
+
+def test_temporal_reachability_preserves_later_lexical_tie_label():
+  graph = _graph(
+      _edge("target", "z", 0),
+      _edge("z", "a", 0),
+      _edge("target", "b", 1),
+      _edge("b", "a", 1),
+      _edge("a", "d", 2),
+  )
+
+  _, paths = temporal_reachability(
+      graph, TemporalGraph(), "target", intervention_start=0
+  )
+
+  assert paths["a"] == ("target", "z", "a")
+  assert paths["d"] == ("target", "b", "a", "d")
+
+
 def test_state_affected_uses_thresholds_and_sign_invariant_quaternions():
   object_ids = ("target", "a", "b")
   factual_states = _states(2, 3)
@@ -308,6 +342,20 @@ def test_state_affected_detects_quaternion_angle_but_ignores_sign_only():
   assert state_affected(
       factual, counterfactual, "target", quaternion_epsilon=0.01
   ) == ("a",)
+
+
+def test_state_affected_normalizes_accepted_quaternions_before_angle():
+  factual_states = _states(1, 2)
+  counterfactual_states = factual_states.copy()
+  quaternion = (0.9999995, 0.0, 0.0, 0.0)
+  factual_states[0, 1, QUATERNION_INDEX] = quaternion
+  counterfactual_states[0, 1, QUATERNION_INDEX] = quaternion
+  factual = _log("factual", ("target", "a"), (0,), states=factual_states)
+  counterfactual = _log(
+      "counterfactual", ("target", "a"), (0,), states=counterfactual_states
+  )
+
+  assert state_affected(factual, counterfactual, "target") == ()
 
 
 def test_state_affected_rejects_misaligned_logs_and_invalid_thresholds():

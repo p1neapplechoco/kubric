@@ -281,10 +281,6 @@ def _aggregate_normal(
   normalized = _normalized(weighted)
   if normalized is not None:
     return normalized  # type: ignore[return-value]
-  for normal in sorted(tuple(tuple(item) for item in normals)):
-    normalized = _normalized(normal)
-    if normalized is not None:
-      return normalized  # type: ignore[return-value]
   return (0.0, 0.0, 0.0)
 
 
@@ -485,16 +481,19 @@ def temporal_reachability(
   for edges in adjacency.values():
     edges.sort(key=lambda edge: edge.identity)
 
-  # Rank is arrival time, path length, then full lexicographic path.
-  best: Dict[str, Tuple[int, int, Tuple[str, ...]]] = {
-      target: (start, 0, (target,))
+  # A later-but-shorter label can yield the best path after a future contact,
+  # so retain every nondominated (arrival, hops, path) label at each node.
+  initial_label = (start, 0, (target,))
+  labels: Dict[str, set[Tuple[int, int, Tuple[str, ...]]]] = {
+      target: {initial_label}
   }
   queue: List[Tuple[int, int, Tuple[str, ...], str]] = [
       (start, 0, (target,), target)
   ]
   while queue:
     arrival, hops, path, node = heapq.heappop(queue)
-    if best.get(node) != (arrival, hops, path):
+    label = (arrival, hops, path)
+    if label not in labels.get(node, set()):
       continue
     for edge in adjacency.get(node, ()):
       other = edge.object_b if node == edge.object_a else edge.object_a
@@ -503,16 +502,37 @@ def temporal_reachability(
         continue
       candidate_path = path + (other,)
       candidate = (contact_time, hops + 1, candidate_path)
-      if other not in best or candidate < best[other]:
-        best[other] = candidate
-        heapq.heappush(
-            queue,
-            (contact_time, hops + 1, candidate_path, other),
-        )
+      other_labels = labels.setdefault(other, set())
+      if any(_label_dominates(existing, candidate) for existing in other_labels):
+        continue
+      dominated = {
+          existing for existing in other_labels
+          if _label_dominates(candidate, existing)
+      }
+      other_labels.difference_update(dominated)
+      other_labels.add(candidate)
+      heapq.heappush(
+          queue,
+          (contact_time, hops + 1, candidate_path, other),
+      )
 
-  affected = tuple(sorted(node for node in best if node != target))
-  paths = MappingProxyType({node: best[node][2] for node in affected})
+  affected = tuple(sorted(node for node in labels if node != target))
+  paths = MappingProxyType({
+      node: min(labels[node])[2] for node in affected
+  })
   return affected, paths
+
+
+def _label_dominates(
+    left: Tuple[int, int, Tuple[str, ...]],
+    right: Tuple[int, int, Tuple[str, ...]],
+) -> bool:
+  """Returns whether ``left`` can safely replace ``right`` downstream."""
+  if left[0] > right[0] or left[1] > right[1]:
+    return False
+  if left[1] == right[1] and left[2] > right[2]:
+    return False
+  return True
 
 
 def _distance(left: np.ndarray, right: np.ndarray) -> float:
@@ -584,7 +604,14 @@ def state_affected(
           float(left) * float(right)
           for left, right in zip(factual_quaternion, counterfactual_quaternion)
       )
-      quaternion_distance = 2.0 * math.acos(min(1.0, abs(dot)))
+      factual_norm = math.hypot(*(float(item) for item in factual_quaternion))
+      counterfactual_norm = math.hypot(
+          *(float(item) for item in counterfactual_quaternion)
+      )
+      normalized_dot = dot / (factual_norm * counterfactual_norm)
+      quaternion_distance = 2.0 * math.acos(
+          min(1.0, abs(normalized_dot))
+      )
       if (
           position_distance > position_threshold
           or linear_distance > velocity_threshold

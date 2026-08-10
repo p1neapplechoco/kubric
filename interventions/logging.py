@@ -116,15 +116,19 @@ def _float_array(value: Any, name: str) -> np.ndarray:
     untyped = np.asarray(value)
   except (TypeError, ValueError, OverflowError) as error:
     raise ValueError("{} must be a numeric array".format(name)) from error
-  if np.iscomplexobj(untyped):
-    raise ValueError("{} must contain real values".format(name))
+  if (
+      not np.issubdtype(untyped.dtype, np.number)
+      or np.issubdtype(untyped.dtype, np.complexfloating)
+  ):
+    raise ValueError("{} must contain real numeric values".format(name))
   try:
-    array = np.array(untyped, dtype=float, copy=True)
+    canonical = np.array(untyped, dtype=np.float64, order="C", copy=True)
   except (TypeError, ValueError, OverflowError) as error:
     raise ValueError("{} must be a numeric array".format(name)) from error
-  if not np.isfinite(array).all():
+  if not np.isfinite(canonical).all():
     raise ValueError("{} must contain only finite values".format(name))
-  return array
+  immutable = canonical.tobytes(order="C")
+  return np.frombuffer(immutable, dtype=np.float64).reshape(canonical.shape)
 
 
 def _validate_unit_quaternions(quaternions: np.ndarray, name: str) -> None:
@@ -315,7 +319,7 @@ class SimulationLog:
 
   def __post_init__(self) -> None:
     branch = _identifier(self.branch, "branch")
-    if isinstance(self.object_ids, (str, bytes)):
+    if isinstance(self.object_ids, (str, bytes, set, frozenset)):
       raise TypeError("object_ids must be an ordered iterable")
     try:
       object_ids = tuple(
@@ -326,7 +330,7 @@ class SimulationLog:
     if len(set(object_ids)) != len(object_ids):
       raise ValueError("object_ids must be unique")
 
-    if isinstance(self.steps, (str, bytes)):
+    if isinstance(self.steps, (str, bytes, set, frozenset)):
       raise TypeError("steps must be an ordered iterable")
     try:
       steps = tuple(_integer(item, "step") for item in self.steps)
@@ -522,8 +526,11 @@ def read_simulation_log(
   try:
     with (source / "states.npy").open("rb") as stream:
       states = np.load(stream, allow_pickle=False)
+      trailing_payload = stream.read(1)
   except (TypeError, ValueError, OSError) as error:
     raise ValueError("states.npy is not a valid numeric NumPy array") from error
+  if trailing_payload:
+    raise ValueError("states.npy contains a trailing payload")
   if not isinstance(states, np.ndarray) or states.dtype.hasobject:
     raise ValueError("states.npy must contain one non-object NumPy array")
 
