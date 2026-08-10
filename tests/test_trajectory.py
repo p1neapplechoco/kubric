@@ -222,6 +222,21 @@ def test_extreme_segment_aabb_test_avoids_false_negative():
     validate_path(path, static_aabbs=(aabb,))
 
 
+def test_near_endpoint_slab_rounding_does_not_create_false_intersection():
+  path = np.array([[1.0, 0.0, -1.0], [0.0, 0.0, 1e-18]])
+  aabb = ((0.0, -1.0, -1.0), (1e-20, 1.0, 0.0))
+
+  validate_path(path, static_aabbs=(aabb,))
+
+
+def test_near_endpoint_slab_fallback_keeps_true_intersection():
+  path = np.array([[1.0, 0.0, -1.0], [0.0, 0.0, 1e-18]])
+  aabb = ((0.0, -1.0, -1.0), (1e-17, 1.0, 0.0))
+
+  with pytest.raises(ValueError, match="AABB"):
+    validate_path(path, static_aabbs=(aabb,))
+
+
 def test_perturb_path_raises_when_no_collision_free_candidate_exists():
   factual = _curved_path(5)
   enclosing_box = (((-2.0, -2.0, -2.0), (2.0, 2.0, 2.0)),)

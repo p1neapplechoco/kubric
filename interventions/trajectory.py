@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import numbers
 import warnings
+from fractions import Fraction
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional
 
@@ -331,9 +332,46 @@ def _segment_intersects_aabb(
     scaled_end = end_value / scale
     delta = scaled_end - scaled_start
     if delta == 0.0:
-      continue
+      return _segment_intersects_aabb_exact(start, end, minimum, maximum)
     first = (clipped_minimum / scale - scaled_start) / delta
     second = (clipped_maximum / scale - scaled_start) / delta
+    entry = max(entry, min(first, second))
+    exit_ = min(exit_, max(first, second))
+    if entry > exit_:
+      if _slab_comparison_is_ambiguous(entry, exit_):
+        return _segment_intersects_aabb_exact(start, end, minimum, maximum)
+      return False
+  if _slab_comparison_is_ambiguous(entry, exit_):
+    return _segment_intersects_aabb_exact(start, end, minimum, maximum)
+  return True
+
+
+def _slab_comparison_is_ambiguous(entry: float, exit_: float) -> bool:
+  tolerance = 4.0 * max(math.ulp(entry), math.ulp(exit_))
+  return abs(entry - exit_) <= tolerance
+
+
+def _segment_intersects_aabb_exact(
+    start: np.ndarray,
+    end: np.ndarray,
+    minimum: np.ndarray,
+    maximum: np.ndarray,
+) -> bool:
+  """Evaluates a numerically ambiguous slab comparison as exact float ratios."""
+  entry = Fraction(0)
+  exit_ = Fraction(1)
+  for axis in range(3):
+    start_value = Fraction.from_float(float(start[axis]))
+    end_value = Fraction.from_float(float(end[axis]))
+    minimum_value = Fraction.from_float(float(minimum[axis]))
+    maximum_value = Fraction.from_float(float(maximum[axis]))
+    delta = end_value - start_value
+    if delta == 0:
+      if start_value < minimum_value or start_value > maximum_value:
+        return False
+      continue
+    first = (minimum_value - start_value) / delta
+    second = (maximum_value - start_value) / delta
     entry = max(entry, min(first, second))
     exit_ = min(exit_, max(first, second))
     if entry > exit_:
