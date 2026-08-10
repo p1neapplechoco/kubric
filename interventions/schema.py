@@ -1,0 +1,491 @@
+"""Validated, renderer-independent schemas for intervention experiments.
+
+The classes in this module deliberately depend only on Python's standard library.
+They can therefore be used by planning, execution, and artifact-reading code without
+importing Kubric or a simulator backend.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import math
+import numbers
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping, Optional, Tuple
+
+
+SCHEMA_VERSION = "1.0"
+SUPPORTED_SHAPES = frozenset(("cube", "sphere"))
+SUPPORTED_RECIPES = frozenset(
+    (
+        "remove_collision",
+        "create_collision",
+        "retime",
+        "break_contact",
+        "maintain_contact",
+    )
+)
+
+
+def _json_sort_key(value: Any) -> str:
+  """Returns a stable ordering key for an already JSON-compatible value."""
+  return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def to_jsonable(value: Any) -> Any:
+  """Recursively converts schemas and common containers to JSON-safe values.
+
+  Dataclasses become dictionaries, mappings retain deterministically sorted keys,
+  tuples and arrays become lists, and sets become deterministically sorted lists.
+  Unsupported values raise ``TypeError`` rather than being silently stringified.
+  """
+  if dataclasses.is_dataclass(value) and not isinstance(value, type):
+    return {
+        item.name: to_jsonable(getattr(value, item.name))
+        for item in dataclasses.fields(value)
+    }
+  if value is None or isinstance(value, (str, bool)):
+    return value
+  if isinstance(value, numbers.Integral):
+    return int(value)
+  if isinstance(value, numbers.Real):
+    result = float(value)
+    if not math.isfinite(result):
+      raise ValueError("non-finite numbers are not JSON-safe")
+    return result
+  if isinstance(value, Mapping):
+    items = []
+    for key, item_value in value.items():
+      if not isinstance(key, str):
+        raise TypeError("mapping keys must be strings")
+      items.append((key, to_jsonable(item_value)))
+    return {key: item for key, item in sorted(items, key=lambda item: item[0])}
+  if isinstance(value, (set, frozenset)):
+    converted = [to_jsonable(item) for item in value]
+    return sorted(converted, key=_json_sort_key)
+  if isinstance(value, (tuple, list)):
+    return [to_jsonable(item) for item in value]
+
+  # NumPy scalars and arrays expose these methods. Keeping the check generic avoids
+  # importing NumPy into the schema-only layer.
+  if hasattr(value, "item"):
+    try:
+      scalar = value.item()
+    except (TypeError, ValueError):
+      scalar = value
+    if scalar is not value:
+      return to_jsonable(scalar)
+  if hasattr(value, "tolist"):
+    try:
+      listed = value.tolist()
+    except (TypeError, ValueError):
+      listed = value
+    if listed is not value:
+      return to_jsonable(listed)
+  raise TypeError("unsupported JSON value: {!r}".format(type(value).__name__))
+
+
+def _freeze(value: Any) -> Any:
+  """Copies JSON-like data into recursively immutable containers."""
+  if dataclasses.is_dataclass(value) and not isinstance(value, type):
+    return value
+  if value is None or isinstance(value, (str, bool, numbers.Number)):
+    # Validate numeric leaves while preserving integer/float identity.
+    to_jsonable(value)
+    return value
+  if isinstance(value, Mapping):
+    frozen = {}
+    for key in sorted(value):
+      if not isinstance(key, str):
+        raise TypeError("mapping keys must be strings")
+      frozen[key] = _freeze(value[key])
+    return MappingProxyType(frozen)
+  if isinstance(value, (set, frozenset)):
+    frozen_items = [_freeze(item) for item in value]
+    return tuple(sorted(frozen_items, key=lambda item: _json_sort_key(to_jsonable(item))))
+  if isinstance(value, (tuple, list)):
+    return tuple(_freeze(item) for item in value)
+  if hasattr(value, "tolist"):
+    try:
+      return _freeze(value.tolist())
+    except (TypeError, ValueError):
+      pass
+  raise TypeError("metadata contains unsupported value: {!r}".format(type(value).__name__))
+
+
+def _real(value: Any, name: str) -> float:
+  if isinstance(value, bool) or not isinstance(value, numbers.Real):
+    raise TypeError("{} must be a real number".format(name))
+  result = float(value)
+  if not math.isfinite(result):
+    raise ValueError("{} must be finite".format(name))
+  return result
+
+
+def _integer(value: Any, name: str) -> int:
+  if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+    raise TypeError("{} must be an integer".format(name))
+  return int(value)
+
+
+def _vector(value: Any, length: int, name: str) -> Tuple[float, ...]:
+  if isinstance(value, (str, bytes)):
+    raise TypeError("{} must be a numeric sequence".format(name))
+  try:
+    values = tuple(value)
+  except TypeError as error:
+    raise TypeError("{} must be a numeric sequence".format(name)) from error
+  if len(values) != length:
+    raise ValueError("{} must contain {} values".format(name, length))
+  return tuple(_real(item, "{}[{}]".format(name, index))
+               for index, item in enumerate(values))
+
+
+def _nonempty_string(value: Any, name: str) -> str:
+  if not isinstance(value, str):
+    raise TypeError("{} must be a string".format(name))
+  if not value.strip():
+    raise ValueError("{} must not be empty".format(name))
+  return value
+
+
+def _metadata(value: Any) -> Mapping[str, Any]:
+  if value is None:
+    return MappingProxyType({})
+  if not isinstance(value, Mapping):
+    raise TypeError("metadata must be a mapping")
+  return _freeze(value)
+
+
+def _version(value: Any) -> str:
+  if value != SCHEMA_VERSION:
+    raise ValueError("schema_version must be {!r}".format(SCHEMA_VERSION))
+  return SCHEMA_VERSION
+
+
+class _SchemaMixin:
+  """Shared serialization behavior for persisted schemas."""
+
+  def to_dict(self) -> Mapping[str, Any]:
+    """Returns an independent JSON-safe dictionary representation."""
+    return to_jsonable(self)
+
+
+@dataclass(frozen=True)
+class ObjectConfig(_SchemaMixin):
+  """Logical primitive object and its initial physical state.
+
+  Quaternion components use WXYZ order. Non-zero quaternion inputs are normalized,
+  while scalar sizes are expanded to an XYZ tuple.
+  """
+
+  object_id: str
+  shape: str
+  size: Any = 1.0
+  mass: float = 1.0
+  friction: float = 0.5
+  restitution: float = 0.5
+  position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+  quaternion: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+  linear_velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+  angular_velocity: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+  static: bool = False
+  metadata: Mapping[str, Any] = field(default_factory=dict)
+  schema_version: str = SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    object.__setattr__(self, "object_id", _nonempty_string(self.object_id, "object_id"))
+    if not isinstance(self.shape, str):
+      raise TypeError("shape must be a string")
+    shape = self.shape.lower()
+    if shape not in SUPPORTED_SHAPES:
+      raise ValueError("unsupported shape: {!r}".format(self.shape))
+    object.__setattr__(self, "shape", shape)
+
+    if isinstance(self.size, numbers.Real) and not isinstance(self.size, bool):
+      scalar = _real(self.size, "size")
+      size = (scalar, scalar, scalar)
+    else:
+      size = _vector(self.size, 3, "size")
+    if any(component <= 0.0 for component in size):
+      raise ValueError("size components must be positive")
+    object.__setattr__(self, "size", size)
+
+    mass = _real(self.mass, "mass")
+    if mass < 0.0 or (mass == 0.0 and not self.static):
+      raise ValueError("mass must be positive for dynamic objects")
+    friction = _real(self.friction, "friction")
+    if friction < 0.0:
+      raise ValueError("friction must be nonnegative")
+    restitution = _real(self.restitution, "restitution")
+    if not 0.0 <= restitution <= 1.0:
+      raise ValueError("restitution must lie in [0, 1]")
+    if not isinstance(self.static, bool):
+      raise TypeError("static must be a bool")
+
+    quaternion = _vector(self.quaternion, 4, "quaternion")
+    norm = math.sqrt(sum(component * component for component in quaternion))
+    if norm <= 1e-12:
+      raise ValueError("quaternion must be non-zero")
+    quaternion = tuple(component / norm for component in quaternion)
+
+    object.__setattr__(self, "mass", mass)
+    object.__setattr__(self, "friction", friction)
+    object.__setattr__(self, "restitution", restitution)
+    object.__setattr__(self, "position", _vector(self.position, 3, "position"))
+    object.__setattr__(self, "quaternion", quaternion)
+    object.__setattr__(
+        self, "linear_velocity", _vector(self.linear_velocity, 3, "linear_velocity")
+    )
+    object.__setattr__(
+        self, "angular_velocity", _vector(self.angular_velocity, 3, "angular_velocity")
+    )
+    object.__setattr__(self, "metadata", _metadata(self.metadata))
+    object.__setattr__(self, "schema_version", _version(self.schema_version))
+
+  @property
+  def initial_position(self) -> Tuple[float, float, float]:
+    """Alias emphasizing that ``position`` describes the initial state."""
+    return self.position
+
+  @property
+  def initial_quaternion(self) -> Tuple[float, float, float, float]:
+    """Alias emphasizing that ``quaternion`` describes the initial state."""
+    return self.quaternion
+
+
+@dataclass(frozen=True)
+class CameraConfig(_SchemaMixin):
+  """Pinhole camera placement and focal length."""
+
+  position: Tuple[float, float, float]
+  look_at: Tuple[float, float, float]
+  focal_length: float
+  schema_version: str = SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    position = _vector(self.position, 3, "position")
+    look_at = _vector(self.look_at, 3, "look_at")
+    if position == look_at:
+      raise ValueError("camera position and look_at must differ")
+    focal_length = _real(self.focal_length, "focal_length")
+    if focal_length <= 0.0:
+      raise ValueError("focal_length must be positive")
+    object.__setattr__(self, "position", position)
+    object.__setattr__(self, "look_at", look_at)
+    object.__setattr__(self, "focal_length", focal_length)
+    object.__setattr__(self, "schema_version", _version(self.schema_version))
+
+
+@dataclass(frozen=True)
+class SceneConfig(_SchemaMixin):
+  """Complete backend-independent scene configuration."""
+
+  objects: Tuple[ObjectConfig, ...]
+  camera: Optional[CameraConfig] = None
+  seed: int = 0
+  scene_bounds: Tuple[Tuple[float, float, float], Tuple[float, float, float]] = (
+      (-10.0, -10.0, -10.0),
+      (10.0, 10.0, 10.0),
+  )
+  gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
+  frame_range: Tuple[int, int] = (0, 24)
+  frame_rate: int = 24
+  step_rate: int = 240
+  schema_version: str = SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    if isinstance(self.objects, (str, bytes)):
+      raise TypeError("objects must be an iterable of ObjectConfig")
+    try:
+      objects = tuple(self.objects)
+    except TypeError as error:
+      raise TypeError("objects must be an iterable of ObjectConfig") from error
+    if not all(isinstance(item, ObjectConfig) for item in objects):
+      raise TypeError("objects must contain only ObjectConfig values")
+    identifiers = [item.object_id for item in objects]
+    if len(set(identifiers)) != len(identifiers):
+      raise ValueError("object_id values must be unique")
+    if self.camera is not None and not isinstance(self.camera, CameraConfig):
+      raise TypeError("camera must be CameraConfig or None")
+
+    seed = _integer(self.seed, "seed")
+    if seed < 0:
+      raise ValueError("seed must be nonnegative")
+    if len(self.scene_bounds) != 2:
+      raise ValueError("scene_bounds must contain minimum and maximum XYZ vectors")
+    bounds_min = _vector(self.scene_bounds[0], 3, "scene_bounds[0]")
+    bounds_max = _vector(self.scene_bounds[1], 3, "scene_bounds[1]")
+    if any(lower >= upper for lower, upper in zip(bounds_min, bounds_max)):
+      raise ValueError("scene_bounds minimum must be below maximum on every axis")
+    for item in objects:
+      if item.shape not in SUPPORTED_SHAPES:
+        raise ValueError("unsupported object shape: {!r}".format(item.shape))
+      if any(position < lower or position > upper for position, lower, upper in
+             zip(item.position, bounds_min, bounds_max)):
+        raise ValueError(
+            "initial position for {!r} is outside scene_bounds".format(item.object_id)
+        )
+
+    if len(self.frame_range) != 2:
+      raise ValueError("frame_range must contain start and end")
+    frame_start = _integer(self.frame_range[0], "frame_range[0]")
+    frame_end = _integer(self.frame_range[1], "frame_range[1]")
+    if frame_start < 0 or frame_end <= frame_start:
+      raise ValueError("frame_range must be a nonnegative half-open interval")
+    frame_rate = _integer(self.frame_rate, "frame_rate")
+    step_rate = _integer(self.step_rate, "step_rate")
+    if frame_rate <= 0 or step_rate <= 0:
+      raise ValueError("frame_rate and step_rate must be positive")
+    if step_rate % frame_rate:
+      raise ValueError("step_rate must be divisible by frame_rate")
+
+    object.__setattr__(self, "objects", objects)
+    object.__setattr__(self, "seed", seed)
+    object.__setattr__(self, "scene_bounds", (bounds_min, bounds_max))
+    object.__setattr__(self, "gravity", _vector(self.gravity, 3, "gravity"))
+    object.__setattr__(self, "frame_range", (frame_start, frame_end))
+    object.__setattr__(self, "frame_rate", frame_rate)
+    object.__setattr__(self, "step_rate", step_rate)
+    object.__setattr__(self, "schema_version", _version(self.schema_version))
+
+
+@dataclass(frozen=True)
+class Intervention(_SchemaMixin):
+  """A requested counterfactual edit over a half-open time interval."""
+
+  target_id: str
+  recipe: str
+  magnitude: float
+  time_window: Tuple[float, float]
+  metadata: Mapping[str, Any] = field(default_factory=dict)
+  schema_version: str = SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    target_id = _nonempty_string(self.target_id, "target_id")
+    if not isinstance(self.recipe, str):
+      raise TypeError("recipe must be a string")
+    if self.recipe not in SUPPORTED_RECIPES:
+      raise ValueError("unsupported recipe: {!r}".format(self.recipe))
+    magnitude = _real(self.magnitude, "magnitude")
+    if magnitude < 0.0:
+      raise ValueError("magnitude must be nonnegative")
+    time_window = _vector(self.time_window, 2, "time_window")
+    if time_window[0] < 0.0 or time_window[1] <= time_window[0]:
+      raise ValueError("time_window must be a nonnegative half-open interval")
+    object.__setattr__(self, "target_id", target_id)
+    object.__setattr__(self, "magnitude", magnitude)
+    object.__setattr__(self, "time_window", time_window)
+    object.__setattr__(self, "metadata", _metadata(self.metadata))
+    object.__setattr__(self, "schema_version", _version(self.schema_version))
+
+
+def _records(value: Iterable[Any], name: str) -> Tuple[Any, ...]:
+  if value is None:
+    return ()
+  if isinstance(value, Mapping):
+    records = (value,)
+  elif isinstance(value, (str, bytes)):
+    raise TypeError("{} must be an iterable of records".format(name))
+  else:
+    try:
+      records = tuple(value)
+    except TypeError as error:
+      raise TypeError("{} must be an iterable of records".format(name)) from error
+  frozen = tuple(_freeze(record) for record in records)
+  # Force validation now so artifact writing cannot fail later.
+  to_jsonable(frozen)
+  return frozen
+
+
+@dataclass(frozen=True)
+class GraphEdgeDelta(_SchemaMixin):
+  """Added, removed, and changed temporal edge records."""
+
+  added: Tuple[Any, ...] = ()
+  removed: Tuple[Any, ...] = ()
+  changed: Tuple[Any, ...] = ()
+  schema_version: str = SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    object.__setattr__(self, "added", _records(self.added, "added"))
+    object.__setattr__(self, "removed", _records(self.removed, "removed"))
+    object.__setattr__(self, "changed", _records(self.changed, "changed"))
+    object.__setattr__(self, "schema_version", _version(self.schema_version))
+
+  @property
+  def added_edges(self) -> Tuple[Any, ...]:
+    """Compatibility alias for ``added`` records."""
+    return self.added
+
+  @property
+  def removed_edges(self) -> Tuple[Any, ...]:
+    """Compatibility alias for ``removed`` records."""
+    return self.removed
+
+  @property
+  def changed_edges(self) -> Tuple[Any, ...]:
+    """Compatibility alias for ``changed`` records."""
+    return self.changed
+
+
+def _affected_ids(value: Iterable[str], name: str) -> Tuple[str, ...]:
+  if isinstance(value, (str, bytes)):
+    raise TypeError("{} must be an iterable of identifiers".format(name))
+  try:
+    identifiers = tuple(value)
+  except TypeError as error:
+    raise TypeError("{} must be an iterable of identifiers".format(name)) from error
+  normalized = {_nonempty_string(item, name) for item in identifiers}
+  return tuple(sorted(normalized))
+
+
+def _propagation_paths(value: Mapping[str, Iterable[str]]) -> Mapping[str, Tuple[str, ...]]:
+  if not isinstance(value, Mapping):
+    raise TypeError("propagation_path must be a mapping")
+  result = {}
+  for key in sorted(value):
+    normalized_key = _nonempty_string(key, "propagation_path key")
+    path = value[key]
+    if isinstance(path, str):
+      normalized_path = (_nonempty_string(path, "propagation path item"),)
+    elif isinstance(path, (set, frozenset)):
+      normalized_path = tuple(sorted(
+          _nonempty_string(item, "propagation path item") for item in path
+      ))
+    else:
+      try:
+        normalized_path = tuple(
+            _nonempty_string(item, "propagation path item") for item in path
+        )
+      except TypeError as error:
+        raise TypeError("propagation paths must be iterable") from error
+    result[normalized_key] = normalized_path
+  return MappingProxyType(result)
+
+
+@dataclass(frozen=True)
+class GroundTruth(_SchemaMixin):
+  """Expected graph and affected-object changes for an intervention."""
+
+  graph_delta: GraphEdgeDelta
+  hard_affected: Tuple[str, ...] = ()
+  soft_affected: Tuple[str, ...] = ()
+  propagation_path: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
+  schema_version: str = SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.graph_delta, GraphEdgeDelta):
+      raise TypeError("graph_delta must be GraphEdgeDelta")
+    hard = _affected_ids(self.hard_affected, "hard_affected")
+    soft = _affected_ids(self.soft_affected, "soft_affected")
+    if set(hard).intersection(soft):
+      raise ValueError("hard_affected and soft_affected must be disjoint")
+    object.__setattr__(self, "hard_affected", hard)
+    object.__setattr__(self, "soft_affected", soft)
+    object.__setattr__(
+        self, "propagation_path", _propagation_paths(self.propagation_path)
+    )
+    object.__setattr__(self, "schema_version", _version(self.schema_version))
