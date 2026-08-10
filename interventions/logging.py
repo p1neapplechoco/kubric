@@ -116,10 +116,7 @@ def _float_array(value: Any, name: str) -> np.ndarray:
     untyped = np.asarray(value)
   except (TypeError, ValueError, OverflowError) as error:
     raise ValueError("{} must be a numeric array".format(name)) from error
-  if (
-      not np.issubdtype(untyped.dtype, np.number)
-      or np.issubdtype(untyped.dtype, np.complexfloating)
-  ):
+  if untyped.dtype.kind not in {"i", "u", "f"}:
     raise ValueError("{} must contain real numeric values".format(name))
   try:
     canonical = np.array(untyped, dtype=np.float64, order="C", copy=True)

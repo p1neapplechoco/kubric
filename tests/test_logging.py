@@ -56,6 +56,14 @@ def _states(num_steps=3, num_objects=2):
   return states
 
 
+def _timedelta_states(num_steps=3, num_objects=2):
+  states = np.zeros(
+      (num_steps, num_objects, 13), dtype="timedelta64[ns]"
+  )
+  states[:, :, 3] = np.timedelta64(1, "ns")
+  return states
+
+
 def _simulation_log(**overrides):
   values = {
       "branch": "factual",
@@ -257,6 +265,11 @@ def test_simulation_log_rejects_nonnumeric_source_dtypes(states):
     _simulation_log(states=states)
 
 
+def test_simulation_log_rejects_timedelta_states():
+  with pytest.raises((TypeError, ValueError), match="numeric|real"):
+    _simulation_log(states=_timedelta_states())
+
+
 def test_simulation_log_rejects_nonnumeric_commanded_path_dtype():
   path = np.array(
       [[0, 0, 0], [0.5, 0, 0], [1, 0, 0]], dtype=float
@@ -372,6 +385,15 @@ def test_read_simulation_log_rejects_nonnumeric_or_pickled_states(
     np.save(stream, values, allow_pickle=dtype is object)
 
   with pytest.raises(ValueError, match="numeric|object|NumPy"):
+    read_simulation_log(directory)
+
+
+def test_read_simulation_log_rejects_timedelta_states(tmp_path):
+  directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
+  with (directory / "states.npy").open("wb") as stream:
+    np.save(stream, _timedelta_states(), allow_pickle=False)
+
+  with pytest.raises(ValueError, match="numeric|real"):
     read_simulation_log(directory)
 
 
