@@ -1,32 +1,76 @@
-"""Interpolation and bounded perturbation of XYZ and XYZ+WXYZ paths."""
+"""Interpolation and bounded heuristic perturbation of XYZ/XYZ+WXYZ paths.
+
+Recipe names describe the contact outcome a caller is trying to produce. This module
+only generates heuristic candidate path profiles; a physics simulator and downstream
+quality control must determine whether the named contact outcome actually occurred.
+"""
 
 from __future__ import annotations
 
 import math
 import numbers
-from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
 
+from interventions.schema import INTERVENTION_RECIPES
 
-_RECIPES = frozenset(
-    (
-        "remove_collision",
-        "create_collision",
-        "retime",
-        "break_contact",
-        "maintain_contact",
-    )
-)
+
+RECIPE_PROFILE_SEMANTICS = MappingProxyType({
+    "remove_collision": (
+        "Heuristic clearance candidate; physics and QC determine collision removal."
+    ),
+    "create_collision": (
+        "Heuristic approach candidate; physics and QC determine collision creation."
+    ),
+    "retime": (
+        "Heuristic timing-warp candidate; physics and QC determine contact changes."
+    ),
+    "break_contact": (
+        "Heuristic lift candidate; physics and QC determine whether contact breaks."
+    ),
+    "maintain_contact": (
+        "Heuristic lateral candidate; physics and QC determine whether contact persists."
+    ),
+})
 _QUATERNION_TOLERANCE = 1e-6
+_FLOAT_MAX = np.finfo(float).max
 
 
 def _numeric_array(value: Any, name: str) -> np.ndarray:
   try:
-    array = np.asarray(value, dtype=float)
-  except (TypeError, ValueError) as error:
+    untyped = np.asarray(value)
+  except (TypeError, ValueError, OverflowError) as error:
+    raise ValueError("{} must be numeric".format(name)) from error
+  contains_object_complex = (
+      untyped.dtype.kind == "O"
+      and any(
+          isinstance(item, numbers.Complex) and not isinstance(item, numbers.Real)
+          for item in untyped.flat
+      )
+  )
+  if np.iscomplexobj(untyped) or contains_object_complex:
+    raise ValueError("{} must not contain complex values".format(name))
+  try:
+    array = np.asarray(untyped, dtype=float)
+  except (TypeError, ValueError, OverflowError) as error:
     raise ValueError("{} must be numeric".format(name)) from error
   return array
+
+
+def _stable_euclidean_norm(vector: np.ndarray) -> float:
+  """Computes a Euclidean norm without overflow during squaring."""
+  components = np.abs(np.asarray(vector, dtype=float).reshape(-1))
+  scale = float(np.max(components)) if components.size else 0.0
+  if scale == 0.0:
+    return 0.0
+  if not math.isfinite(scale):
+    return math.inf
+  scaled_norm = math.hypot(*(float(item / scale) for item in components))
+  if scale > _FLOAT_MAX / scaled_norm:
+    return math.inf
+  return scale * scaled_norm
 
 
 def _validate_path_array(
@@ -46,7 +90,7 @@ def _validate_path_array(
     raise ValueError("{} must contain only finite values".format(name))
   if array.shape[1] == 7:
     quaternions = array[:, 3:]
-    norms = np.linalg.norm(quaternions, axis=1)
+    norms = np.array([_stable_euclidean_norm(item) for item in quaternions])
     if not np.all(np.abs(norms - 1.0) <= _QUATERNION_TOLERANCE):
       raise ValueError("{} quaternions must be unit-normalized".format(name))
     if require_continuous_quaternions and len(quaternions) > 1:
@@ -227,12 +271,59 @@ def _aabb_array(static_aabbs: Iterable[Any]) -> np.ndarray:
 def _nonnegative_real(value: Any, name: str) -> float:
   if isinstance(value, bool) or not isinstance(value, numbers.Real):
     raise TypeError("{} must be a real number".format(name))
-  result = float(value)
+  try:
+    result = float(value)
+  except (OverflowError, ValueError) as error:
+    raise ValueError("{} must be finite".format(name)) from error
   if not math.isfinite(result):
     raise ValueError("{} must be finite".format(name))
   if result < 0.0:
     raise ValueError("{} must be nonnegative".format(name))
   return result
+
+
+def _segment_intersects_aabb(
+    start: np.ndarray,
+    end: np.ndarray,
+    minimum: np.ndarray,
+    maximum: np.ndarray,
+) -> bool:
+  """Returns whether a closed line segment intersects a closed AABB."""
+  entry = 0.0
+  exit_ = 1.0
+  for axis in range(3):
+    start_value = float(start[axis])
+    end_value = float(end[axis])
+    minimum_value = float(minimum[axis])
+    maximum_value = float(maximum[axis])
+    if start_value == end_value:
+      if start_value < minimum_value or start_value > maximum_value:
+        return False
+      continue
+    scale = max(
+        abs(start_value),
+        abs(end_value),
+        abs(minimum_value),
+        abs(maximum_value),
+    )
+    if scale == 0.0:
+      continue
+    scaled_start = start_value / scale
+    scaled_end = end_value / scale
+    delta = scaled_end - scaled_start
+    if delta == 0.0:
+      if max(start_value, end_value) < minimum_value:
+        return False
+      if min(start_value, end_value) > maximum_value:
+        return False
+      continue
+    first = (minimum_value / scale - scaled_start) / delta
+    second = (maximum_value / scale - scaled_start) / delta
+    entry = max(entry, min(first, second))
+    exit_ = min(exit_, max(first, second))
+    if entry > exit_:
+      return False
+  return True
 
 
 def _validate_geometry(
@@ -245,12 +336,18 @@ def _validate_geometry(
     if np.any(positions < bounds[0]) or np.any(positions > bounds[1]):
       raise ValueError("path positions fall outside bounds")
   for aabb in static_aabbs:
-    expanded_minimum = aabb[0] - clearance
-    expanded_maximum = aabb[1] + clearance
+    with np.errstate(over="ignore"):
+      expanded_minimum = np.maximum(aabb[0] - clearance, -_FLOAT_MAX)
+      expanded_maximum = np.minimum(aabb[1] + clearance, _FLOAT_MAX)
     inside = np.all(positions >= expanded_minimum, axis=1) & np.all(
         positions <= expanded_maximum, axis=1
     )
     if np.any(inside):
+      raise ValueError("path intersects a static AABB")
+    if any(
+        _segment_intersects_aabb(start, end, expanded_minimum, expanded_maximum)
+        for start, end in zip(positions[:-1], positions[1:])
+    ):
       raise ValueError("path intersects a static AABB")
 
 
@@ -265,7 +362,7 @@ def validate_path(
 
   A path is valid when it is finite, has at least two samples, uses unit and
   sign-continuous quaternions when present, remains within ``bounds``, and has no
-  sampled position inside a static AABB expanded by ``clearance``.
+  line segment intersecting a static AABB expanded by ``clearance``.
 
   Raises:
     ValueError: If the path or any spatial constraint is invalid.
@@ -294,10 +391,9 @@ def max_position_deviation(factual: Any, perturbed: Any) -> float:
     raise ValueError("paths must contain at least two samples")
   if not np.isfinite(factual_array).all() or not np.isfinite(perturbed_array).all():
     raise ValueError("paths must contain only finite values")
-  distances = np.linalg.norm(
-      factual_array[:, :3] - perturbed_array[:, :3], axis=1
-  )
-  return float(np.max(distances))
+  with np.errstate(over="ignore", invalid="ignore"):
+    differences = factual_array[:, :3] - perturbed_array[:, :3]
+  return max(_stable_euclidean_norm(item) for item in differences)
 
 
 def _resample_path(path: np.ndarray, query_times: np.ndarray) -> np.ndarray:
@@ -316,7 +412,10 @@ def _retimed_candidate(
     rng: Any,
 ) -> np.ndarray:
   output_times = np.linspace(0.0, 1.0, len(path))
-  random_value = float(rng.uniform(-1.0, 1.0))
+  try:
+    random_value = float(rng.uniform(-1.0, 1.0))
+  except (TypeError, ValueError, OverflowError) as error:
+    raise ValueError("rng.uniform must return a finite scalar") from error
   if not math.isfinite(random_value):
     raise ValueError("rng returned a non-finite value")
   sign = -1.0 if random_value < 0.0 else 1.0
@@ -349,15 +448,17 @@ def _retimed_candidate(
 
 def _random_direction(rng: Any, recipe: str) -> np.ndarray:
   for _ in range(8):
-    direction = np.asarray(rng.normal(size=3), dtype=float)
+    direction = _numeric_array(rng.normal(size=3), "rng direction")
     if direction.shape != (3,) or not np.isfinite(direction).all():
       raise ValueError("rng.normal(size=3) must return three finite values")
     if recipe == "maintain_contact":
       direction[2] = 0.0
     elif recipe == "break_contact":
       direction[2] = abs(direction[2]) + 0.25
-    norm = float(np.linalg.norm(direction))
-    if norm > 1e-12:
+    scale = float(np.max(np.abs(direction)))
+    if scale > 0.0:
+      direction /= scale
+      norm = _stable_euclidean_norm(direction)
       direction /= norm
       return -direction if recipe == "create_collision" else direction
   raise ValueError("rng repeatedly returned a zero displacement direction")
@@ -370,7 +471,10 @@ def _spatial_candidate(
     rng: Any,
 ) -> np.ndarray:
   direction = _random_direction(rng, recipe)
-  amplitude_draw = float(rng.uniform(0.5, 1.0))
+  try:
+    amplitude_draw = float(rng.uniform(0.5, 1.0))
+  except (TypeError, ValueError, OverflowError) as error:
+    raise ValueError("rng.uniform must return a finite scalar") from error
   if not math.isfinite(amplitude_draw):
     raise ValueError("rng returned a non-finite value")
   amplitude = magnitude * float(np.clip(amplitude_draw, 0.0, 1.0))
@@ -406,8 +510,9 @@ def perturb_path(
 
   Spatial recipes add a smooth displacement that is zero at both endpoints.
   ``retime`` instead samples the same piecewise trajectory at smoothly warped times.
-  Candidates violating bounds or expanded static AABBs are resampled up to
-  ``max_attempts`` times.
+  These profiles are heuristic candidates: only physics simulation and downstream QC
+  can establish whether the recipe's named contact outcome occurred. Candidates
+  violating bounds or expanded static AABBs are resampled up to ``max_attempts`` times.
 
   Args:
     path_factual: A valid ``[T, 3]`` or ``[T, 7]`` path.
@@ -425,7 +530,7 @@ def perturb_path(
   """
   if not isinstance(recipe, str):
     raise TypeError("recipe must be a string")
-  if recipe not in _RECIPES:
+  if recipe not in INTERVENTION_RECIPES:
     raise ValueError("unsupported recipe: {!r}".format(recipe))
   magnitude_value = _nonnegative_real(magnitude, "magnitude")
   clearance_value = _nonnegative_real(clearance, "clearance")

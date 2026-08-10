@@ -11,6 +11,7 @@ import dataclasses
 import json
 import math
 import numbers
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Optional, Tuple
@@ -18,7 +19,7 @@ from typing import Any, Iterable, Mapping, Optional, Tuple
 
 SCHEMA_VERSION = "1.0"
 SUPPORTED_SHAPES = frozenset(("cube", "sphere"))
-SUPPORTED_RECIPES = frozenset(
+INTERVENTION_RECIPES = frozenset(
     (
         "remove_collision",
         "create_collision",
@@ -32,6 +33,11 @@ SUPPORTED_RECIPES = frozenset(
 def _json_sort_key(value: Any) -> str:
   """Returns a stable ordering key for an already JSON-compatible value."""
   return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _validate_mapping_keys(value: Mapping[Any, Any]) -> None:
+  if not all(isinstance(key, str) for key in value):
+    raise ValueError("mapping keys must be strings")
 
 
 def to_jsonable(value: Any) -> Any:
@@ -51,17 +57,16 @@ def to_jsonable(value: Any) -> Any:
   if isinstance(value, numbers.Integral):
     return int(value)
   if isinstance(value, numbers.Real):
-    result = float(value)
+    try:
+      result = float(value)
+    except (OverflowError, ValueError) as error:
+      raise ValueError("numbers must be finite") from error
     if not math.isfinite(result):
       raise ValueError("non-finite numbers are not JSON-safe")
     return result
   if isinstance(value, Mapping):
-    items = []
-    for key, item_value in value.items():
-      if not isinstance(key, str):
-        raise TypeError("mapping keys must be strings")
-      items.append((key, to_jsonable(item_value)))
-    return {key: item for key, item in sorted(items, key=lambda item: item[0])}
+    _validate_mapping_keys(value)
+    return {key: to_jsonable(value[key]) for key in sorted(value)}
   if isinstance(value, (set, frozenset)):
     converted = [to_jsonable(item) for item in value]
     return sorted(converted, key=_json_sort_key)
@@ -96,10 +101,9 @@ def _freeze(value: Any) -> Any:
     to_jsonable(value)
     return value
   if isinstance(value, Mapping):
+    _validate_mapping_keys(value)
     frozen = {}
     for key in sorted(value):
-      if not isinstance(key, str):
-        raise TypeError("mapping keys must be strings")
       frozen[key] = _freeze(value[key])
     return MappingProxyType(frozen)
   if isinstance(value, (set, frozenset)):
@@ -118,7 +122,10 @@ def _freeze(value: Any) -> Any:
 def _real(value: Any, name: str) -> float:
   if isinstance(value, bool) or not isinstance(value, numbers.Real):
     raise TypeError("{} must be a real number".format(name))
-  result = float(value)
+  try:
+    result = float(value)
+  except (OverflowError, ValueError) as error:
+    raise ValueError("{} must be finite".format(name)) from error
   if not math.isfinite(result):
     raise ValueError("{} must be finite".format(name))
   return result
@@ -372,7 +379,7 @@ class Intervention(_SchemaMixin):
     target_id = _nonempty_string(self.target_id, "target_id")
     if not isinstance(self.recipe, str):
       raise TypeError("recipe must be a string")
-    if self.recipe not in SUPPORTED_RECIPES:
+    if self.recipe not in INTERVENTION_RECIPES:
       raise ValueError("unsupported recipe: {!r}".format(self.recipe))
     magnitude = _real(self.magnitude, "magnitude")
     if magnitude < 0.0:
@@ -430,9 +437,26 @@ def _records(value: Iterable[Any], name: str) -> Tuple[Any, ...]:
       records = tuple(value)
     except TypeError as error:
       raise TypeError("{} must be an iterable of records".format(name)) from error
-  frozen = tuple(
-      _temporal_edge(record, name, index) for index, record in enumerate(records)
-  )
+  by_identity = {}
+  serialized = {}
+  for index, record in enumerate(records):
+    frozen_record = _temporal_edge(record, name, index)
+    identity = (
+        frozen_record["object_a"],
+        frozen_record["object_b"],
+        frozen_record["start_step"],
+        frozen_record["end_step"],
+    )
+    payload = _json_sort_key(to_jsonable(frozen_record))
+    if identity in serialized and serialized[identity] != payload:
+      raise ValueError(
+          "{} contains conflicting payloads for edge identity {!r}".format(
+              name, identity
+          )
+      )
+    by_identity[identity] = frozen_record
+    serialized[identity] = payload
+  frozen = tuple(by_identity[identity] for identity in sorted(by_identity))
   # Force validation now so artifact writing cannot fail later.
   to_jsonable(frozen)
   return frozen
@@ -440,7 +464,11 @@ def _records(value: Iterable[Any], name: str) -> Tuple[Any, ...]:
 
 @dataclass(frozen=True)
 class GraphEdgeDelta(_SchemaMixin):
-  """Added, removed, and changed temporal edge records."""
+  """Added, removed, and changed temporal edge records.
+
+  An edge's canonical identity is ``(object_a, object_b, start_step, end_step)``
+  with its object identifiers lexicographically ordered.
+  """
 
   added: Tuple[Any, ...] = ()
   removed: Tuple[Any, ...] = ()
@@ -448,9 +476,36 @@ class GraphEdgeDelta(_SchemaMixin):
   schema_version: str = SCHEMA_VERSION
 
   def __post_init__(self) -> None:
-    object.__setattr__(self, "added", _records(self.added, "added"))
-    object.__setattr__(self, "removed", _records(self.removed, "removed"))
-    object.__setattr__(self, "changed", _records(self.changed, "changed"))
+    added = _records(self.added, "added")
+    removed = _records(self.removed, "removed")
+    changed = _records(self.changed, "changed")
+    identities_by_bucket = {
+        "added": {
+            (item["object_a"], item["object_b"], item["start_step"], item["end_step"])
+            for item in added
+        },
+        "removed": {
+            (item["object_a"], item["object_b"], item["start_step"], item["end_step"])
+            for item in removed
+        },
+        "changed": {
+            (item["object_a"], item["object_b"], item["start_step"], item["end_step"])
+            for item in changed
+        },
+    }
+    owners = {}
+    for bucket, identities in identities_by_bucket.items():
+      for identity in identities:
+        if identity in owners:
+          raise ValueError(
+              "edge identity {!r} appears in multiple buckets: {} and {}".format(
+                  identity, owners[identity], bucket
+              )
+          )
+        owners[identity] = bucket
+    object.__setattr__(self, "added", added)
+    object.__setattr__(self, "removed", removed)
+    object.__setattr__(self, "changed", changed)
     object.__setattr__(self, "schema_version", _version(self.schema_version))
 
   @property
@@ -483,30 +538,23 @@ def _affected_ids(value: Iterable[str], name: str) -> Tuple[str, ...]:
 def _propagation_paths(value: Mapping[str, Iterable[str]]) -> Mapping[str, Tuple[str, ...]]:
   if not isinstance(value, Mapping):
     raise TypeError("propagation_path must be a mapping")
+  _validate_mapping_keys(value)
   result = {}
   for key in sorted(value):
     normalized_key = _nonempty_string(key, "propagation_path key")
     path = value[key]
-    if isinstance(path, str):
-      normalized_path = (_nonempty_string(path, "propagation path item"),)
-    elif isinstance(path, (set, frozenset)):
-      normalized_path = tuple(sorted(
-          _nonempty_string(item, "propagation path item") for item in path
-      ))
-    else:
-      try:
-        normalized_path = tuple(
-            _nonempty_string(item, "propagation path item") for item in path
-        )
-      except TypeError as error:
-        raise TypeError("propagation paths must be iterable") from error
+    if isinstance(path, (str, bytes)) or not isinstance(path, SequenceABC):
+      raise TypeError("propagation paths must be an ordered sequence, not a string")
+    normalized_path = tuple(
+        _nonempty_string(item, "propagation path item") for item in path
+    )
     result[normalized_key] = normalized_path
   return MappingProxyType(result)
 
 
 @dataclass(frozen=True)
 class GroundTruth(_SchemaMixin):
-  """Expected graph and affected-object changes for an intervention."""
+  """Expected graph changes, affected objects, and ordered propagation paths."""
 
   graph_delta: GraphEdgeDelta
   hard_affected: Tuple[str, ...] = ()

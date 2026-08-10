@@ -1,8 +1,13 @@
 """Tests for trajectory interpolation and perturbation."""
 
+import math
+import warnings
+
 import numpy as np
 import pytest
 
+from interventions import schema as schema_module
+from interventions import trajectory as trajectory_module
 from interventions.trajectory import (
     build_path,
     max_position_deviation,
@@ -11,13 +16,7 @@ from interventions.trajectory import (
 )
 
 
-RECIPES = (
-    "remove_collision",
-    "create_collision",
-    "retime",
-    "break_contact",
-    "maintain_contact",
-)
+RECIPES = tuple(sorted(schema_module.INTERVENTION_RECIPES))
 
 
 def _curved_path(num_frames=9):
@@ -177,6 +176,16 @@ def test_validate_path_rejects_bounds_and_expanded_static_aabbs():
     )
 
 
+def test_validate_path_rejects_segment_crossing_static_aabb():
+  path = np.array([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+  with pytest.raises(ValueError, match="AABB"):
+    validate_path(
+        path,
+        static_aabbs=(((-0.1, -0.1, -0.1), (0.1, 0.1, 0.1)),),
+    )
+
+
 def test_perturb_path_raises_when_no_collision_free_candidate_exists():
   factual = _curved_path(5)
   enclosing_box = (((-2.0, -2.0, -2.0), (2.0, 2.0, 2.0)),)
@@ -256,3 +265,72 @@ def test_max_position_deviation_uses_only_xyz_and_validates_shape():
   assert max_position_deviation(factual, perturbed) == pytest.approx(0.25)
   with pytest.raises(ValueError):
     max_position_deviation(factual, factual[:-1])
+
+
+def test_max_position_deviation_is_stable_for_huge_finite_coordinates():
+  factual = np.zeros((2, 3))
+  perturbed = factual.copy()
+  perturbed[1] = (1e308, 1e308, 0.0)
+
+  deviation = max_position_deviation(factual, perturbed)
+
+  assert math.isfinite(deviation)
+  assert deviation == pytest.approx(math.hypot(1e308, 1e308))
+
+
+def test_spatial_perturbation_normalizes_huge_finite_rng_direction():
+  class HugeDirectionRng:
+    def normal(self, size):
+      assert size == 3
+      return np.array([1e308, 1e308, 0.0])
+
+    def uniform(self, *unused_args):
+      return 1.0
+
+  factual = np.zeros((3, 3))
+
+  perturbed = perturb_path(
+      factual, "maintain_contact", 0.1, HugeDirectionRng()
+  )
+
+  assert np.isfinite(perturbed).all()
+  assert max_position_deviation(factual, perturbed) == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda value: build_path(value, 3),
+        lambda value: validate_path(value),
+        lambda value: perturb_path(
+            value, "retime", 0.1, np.random.default_rng(0)
+        ),
+        lambda value: max_position_deviation(value, value),
+        lambda value: validate_path(np.zeros((2, 3)), bounds=value),
+        lambda value: validate_path(
+            np.zeros((2, 3)), static_aabbs=(value,)
+        ),
+    ],
+)
+def test_public_trajectory_apis_reject_complex_arrays_without_warning(call):
+  complex_value = np.array(
+      [[0.0 + 1.0j, 0.0, 0.0], [1.0 + 2.0j, 1.0, 1.0]]
+  )
+
+  with warnings.catch_warnings():
+    warnings.simplefilter("error")
+    with pytest.raises(ValueError, match="complex"):
+      call(complex_value)
+
+
+def test_trajectory_numeric_overflow_is_reported_as_value_error():
+  with pytest.raises(ValueError, match="numeric"):
+    build_path([[10**10000, 0, 0], [0, 0, 0]], 2)
+
+
+def test_recipe_profiles_are_documented_as_heuristic_candidates():
+  assert trajectory_module.INTERVENTION_RECIPES is schema_module.INTERVENTION_RECIPES
+  descriptions = trajectory_module.RECIPE_PROFILE_SEMANTICS
+  assert frozenset(descriptions) == schema_module.INTERVENTION_RECIPES
+  assert all("heuristic" in description.lower() for description in descriptions.values())
+  assert "physics" in perturb_path.__doc__.lower()

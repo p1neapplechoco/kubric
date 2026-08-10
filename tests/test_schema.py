@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import dataclass, FrozenInstanceError
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -15,6 +16,7 @@ from interventions.schema import (
     SceneConfig,
     to_jsonable,
 )
+from interventions import schema as schema_module
 
 
 def _object(object_id="ball", **overrides):
@@ -55,6 +57,16 @@ def _scene(**overrides):
   return SceneConfig(**values)
 
 
+def _edge(object_a="a", object_b="b", start_step=0, end_step=2, **payload):
+  return {
+      "object_a": object_a,
+      "object_b": object_b,
+      "start_step": start_step,
+      "end_step": end_step,
+      **payload,
+  }
+
+
 def test_object_config_normalizes_size_quaternion_and_metadata():
   config = _object(
       size=2,
@@ -77,6 +89,15 @@ def test_object_config_normalizes_extreme_finite_quaternion_safely():
 
   assert config.quaternion == (1.0, 0.0, 0.0, 0.0)
   assert np.linalg.norm(config.quaternion) == pytest.approx(1.0)
+
+
+def test_schema_numeric_overflow_is_reported_as_value_error():
+  oversized = Fraction(10**10000, 1)
+
+  with pytest.raises(ValueError, match="finite"):
+    _object(size=oversized)
+  with pytest.raises(ValueError, match="finite"):
+    to_jsonable(oversized)
 
 
 @pytest.mark.parametrize(
@@ -226,13 +247,13 @@ def test_graph_delta_and_ground_truth_are_deterministic_and_json_safe():
       graph_delta=delta,
       hard_affected={"c", "a"},
       soft_affected=["d", "b", "b"],
-      propagation_path={"c": {"c", "a"}, "a": ["a"]},
+      propagation_path={"c": ["c", "a"], "a": ["a"]},
   )
 
   assert truth.hard_affected == ("a", "c")
   assert truth.soft_affected == ("b", "d")
   assert tuple(truth.propagation_path) == ("a", "c")
-  assert truth.propagation_path["c"] == ("a", "c")
+  assert truth.propagation_path["c"] == ("c", "a")
   assert delta.added[0]["object_a"] == "a"
   assert delta.added[0]["object_b"] == "b"
   with pytest.raises(TypeError):
@@ -283,6 +304,41 @@ def test_graph_delta_rejects_malformed_temporal_edges(field, record):
     GraphEdgeDelta(**{field: (record,)})
 
 
+def test_graph_delta_sorts_and_deduplicates_canonical_edge_identities():
+  delta = GraphEdgeDelta(added=(
+      _edge("z", "y", 4, 6, force=2.0),
+      _edge("b", "a", 2, 3, force=1.0),
+      _edge("a", "b", 2, 3, force=1.0),
+  ))
+
+  identities = [
+      (edge["object_a"], edge["object_b"], edge["start_step"], edge["end_step"])
+      for edge in delta.added
+  ]
+  assert identities == [("a", "b", 2, 3), ("y", "z", 4, 6)]
+
+
+def test_graph_delta_rejects_conflicting_payload_for_one_identity():
+  with pytest.raises(ValueError, match="conflicting"):
+    GraphEdgeDelta(added=(
+        _edge("a", "b", force=1.0),
+        _edge("b", "a", force=2.0),
+    ))
+
+
+@pytest.mark.parametrize(
+    "left_bucket,right_bucket",
+    [("added", "removed"), ("added", "changed"), ("removed", "changed")],
+)
+def test_graph_delta_rejects_identity_shared_across_buckets(
+    left_bucket, right_bucket
+):
+  values = {left_bucket: (_edge(),), right_bucket: (_edge("b", "a"),)}
+
+  with pytest.raises(ValueError, match="multiple"):
+    GraphEdgeDelta(**values)
+
+
 def test_schema_construction_rejects_nested_dataclass_values():
   @dataclass
   class MutableMetadata:
@@ -299,6 +355,41 @@ def test_schema_construction_rejects_nested_dataclass_values():
         "end_step": 1,
         "payload": nested,
     },))
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: _object(metadata={"valid": 1, 2: "invalid"}),
+        lambda: GroundTruth(
+            graph_delta=GraphEdgeDelta(),
+            propagation_path={"valid": ["a"], 2: ["b"]},
+        ),
+        lambda: to_jsonable({"valid": 1, 2: "invalid"}),
+    ],
+)
+def test_schema_mappings_reject_non_string_keys_consistently(build):
+  with pytest.raises(ValueError, match="keys must be strings"):
+    build()
+
+
+@pytest.mark.parametrize("path", [{"a", "b"}, frozenset(("a", "b")), iter(("a", "b"))])
+def test_ground_truth_rejects_unordered_or_non_sequence_propagation_paths(path):
+  with pytest.raises(TypeError, match="ordered sequence"):
+    GroundTruth(
+        graph_delta=GraphEdgeDelta(),
+        propagation_path={"b": path},
+    )
+
+
+def test_intervention_recipes_have_one_authoritative_constant():
+  assert schema_module.INTERVENTION_RECIPES == frozenset((
+      "remove_collision",
+      "create_collision",
+      "retime",
+      "break_contact",
+      "maintain_contact",
+  ))
 
 
 def test_ground_truth_rejects_overlap_and_invalid_delta():
