@@ -5,6 +5,8 @@ import io
 import json
 import math
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -96,10 +98,10 @@ def _simulation_log(**overrides):
 _PAYLOAD_FILENAMES = ("contacts.jsonl", "states.npy", "metadata.json")
 
 
-def _expected_manifest(directory):
+def _manifest_for_payloads(payloads):
   files = {}
   for filename in _PAYLOAD_FILENAMES:
-    payload = (directory / filename).read_bytes()
+    payload = payloads[filename]
     files[filename] = {
         "sha256": hashlib.sha256(payload).hexdigest(),
         "size": len(payload),
@@ -107,20 +109,64 @@ def _expected_manifest(directory):
   generation_material = "".join(
       files[filename]["sha256"] for filename in _PAYLOAD_FILENAMES
   ).encode("ascii")
+  generation = hashlib.sha256(generation_material).hexdigest()
+  for filename in _PAYLOAD_FILENAMES:
+    files[filename]["path"] = "generations/{}/{}".format(
+        generation, filename
+    )
   return {
       "files": files,
-      "generation": hashlib.sha256(generation_material).hexdigest(),
+      "generation": generation,
       "schema_version": "1.0",
   }
 
 
+def _read_manifest(directory):
+  return json.loads((directory / "manifest.json").read_text())
+
+
+def _payload_path(directory, filename):
+  return directory / _read_manifest(directory)["files"][filename]["path"]
+
+
+def _expected_manifest(directory):
+  manifest = _read_manifest(directory)
+  payloads = {
+      filename: (
+          directory / "generations" / manifest["generation"] / filename
+      ).read_bytes()
+      for filename in _PAYLOAD_FILENAMES
+  }
+  return _manifest_for_payloads(payloads)
+
+
 def _refresh_manifest(directory):
+  manifest = _read_manifest(directory)
+  old_generation = manifest["generation"]
+  old_directory = directory / "generations" / old_generation
+  payloads = {
+      filename: (old_directory / filename).read_bytes()
+      for filename in _PAYLOAD_FILENAMES
+  }
+  refreshed = _manifest_for_payloads(payloads)
+  new_generation = refreshed["generation"]
+  if new_generation != old_generation:
+    old_directory.rename(directory / "generations" / new_generation)
   payload = json.dumps(
-      _expected_manifest(directory),
+      refreshed,
       sort_keys=True,
       separators=(",", ":"),
   ) + "\n"
   (directory / "manifest.json").write_text(payload)
+
+
+def _artifact_snapshot(directory):
+  return {
+      str(path.relative_to(directory)): (
+          None if path.is_dir() else path.read_bytes()
+      )
+      for path in sorted(directory.rglob("*"))
+  }
 
 
 def test_contact_record_canonicalizes_endpoints_and_flips_normal():
@@ -362,33 +408,36 @@ def test_simulation_log_roundtrip_and_overwrite_refusal(tmp_path):
   assert restored.metadata == log.metadata
   np.testing.assert_array_equal(restored.states, log.states)
   np.testing.assert_array_equal(restored.commanded_path, log.commanded_path)
-  assert (directory / "states.npy").read_bytes()[:6] == b"\x93NUMPY"
-  metadata = json.loads((directory / "metadata.json").read_text())
+  assert _payload_path(directory, "states.npy").read_bytes()[:6] == b"\x93NUMPY"
+  metadata = json.loads(_payload_path(directory, "metadata.json").read_text())
   assert metadata["schema_version"] == "1.0"
-  assert json.loads((directory / "contacts.jsonl").read_text()) == log.contacts[0].to_dict()
-  assert json.loads((directory / "manifest.json").read_text()) == (
-      _expected_manifest(directory)
+  assert json.loads(_payload_path(directory, "contacts.jsonl").read_text()) == (
+      log.contacts[0].to_dict()
   )
-  before_refusal = {
-      filename: (directory / filename).read_bytes()
-      for filename in _PAYLOAD_FILENAMES + ("manifest.json",)
-  }
+  manifest = _read_manifest(directory)
+  assert manifest == _expected_manifest(directory)
+  generation_directory = directory / "generations" / manifest["generation"]
+  assert sorted(path.name for path in generation_directory.iterdir()) == list(
+      sorted(_PAYLOAD_FILENAMES)
+  )
+  before_refusal = _artifact_snapshot(directory)
   with pytest.raises(FileExistsError):
     write_simulation_log(log, directory)
-  assert before_refusal == {
-      filename: (directory / filename).read_bytes()
-      for filename in before_refusal
-  }
+  assert before_refusal == _artifact_snapshot(directory)
   assert sorted(path.name for path in directory.iterdir()) == [
-      "contacts.jsonl",
+      ".publish.lock",
+      "generations",
       "manifest.json",
-      "metadata.json",
-      "states.npy",
   ]
 
   replacement = _simulation_log(branch="counterfactual", contacts=())
   write_simulation_log(replacement, directory, overwrite=True)
   assert read_simulation_log(directory).branch == "counterfactual"
+  new_generation = _read_manifest(directory)["generation"]
+  assert new_generation != manifest["generation"]
+  assert sorted(
+      path.name for path in (directory / "generations").iterdir()
+  ) == sorted((manifest["generation"], new_generation))
 
 
 def test_states_npy_is_deterministic_across_input_memory_layouts(tmp_path):
@@ -399,19 +448,22 @@ def test_states_npy_is_deterministic_across_input_memory_layouts(tmp_path):
   c_directory = write_simulation_log(c_log, tmp_path / "c")
   f_directory = write_simulation_log(f_log, tmp_path / "f")
 
-  assert (c_directory / "states.npy").read_bytes() == (
-      f_directory / "states.npy"
-  ).read_bytes()
+  assert _payload_path(c_directory, "states.npy").read_bytes() == (
+      _payload_path(f_directory, "states.npy").read_bytes()
+  )
+  assert _read_manifest(c_directory)["generation"] == (
+      _read_manifest(f_directory)["generation"]
+  )
 
 
 def test_identical_overwrite_keeps_every_artifact_byte_identical(tmp_path):
   directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
-  filenames = _PAYLOAD_FILENAMES + ("manifest.json",)
-  before = {name: (directory / name).read_bytes() for name in filenames}
+  before = _artifact_snapshot(directory)
 
   write_simulation_log(_simulation_log(), directory, overwrite=True)
 
-  assert before == {name: (directory / name).read_bytes() for name in filenames}
+  assert before == _artifact_snapshot(directory)
+  assert len(tuple((directory / "generations").iterdir())) == 1
 
 
 def test_signed_zero_and_contact_permutations_produce_identical_artifacts(tmp_path):
@@ -443,22 +495,34 @@ def test_signed_zero_and_contact_permutations_produce_identical_artifacts(tmp_pa
   positive_directory = write_simulation_log(positive, tmp_path / "positive")
   negative_directory = write_simulation_log(negative, tmp_path / "negative")
 
-  for filename in _PAYLOAD_FILENAMES + ("manifest.json",):
-    assert (positive_directory / filename).read_bytes() == (
-        negative_directory / filename
-    ).read_bytes()
+  assert (positive_directory / "manifest.json").read_bytes() == (
+      negative_directory / "manifest.json"
+  ).read_bytes()
+  for filename in _PAYLOAD_FILENAMES:
+    assert _payload_path(positive_directory, filename).read_bytes() == (
+        _payload_path(negative_directory, filename).read_bytes()
+    )
 
 
-def test_write_simulation_log_finalizes_each_temp_file_with_replace(
+def test_write_simulation_log_publishes_generation_then_manifest_and_fsyncs(
     tmp_path, monkeypatch
 ):
+  renames = []
   replacements = []
+  publication_events = []
   directory_fsyncs = []
+  real_rename = logging_module.os.rename
   real_replace = logging_module.os.replace
   real_fsync = logging_module.os.fsync
 
+  def tracked_rename(source, destination):
+    renames.append((Path(source), Path(destination)))
+    publication_events.append("generation")
+    return real_rename(source, destination)
+
   def tracked_replace(source, destination):
     replacements.append((Path(source), Path(destination)))
+    publication_events.append("manifest")
     return real_replace(source, destination)
 
   def tracked_fsync(file_descriptor):
@@ -466,65 +530,149 @@ def test_write_simulation_log_finalizes_each_temp_file_with_replace(
       directory_fsyncs.append(file_descriptor)
     return real_fsync(file_descriptor)
 
+  monkeypatch.setattr(logging_module.os, "rename", tracked_rename)
   monkeypatch.setattr(logging_module.os, "replace", tracked_replace)
   monkeypatch.setattr(logging_module.os, "fsync", tracked_fsync)
   directory = tmp_path / "artifact"
 
   write_simulation_log(_simulation_log(), directory)
 
-  assert [destination.name for _, destination in replacements] == [
-      "contacts.jsonl",
-      "states.npy",
-      "metadata.json",
-      "manifest.json",
+  assert len(renames) == 1
+  temporary_generation, final_generation = renames[0]
+  assert temporary_generation.parent == directory / "generations"
+  assert temporary_generation.name.startswith(".tmp-")
+  assert final_generation.parent == directory / "generations"
+  assert final_generation.name == _read_manifest(directory)["generation"]
+  assert replacements == [
+      (replacements[0][0], directory / "manifest.json")
   ]
-  assert all(source.parent == directory for source, _ in replacements)
-  assert all(source.name.startswith(".") for source, _ in replacements)
-  assert all(source != destination for source, destination in replacements)
-  assert directory_fsyncs
+  assert replacements[0][0].parent == directory
+  assert replacements[0][0].name.startswith(".manifest.")
+  assert publication_events == ["generation", "manifest"]
+  # Temporary generation, generations/, artifact root, and newly created
+  # artifact root's parent are all durably synchronized.
+  assert len(directory_fsyncs) >= 4
 
 
-@pytest.mark.parametrize("failure_index", range(4))
-def test_replace_failure_never_exposes_a_mixed_generation(
-    tmp_path, monkeypatch, failure_index
+@pytest.mark.parametrize("failure_boundary", ["generation", "manifest"])
+def test_publication_failure_during_overwrite_keeps_old_generation_readable(
+    tmp_path, monkeypatch, failure_boundary
 ):
   old_log = _simulation_log(branch="old", contacts=())
-  directory = write_simulation_log(
-      old_log, tmp_path / "artifact"
-  )
+  directory = write_simulation_log(old_log, tmp_path / "artifact")
+  old_manifest = (directory / "manifest.json").read_bytes()
   new_states = _states()
   new_states[-1, 0, 0] = 1.0
-  new_log = _simulation_log(
-      branch="new", states=new_states, contacts=()
-  )
+  new_log = _simulation_log(branch="new", states=new_states, contacts=())
+  real_rename = logging_module.os.rename
   real_replace = logging_module.os.replace
-  call_count = 0
 
-  def fail_at_boundary(source, destination):
-    nonlocal call_count
-    current_call = call_count
-    call_count += 1
-    if current_call == failure_index:
+  def fail_generation(source, destination):
+    if failure_boundary == "generation":
+      raise OSError("injected publication failure")
+    return real_rename(source, destination)
+
+  def fail_manifest(source, destination):
+    if failure_boundary == "manifest":
       raise OSError("injected publication failure")
     return real_replace(source, destination)
 
-  monkeypatch.setattr(logging_module.os, "replace", fail_at_boundary)
+  monkeypatch.setattr(logging_module.os, "rename", fail_generation)
+  monkeypatch.setattr(logging_module.os, "replace", fail_manifest)
   with pytest.raises(OSError, match="injected"):
     write_simulation_log(new_log, directory, overwrite=True)
 
-  try:
-    restored = read_simulation_log(directory)
-  except ValueError as error:
-    assert "corrupt" in str(error).lower() or "incomplete" in str(error).lower()
-  else:
-    assert restored == old_log
+  assert (directory / "manifest.json").read_bytes() == old_manifest
+  assert read_simulation_log(directory) == old_log
+  assert not any(
+      path.name.startswith(".tmp-")
+      for path in (directory / "generations").iterdir()
+  )
+
+
+@pytest.mark.parametrize("failure_boundary", ["generation", "manifest"])
+def test_initial_publication_failure_leaves_no_readable_manifest(
+    tmp_path, monkeypatch, failure_boundary
+):
+  directory = tmp_path / "artifact"
+  real_rename = logging_module.os.rename
+  real_replace = logging_module.os.replace
+
+  def fail_generation(source, destination):
+    if failure_boundary == "generation":
+      raise OSError("injected publication failure")
+    return real_rename(source, destination)
+
+  def fail_manifest(source, destination):
+    if failure_boundary == "manifest":
+      raise OSError("injected publication failure")
+    return real_replace(source, destination)
+
+  monkeypatch.setattr(logging_module.os, "rename", fail_generation)
+  monkeypatch.setattr(logging_module.os, "replace", fail_manifest)
+  with pytest.raises(OSError, match="injected"):
+    write_simulation_log(_simulation_log(), directory)
+
+  assert not (directory / "manifest.json").exists()
+  with pytest.raises(ValueError, match="corrupt|incomplete|manifest"):
+    read_simulation_log(directory)
+
+
+def test_concurrent_overwrites_publish_one_complete_generation(tmp_path):
+  directory = write_simulation_log(
+      _simulation_log(branch="old", contacts=()), tmp_path / "artifact"
+  )
+  first_states = _states()
+  first_states[-1, 0, 0] = 1.0
+  second_states = _states()
+  second_states[-1, 0, 0] = 2.0
+  first = _simulation_log(branch="first", states=first_states, contacts=())
+  second = _simulation_log(branch="second", states=second_states, contacts=())
+  barrier = threading.Barrier(2)
+
+  def publish(log):
+    barrier.wait()
+    write_simulation_log(log, directory, overwrite=True)
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    futures = [executor.submit(publish, log) for log in (first, second)]
+    for future in futures:
+      future.result()
+
+  restored = read_simulation_log(directory)
+  assert restored == first or restored == second
+  assert _read_manifest(directory) == _expected_manifest(directory)
+  assert not any(
+      path.name.startswith(".tmp-")
+      for path in (directory / "generations").iterdir()
+  )
+
+
+def test_concurrent_non_overwriting_publishers_have_one_winner(tmp_path):
+  directory = tmp_path / "artifact"
+  first = _simulation_log(branch="first", contacts=())
+  second = _simulation_log(branch="second", contacts=())
+  barrier = threading.Barrier(2)
+
+  def publish(log):
+    barrier.wait()
+    try:
+      write_simulation_log(log, directory)
+    except FileExistsError:
+      return ("exists", log.branch)
+    return ("written", log.branch)
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    results = list(executor.map(publish, (first, second)))
+
+  assert sorted(result for result, _ in results) == ["exists", "written"]
+  winner = next(branch for result, branch in results if result == "written")
+  assert read_simulation_log(directory).branch == winner
 
 
 def test_read_simulation_log_requires_and_validates_manifest(tmp_path):
   directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
-  assert json.loads((directory / "manifest.json").read_text()) == (
-      _expected_manifest(directory)
-  )
+  assert _read_manifest(directory) == _expected_manifest(directory)
   (directory / "manifest.json").unlink()
 
   with pytest.raises(ValueError, match="corrupt|incomplete|manifest"):
@@ -534,7 +682,7 @@ def test_read_simulation_log_requires_and_validates_manifest(tmp_path):
 @pytest.mark.parametrize("filename", _PAYLOAD_FILENAMES)
 def test_read_simulation_log_rejects_manifest_payload_mismatch(tmp_path, filename):
   directory = write_simulation_log(_simulation_log(), tmp_path / filename)
-  with (directory / filename).open("ab") as stream:
+  with _payload_path(directory, filename).open("ab") as stream:
     stream.write(b"tampered")
 
   with pytest.raises(ValueError, match="corrupt|integrity|manifest"):
@@ -544,7 +692,7 @@ def test_read_simulation_log_rejects_manifest_payload_mismatch(tmp_path, filenam
 @pytest.mark.parametrize("corruption", ["trailing", "concatenated"])
 def test_read_simulation_log_rejects_bytes_after_npy_payload(tmp_path, corruption):
   directory = write_simulation_log(_simulation_log(), tmp_path / corruption)
-  states_path = directory / "states.npy"
+  states_path = _payload_path(directory, "states.npy")
   if corruption == "trailing":
     extra = b"trailing bytes"
   else:
@@ -564,7 +712,7 @@ def test_read_simulation_log_rejects_nonnumeric_or_pickled_states(
     tmp_path, dtype
 ):
   directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
-  states_path = directory / "states.npy"
+  states_path = _payload_path(directory, "states.npy")
   values = _states().astype(dtype)
   with states_path.open("wb") as stream:
     np.save(stream, values, allow_pickle=dtype is object)
@@ -576,7 +724,7 @@ def test_read_simulation_log_rejects_nonnumeric_or_pickled_states(
 
 def test_read_simulation_log_rejects_timedelta_states(tmp_path):
   directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
-  with (directory / "states.npy").open("wb") as stream:
+  with _payload_path(directory, "states.npy").open("wb") as stream:
     np.save(stream, _timedelta_states(), allow_pickle=False)
   _refresh_manifest(directory)
 
@@ -587,7 +735,7 @@ def test_read_simulation_log_rejects_timedelta_states(tmp_path):
 def test_read_simulation_log_rejects_corrupt_artifacts(tmp_path):
   directory = tmp_path / "artifact"
   write_simulation_log(_simulation_log(), directory)
-  metadata_path = directory / "metadata.json"
+  metadata_path = _payload_path(directory, "metadata.json")
   payload = json.loads(metadata_path.read_text())
   payload["schema_version"] = "999"
   metadata_path.write_text(json.dumps(payload))

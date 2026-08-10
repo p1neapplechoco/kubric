@@ -8,7 +8,9 @@ import json
 import math
 import numbers
 import os
+import shutil
 import tempfile
+from contextlib import contextmanager
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +20,11 @@ from typing import Any, ClassVar, Optional, Tuple, Union
 import numpy as np
 
 from interventions.schema import SCHEMA_VERSION, to_jsonable
+
+try:
+  import fcntl
+except ImportError:  # pragma: no cover - exercised only off POSIX platforms.
+  fcntl = None
 
 
 POSITION_SLICE = slice(0, 3)
@@ -433,7 +440,8 @@ class SimulationLog:
 
 _PAYLOAD_FILENAMES = ("contacts.jsonl", "states.npy", "metadata.json")
 _MANIFEST_FILENAME = "manifest.json"
-_ARTIFACT_FILENAMES = _PAYLOAD_FILENAMES + (_MANIFEST_FILENAME,)
+_GENERATIONS_DIRECTORY = "generations"
+_LOCK_FILENAME = ".publish.lock"
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -460,9 +468,14 @@ def _manifest(payloads: Mapping[str, bytes]) -> Mapping[str, Any]:
   generation_material = "".join(
       files[filename]["sha256"] for filename in _PAYLOAD_FILENAMES
   ).encode("ascii")
+  generation = hashlib.sha256(generation_material).hexdigest()
+  for filename in _PAYLOAD_FILENAMES:
+    files[filename]["path"] = "{}/{}/{}".format(
+        _GENERATIONS_DIRECTORY, generation, filename
+    )
   return {
       "files": files,
-      "generation": hashlib.sha256(generation_material).hexdigest(),
+      "generation": generation,
       "schema_version": SCHEMA_VERSION,
   }
 
@@ -488,23 +501,66 @@ def _fsync_directory(directory: Path) -> None:
     os.close(file_descriptor)
 
 
-def write_simulation_log(
-    log: SimulationLog,
-    directory: Union[str, os.PathLike[str]],
-    *,
-    overwrite: bool = False,
-) -> Path:
-  """Atomically writes each file of a simulation-log artifact."""
-  if not isinstance(log, SimulationLog):
-    raise TypeError("log must be a SimulationLog")
-  if not isinstance(overwrite, bool):
-    raise TypeError("overwrite must be a bool")
-  target = Path(directory)
-  target.mkdir(parents=True, exist_ok=True)
-  final_paths = {name: target / name for name in _ARTIFACT_FILENAMES}
-  if not overwrite and any(path.exists() for path in final_paths.values()):
-    raise FileExistsError("simulation-log artifact already exists: {}".format(target))
+@contextmanager
+def _publisher_lock(directory: Path):
+  if fcntl is None:
+    raise RuntimeError(
+        "simulation-log publication requires advisory file locking"
+    )
+  file_descriptor = os.open(
+      str(directory / _LOCK_FILENAME), os.O_CREAT | os.O_RDWR, 0o600
+  )
+  try:
+    fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+    yield
+  finally:
+    try:
+      fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+    finally:
+      os.close(file_descriptor)
 
+
+def _create_artifact_root(target: Path) -> None:
+  try:
+    target.mkdir(parents=True, exist_ok=False)
+  except FileExistsError:
+    if not target.is_dir():
+      raise
+  else:
+    _fsync_directory(target.parent)
+
+
+def _write_generation_payloads(
+    directory: Path, payloads: Mapping[str, bytes]
+) -> None:
+  for filename in _PAYLOAD_FILENAMES:
+    path = directory / filename
+    with path.open("xb") as stream:
+      stream.write(payloads[filename])
+      stream.flush()
+      os.fsync(stream.fileno())
+  _fsync_directory(directory)
+
+
+def _verify_generation(
+    directory: Path, payloads: Mapping[str, bytes]
+) -> None:
+  try:
+    names = tuple(sorted(path.name for path in directory.iterdir()))
+  except OSError as error:
+    raise ValueError("simulation-log generation is incomplete") from error
+  if names != tuple(sorted(_PAYLOAD_FILENAMES)):
+    raise ValueError("simulation-log generation has unexpected files")
+  for filename in _PAYLOAD_FILENAMES:
+    try:
+      existing = (directory / filename).read_bytes()
+    except OSError as error:
+      raise ValueError("simulation-log generation is incomplete") from error
+    if existing != payloads[filename]:
+      raise ValueError("simulation-log generation hash collision")
+
+
+def _simulation_log_payloads(log: SimulationLog) -> Mapping[str, bytes]:
   metadata_payload = {
       "branch": log.branch,
       "object_ids": list(log.object_ids),
@@ -518,40 +574,76 @@ def write_simulation_log(
   }
   states_stream = io.BytesIO()
   np.save(states_stream, log.states, allow_pickle=False)
-  payloads = {
+  return {
       "contacts.jsonl": b"".join(
           _json_bytes(record.to_dict()) for record in log.contacts
       ),
       "states.npy": states_stream.getvalue(),
       "metadata.json": _json_bytes(metadata_payload),
   }
-  manifest_payload = _json_bytes(_manifest(payloads))
 
-  temporary = {}
-  try:
-    prefixes = {
-        "contacts.jsonl": ".contacts.",
-        "states.npy": ".states.",
-        "metadata.json": ".metadata.",
-    }
-    for name in _PAYLOAD_FILENAMES:
-      temporary[name] = _write_temp(target, prefixes[name], payloads[name])
-    temporary[_MANIFEST_FILENAME] = _write_temp(
-        target, ".manifest.", manifest_payload
+
+def write_simulation_log(
+    log: SimulationLog,
+    directory: Union[str, os.PathLike[str]],
+    *,
+    overwrite: bool = False,
+) -> Path:
+  """Publishes an immutable generation and atomically points to it."""
+  if not isinstance(log, SimulationLog):
+    raise TypeError("log must be a SimulationLog")
+  if not isinstance(overwrite, bool):
+    raise TypeError("overwrite must be a bool")
+  target = Path(directory)
+  _create_artifact_root(target)
+  payloads = _simulation_log_payloads(log)
+  manifest = _manifest(payloads)
+  manifest_payload = _json_bytes(manifest)
+
+  with _publisher_lock(target):
+    manifest_path = target / _MANIFEST_FILENAME
+    if manifest_path.exists() and not overwrite:
+      raise FileExistsError(
+          "simulation-log artifact already exists: {}".format(target)
+      )
+    generations = target / _GENERATIONS_DIRECTORY
+    generations.mkdir(exist_ok=True)
+    temporary_generation = Path(
+        tempfile.mkdtemp(prefix=".tmp-", dir=str(generations))
     )
-    for name in _PAYLOAD_FILENAMES:
-      os.replace(str(temporary[name]), str(final_paths[name]))
-    os.replace(
-        str(temporary[_MANIFEST_FILENAME]),
-        str(final_paths[_MANIFEST_FILENAME]),
-    )
-    _fsync_directory(target)
-  finally:
-    for path in temporary.values():
-      try:
-        path.unlink()
-      except FileNotFoundError:
-        pass
+    temporary_manifest = None
+    try:
+      _write_generation_payloads(temporary_generation, payloads)
+      final_generation = generations / manifest["generation"]
+      if final_generation.exists():
+        _verify_generation(final_generation, payloads)
+        shutil.rmtree(temporary_generation)
+        temporary_generation = None
+      else:
+        try:
+          os.rename(str(temporary_generation), str(final_generation))
+        except OSError:
+          if not final_generation.exists():
+            raise
+          _verify_generation(final_generation, payloads)
+          shutil.rmtree(temporary_generation)
+        temporary_generation = None
+      _fsync_directory(generations)
+
+      temporary_manifest = _write_temp(
+          target, ".manifest.", manifest_payload
+      )
+      os.replace(str(temporary_manifest), str(manifest_path))
+      temporary_manifest = None
+      _fsync_directory(target)
+    finally:
+      if temporary_generation is not None:
+        shutil.rmtree(temporary_generation, ignore_errors=True)
+      if temporary_manifest is not None:
+        try:
+          temporary_manifest.unlink()
+        except FileNotFoundError:
+          pass
   return target
 
 
@@ -570,10 +662,39 @@ def read_simulation_log(
     manifest_payload = json.loads(manifest_bytes.decode("utf-8"))
   except (UnicodeDecodeError, json.JSONDecodeError) as error:
     raise ValueError("simulation log corruption: invalid manifest.json") from error
+  if not isinstance(manifest_payload, dict) or set(manifest_payload) != {
+      "files",
+      "generation",
+      "schema_version",
+  }:
+    raise ValueError("simulation log corruption: invalid manifest.json")
+  generation = manifest_payload["generation"]
+  files = manifest_payload["files"]
+  if (
+      not isinstance(generation, str)
+      or len(generation) != 64
+      or any(character not in "0123456789abcdef" for character in generation)
+      or not isinstance(files, dict)
+      or set(files) != set(_PAYLOAD_FILENAMES)
+  ):
+    raise ValueError("simulation log corruption: invalid manifest.json")
+
   payloads = {}
   for filename in _PAYLOAD_FILENAMES:
+    entry = files[filename]
+    expected_path = "{}/{}/{}".format(
+        _GENERATIONS_DIRECTORY, generation, filename
+    )
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != {"path", "sha256", "size"}
+        or entry.get("path") != expected_path
+    ):
+      raise ValueError("simulation log corruption: invalid manifest.json")
     try:
-      payloads[filename] = (source / filename).read_bytes()
+      payloads[filename] = (
+          source / _GENERATIONS_DIRECTORY / generation / filename
+      ).read_bytes()
     except OSError as error:
       raise ValueError(
           "incomplete simulation log: missing {}".format(filename)
