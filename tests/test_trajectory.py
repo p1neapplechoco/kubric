@@ -45,6 +45,16 @@ def test_build_linear_path_has_expected_shape_values_and_endpoints():
   np.testing.assert_allclose(path[2], [0.5, 1.0, 1.5])
 
 
+def test_build_linear_path_interpolates_extreme_finite_endpoints_safely():
+  waypoints = np.array([[1e308, 0.0, 0.0], [-1e308, 0.0, 0.0]])
+
+  path = build_path(waypoints, 3, method="linear")
+
+  assert np.isfinite(path).all()
+  np.testing.assert_array_equal(path[[0, -1]], waypoints)
+  assert path[1, 0] == pytest.approx(0.0, abs=1.0)
+
+
 def test_build_spline_path_preserves_waypoints_endpoints():
   waypoints = np.array(
       [[0.0, 0.0, 0.0], [1.0, 1.0, 0.5], [2.0, 0.0, 1.0]]

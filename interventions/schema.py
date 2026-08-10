@@ -90,7 +90,7 @@ def to_jsonable(value: Any) -> Any:
 def _freeze(value: Any) -> Any:
   """Copies JSON-like data into recursively immutable containers."""
   if dataclasses.is_dataclass(value) and not isinstance(value, type):
-    return value
+    raise TypeError("nested dataclass values are not supported")
   if value is None or isinstance(value, (str, bool, numbers.Number)):
     # Validate numeric leaves while preserving integer/float identity.
     to_jsonable(value)
@@ -226,10 +226,15 @@ class ObjectConfig(_SchemaMixin):
       raise TypeError("static must be a bool")
 
     quaternion = _vector(self.quaternion, 4, "quaternion")
-    norm = math.sqrt(sum(component * component for component in quaternion))
-    if norm <= 1e-12:
+    scale = max(abs(component) for component in quaternion)
+    if scale == 0.0:
       raise ValueError("quaternion must be non-zero")
-    quaternion = tuple(component / norm for component in quaternion)
+    scaled = tuple(component / scale for component in quaternion)
+    norm = math.hypot(*scaled)
+    quaternion = tuple(component / norm for component in scaled)
+    unit_norm = math.hypot(*quaternion)
+    if not math.isfinite(unit_norm) or abs(unit_norm - 1.0) > 1e-12:
+      raise ValueError("quaternion normalization failed")
 
     object.__setattr__(self, "mass", mass)
     object.__setattr__(self, "friction", friction)
@@ -382,6 +387,37 @@ class Intervention(_SchemaMixin):
     object.__setattr__(self, "schema_version", _version(self.schema_version))
 
 
+def _temporal_edge(record: Any, name: str, index: int) -> Mapping[str, Any]:
+  if not isinstance(record, Mapping):
+    raise TypeError("{}[{}] must be a temporal edge mapping".format(name, index))
+  required = ("object_a", "object_b", "start_step", "end_step")
+  missing = [key for key in required if key not in record]
+  if missing:
+    raise ValueError(
+        "{}[{}] is missing required fields: {}".format(
+            name, index, ", ".join(missing)
+        )
+    )
+  object_a = _nonempty_string(record["object_a"], "object_a")
+  object_b = _nonempty_string(record["object_b"], "object_b")
+  if object_a == object_b:
+    raise ValueError("temporal edge endpoints must be distinct")
+  object_a, object_b = sorted((object_a, object_b))
+  start_step = _integer(record["start_step"], "start_step")
+  end_step = _integer(record["end_step"], "end_step")
+  if start_step < 0 or end_step <= start_step:
+    raise ValueError("temporal edge steps must satisfy 0 <= start_step < end_step")
+
+  normalized = dict(record)
+  normalized.update(
+      object_a=object_a,
+      object_b=object_b,
+      start_step=start_step,
+      end_step=end_step,
+  )
+  return _freeze(normalized)
+
+
 def _records(value: Iterable[Any], name: str) -> Tuple[Any, ...]:
   if value is None:
     return ()
@@ -394,7 +430,9 @@ def _records(value: Iterable[Any], name: str) -> Tuple[Any, ...]:
       records = tuple(value)
     except TypeError as error:
       raise TypeError("{} must be an iterable of records".format(name)) from error
-  frozen = tuple(_freeze(record) for record in records)
+  frozen = tuple(
+      _temporal_edge(record, name, index) for index, record in enumerate(records)
+  )
   # Force validation now so artifact writing cannot fail later.
   to_jsonable(frozen)
   return frozen

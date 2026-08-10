@@ -1,7 +1,7 @@
 """Tests for immutable intervention artifact schemas."""
 
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import dataclass, FrozenInstanceError
 
 import numpy as np
 import pytest
@@ -70,6 +70,13 @@ def test_object_config_normalizes_size_quaternion_and_metadata():
     config.mass = 2.0
   with pytest.raises(TypeError):
     config.metadata["new"] = "value"
+
+
+def test_object_config_normalizes_extreme_finite_quaternion_safely():
+  config = _object(quaternion=(1e308, 0.0, 0.0, 0.0))
+
+  assert config.quaternion == (1.0, 0.0, 0.0, 0.0)
+  assert np.linalg.norm(config.quaternion) == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -194,9 +201,26 @@ def test_intervention_rejects_invalid_values(overrides):
 
 def test_graph_delta_and_ground_truth_are_deterministic_and_json_safe():
   delta = GraphEdgeDelta(
-      added=({"source": "a", "target": "b", "frames": (2, 4)},),
-      removed=[{"source": "c", "target": "b", "frames": [1, 2]}],
-      changed=(),
+      added=({
+          "object_a": "b",
+          "object_b": "a",
+          "start_step": 2,
+          "end_step": 4,
+      },),
+      removed=[{
+          "object_a": "c",
+          "object_b": "b",
+          "start_step": 1,
+          "end_step": 2,
+      }],
+      changed=({
+          "object_a": "d",
+          "object_b": "a",
+          "start_step": 5,
+          "end_step": 7,
+          "factual": {"force": 1.0},
+          "counterfactual": {"force": 2.0},
+      },),
   )
   truth = GroundTruth(
       graph_delta=delta,
@@ -209,11 +233,72 @@ def test_graph_delta_and_ground_truth_are_deterministic_and_json_safe():
   assert truth.soft_affected == ("b", "d")
   assert tuple(truth.propagation_path) == ("a", "c")
   assert truth.propagation_path["c"] == ("a", "c")
+  assert delta.added[0]["object_a"] == "a"
+  assert delta.added[0]["object_b"] == "b"
   with pytest.raises(TypeError):
-    delta.added[0]["source"] = "x"
+    delta.added[0]["object_a"] = "x"
   payload = truth.to_dict()
-  assert payload["graph_delta"]["added"][0]["frames"] == [2, 4]
+  assert payload["graph_delta"]["changed"][0]["counterfactual"] == {
+      "force": 2.0
+  }
   assert json.loads(json.dumps(payload)) == payload
+
+
+@pytest.mark.parametrize(
+    "field,record",
+    [
+        ("added", 7),
+        ("removed", {"object_a": "a", "object_b": "b"}),
+        (
+            "changed",
+            {
+                "object_a": "a",
+                "object_b": "b",
+                "start_step": True,
+                "end_step": 2,
+            },
+        ),
+        (
+            "added",
+            {
+                "object_a": "a",
+                "object_b": "b",
+                "start_step": -1,
+                "end_step": 2,
+            },
+        ),
+        (
+            "removed",
+            {
+                "object_a": "a",
+                "object_b": "b",
+                "start_step": 2,
+                "end_step": 2,
+            },
+        ),
+    ],
+)
+def test_graph_delta_rejects_malformed_temporal_edges(field, record):
+  with pytest.raises((TypeError, ValueError)):
+    GraphEdgeDelta(**{field: (record,)})
+
+
+def test_schema_construction_rejects_nested_dataclass_values():
+  @dataclass
+  class MutableMetadata:
+    values: list
+
+  nested = MutableMetadata(values=[1])
+  with pytest.raises(TypeError, match="dataclass"):
+    _object(metadata={"nested": nested})
+  with pytest.raises(TypeError, match="dataclass"):
+    GraphEdgeDelta(added=({
+        "object_a": "a",
+        "object_b": "b",
+        "start_step": 0,
+        "end_step": 1,
+        "payload": nested,
+    },))
 
 
 def test_ground_truth_rejects_overlap_and_invalid_delta():

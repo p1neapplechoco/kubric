@@ -65,6 +65,22 @@ def _continuous_quaternions(quaternions: np.ndarray) -> np.ndarray:
   return result
 
 
+def _linear_interpolate(
+    source_times: np.ndarray,
+    values: np.ndarray,
+    query_times: np.ndarray,
+) -> np.ndarray:
+  """Linearly interpolates with convex weights to avoid subtractive overflow."""
+  queries = np.clip(np.asarray(query_times, dtype=float), source_times[0], source_times[-1])
+  indices = np.searchsorted(source_times, queries, side="right") - 1
+  indices = np.clip(indices, 0, len(source_times) - 2)
+  fractions = (
+      (queries - source_times[indices])
+      / (source_times[indices + 1] - source_times[indices])
+  )[:, None]
+  return (1.0 - fractions) * values[indices] + fractions * values[indices + 1]
+
+
 def _slerp(
     source_times: np.ndarray,
     quaternions: np.ndarray,
@@ -141,9 +157,7 @@ def build_path(
   output_times = np.linspace(0.0, 1.0, num_frames)
   positions = source[:, :3]
   if method == "linear":
-    output_positions = np.column_stack(
-        [np.interp(output_times, source_times, positions[:, axis]) for axis in range(3)]
-    )
+    output_positions = _linear_interpolate(source_times, positions, output_times)
   else:
     try:
       from scipy.interpolate import CubicSpline
@@ -162,6 +176,8 @@ def build_path(
     aligned = _continuous_quaternions(source[:, 3:])
     result[0, 3:] = aligned[0]
     result[-1, 3:] = aligned[-1]
+  if not np.isfinite(result).all():
+    raise ValueError("interpolation produced non-finite values")
   return result
 
 
@@ -286,9 +302,7 @@ def max_position_deviation(factual: Any, perturbed: Any) -> float:
 
 def _resample_path(path: np.ndarray, query_times: np.ndarray) -> np.ndarray:
   source_times = np.linspace(0.0, 1.0, len(path))
-  positions = np.column_stack(
-      [np.interp(query_times, source_times, path[:, axis]) for axis in range(3)]
-  )
+  positions = _linear_interpolate(source_times, path[:, :3], query_times)
   if path.shape[1] == 3:
     return positions
   return np.column_stack(
