@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import math
 import numbers
@@ -63,7 +65,7 @@ def _real(value: Any, name: str) -> float:
     raise ValueError("{} must be finite".format(name)) from error
   if not math.isfinite(result):
     raise ValueError("{} must be finite".format(name))
-  return result
+  return 0.0 if result == 0.0 else result
 
 
 def _vector(value: Any, length: int, name: str) -> Tuple[float, ...]:
@@ -100,12 +102,24 @@ def _freeze_json(value: Any) -> Any:
   return value
 
 
+def _canonical_json_zeros(value: Any) -> Any:
+  if isinstance(value, float):
+    return 0.0 if value == 0.0 else value
+  if isinstance(value, Mapping):
+    return {
+        key: _canonical_json_zeros(item) for key, item in value.items()
+    }
+  if isinstance(value, (tuple, list)):
+    return [_canonical_json_zeros(item) for item in value]
+  return value
+
+
 def _metadata(value: Any) -> Mapping[str, Any]:
   if value is None:
     value = {}
   if not isinstance(value, Mapping):
     raise TypeError("metadata must be a mapping")
-  converted = to_jsonable(value)
+  converted = _canonical_json_zeros(to_jsonable(value))
   if not isinstance(converted, dict):  # Defensive: mappings serialize as objects.
     raise TypeError("metadata must serialize to a JSON object")
   return _freeze_json(converted)
@@ -124,6 +138,7 @@ def _float_array(value: Any, name: str) -> np.ndarray:
     raise ValueError("{} must be a numeric array".format(name)) from error
   if not np.isfinite(canonical).all():
     raise ValueError("{} must contain only finite values".format(name))
+  canonical[canonical == 0.0] = 0.0
   immutable = canonical.tobytes(order="C")
   return np.frombuffer(immutable, dtype=np.float64).reshape(canonical.shape)
 
@@ -179,7 +194,8 @@ class ContactRecord:
 
     if object_b < object_a:
       object_a, object_b = object_b, object_a
-      normal = tuple(-component for component in normal)
+      normal = tuple(0.0 if component == 0.0 else -component
+                     for component in normal)
 
     object.__setattr__(self, "step", step)
     object.__setattr__(self, "object_a", object_a)
@@ -415,13 +431,15 @@ class SimulationLog:
     )
 
 
-_ARTIFACT_FILENAMES = ("contacts.jsonl", "states.npy", "metadata.json")
+_PAYLOAD_FILENAMES = ("contacts.jsonl", "states.npy", "metadata.json")
+_MANIFEST_FILENAME = "manifest.json"
+_ARTIFACT_FILENAMES = _PAYLOAD_FILENAMES + (_MANIFEST_FILENAME,)
 
 
 def _json_bytes(value: Any) -> bytes:
   return (
       json.dumps(
-          value,
+          _canonical_json_zeros(value),
           sort_keys=True,
           separators=(",", ":"),
           ensure_ascii=False,
@@ -429,6 +447,24 @@ def _json_bytes(value: Any) -> bytes:
       )
       + "\n"
   ).encode("utf-8")
+
+
+def _manifest(payloads: Mapping[str, bytes]) -> Mapping[str, Any]:
+  files = {}
+  for filename in _PAYLOAD_FILENAMES:
+    payload = payloads[filename]
+    files[filename] = {
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+    }
+  generation_material = "".join(
+      files[filename]["sha256"] for filename in _PAYLOAD_FILENAMES
+  ).encode("ascii")
+  return {
+      "files": files,
+      "generation": hashlib.sha256(generation_material).hexdigest(),
+      "schema_version": SCHEMA_VERSION,
+  }
 
 
 def _write_temp(directory: Path, prefix: str, payload: bytes) -> Path:
@@ -439,6 +475,17 @@ def _write_temp(directory: Path, prefix: str, payload: bytes) -> Path:
     stream.flush()
     os.fsync(stream.fileno())
     return Path(stream.name)
+
+
+def _fsync_directory(directory: Path) -> None:
+  flags = os.O_RDONLY
+  if hasattr(os, "O_DIRECTORY"):
+    flags |= os.O_DIRECTORY
+  file_descriptor = os.open(str(directory), flags)
+  try:
+    os.fsync(file_descriptor)
+  finally:
+    os.close(file_descriptor)
 
 
 def write_simulation_log(
@@ -458,9 +505,6 @@ def write_simulation_log(
   if not overwrite and any(path.exists() for path in final_paths.values()):
     raise FileExistsError("simulation-log artifact already exists: {}".format(target))
 
-  contacts_payload = b"".join(
-      _json_bytes(record.to_dict()) for record in log.contacts
-  )
   metadata_payload = {
       "branch": log.branch,
       "object_ids": list(log.object_ids),
@@ -472,24 +516,36 @@ def write_simulation_log(
       "metadata": to_jsonable(log.metadata),
       "schema_version": log.schema_version,
   }
+  states_stream = io.BytesIO()
+  np.save(states_stream, log.states, allow_pickle=False)
+  payloads = {
+      "contacts.jsonl": b"".join(
+          _json_bytes(record.to_dict()) for record in log.contacts
+      ),
+      "states.npy": states_stream.getvalue(),
+      "metadata.json": _json_bytes(metadata_payload),
+  }
+  manifest_payload = _json_bytes(_manifest(payloads))
 
   temporary = {}
   try:
-    temporary["contacts.jsonl"] = _write_temp(
-        target, ".contacts.", contacts_payload
+    prefixes = {
+        "contacts.jsonl": ".contacts.",
+        "states.npy": ".states.",
+        "metadata.json": ".metadata.",
+    }
+    for name in _PAYLOAD_FILENAMES:
+      temporary[name] = _write_temp(target, prefixes[name], payloads[name])
+    temporary[_MANIFEST_FILENAME] = _write_temp(
+        target, ".manifest.", manifest_payload
     )
-    with tempfile.NamedTemporaryFile(
-        mode="wb", prefix=".states.", dir=str(target), delete=False
-    ) as stream:
-      np.save(stream, log.states, allow_pickle=False)
-      stream.flush()
-      os.fsync(stream.fileno())
-      temporary["states.npy"] = Path(stream.name)
-    temporary["metadata.json"] = _write_temp(
-        target, ".metadata.", _json_bytes(metadata_payload)
-    )
-    for name in _ARTIFACT_FILENAMES:
+    for name in _PAYLOAD_FILENAMES:
       os.replace(str(temporary[name]), str(final_paths[name]))
+    os.replace(
+        str(temporary[_MANIFEST_FILENAME]),
+        str(final_paths[_MANIFEST_FILENAME]),
+    )
+    _fsync_directory(target)
   finally:
     for path in temporary.values():
       try:
@@ -504,8 +560,31 @@ def read_simulation_log(
 ) -> SimulationLog:
   """Reads and validates a simulation-log artifact."""
   source = Path(directory)
-  with (source / "metadata.json").open("r", encoding="utf-8") as stream:
-    metadata_payload = json.load(stream)
+  try:
+    manifest_bytes = (source / _MANIFEST_FILENAME).read_bytes()
+  except OSError as error:
+    raise ValueError(
+        "incomplete simulation log: missing manifest.json"
+    ) from error
+  try:
+    manifest_payload = json.loads(manifest_bytes.decode("utf-8"))
+  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise ValueError("simulation log corruption: invalid manifest.json") from error
+  payloads = {}
+  for filename in _PAYLOAD_FILENAMES:
+    try:
+      payloads[filename] = (source / filename).read_bytes()
+    except OSError as error:
+      raise ValueError(
+          "incomplete simulation log: missing {}".format(filename)
+      ) from error
+  if manifest_payload != _manifest(payloads):
+    raise ValueError("simulation log corruption: manifest integrity mismatch")
+
+  try:
+    metadata_payload = json.loads(payloads["metadata.json"].decode("utf-8"))
+  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise ValueError("metadata.json is invalid JSON") from error
   if not isinstance(metadata_payload, dict):
     raise ValueError("metadata.json must contain a JSON object")
   expected_keys = {
@@ -521,9 +600,9 @@ def read_simulation_log(
     raise ValueError("metadata.json has missing or unexpected fields")
 
   try:
-    with (source / "states.npy").open("rb") as stream:
-      states = np.load(stream, allow_pickle=False)
-      trailing_payload = stream.read(1)
+    states_stream = io.BytesIO(payloads["states.npy"])
+    states = np.load(states_stream, allow_pickle=False)
+    trailing_payload = states_stream.read(1)
   except (TypeError, ValueError, OSError) as error:
     raise ValueError("states.npy is not a valid numeric NumPy array") from error
   if trailing_payload:
@@ -532,7 +611,11 @@ def read_simulation_log(
     raise ValueError("states.npy must contain one non-object NumPy array")
 
   contacts = []
-  with (source / "contacts.jsonl").open("r", encoding="utf-8") as stream:
+  try:
+    contacts_text = payloads["contacts.jsonl"].decode("utf-8")
+  except UnicodeDecodeError as error:
+    raise ValueError("contacts.jsonl is not valid UTF-8") from error
+  with io.StringIO(contacts_text) as stream:
     for line_number, line in enumerate(stream, start=1):
       if not line.strip():
         raise ValueError(

@@ -1,7 +1,10 @@
 """Tests for simulator-independent contact and state logging."""
 
+import hashlib
 import io
 import json
+import math
+import stat
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -90,6 +93,36 @@ def _simulation_log(**overrides):
   return SimulationLog(**values)
 
 
+_PAYLOAD_FILENAMES = ("contacts.jsonl", "states.npy", "metadata.json")
+
+
+def _expected_manifest(directory):
+  files = {}
+  for filename in _PAYLOAD_FILENAMES:
+    payload = (directory / filename).read_bytes()
+    files[filename] = {
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "size": len(payload),
+    }
+  generation_material = "".join(
+      files[filename]["sha256"] for filename in _PAYLOAD_FILENAMES
+  ).encode("ascii")
+  return {
+      "files": files,
+      "generation": hashlib.sha256(generation_material).hexdigest(),
+      "schema_version": "1.0",
+  }
+
+
+def _refresh_manifest(directory):
+  payload = json.dumps(
+      _expected_manifest(directory),
+      sort_keys=True,
+      separators=(",", ":"),
+  ) + "\n"
+  (directory / "manifest.json").write_text(payload)
+
+
 def test_contact_record_canonicalizes_endpoints_and_flips_normal():
   record = ContactRecord(
       step=7,
@@ -115,6 +148,41 @@ def test_contact_record_canonicalizes_endpoints_and_flips_normal():
   }
   with pytest.raises(FrozenInstanceError):
     record.step = 8
+
+
+def test_contact_record_canonicalizes_signed_zero_after_endpoint_reversal():
+  canonical = ContactRecord(
+      step=0,
+      object_a="a",
+      object_b="b",
+      position=(-0.0, 0.0, -0.0),
+      normal=(0.0, -0.0, 1.0),
+      normal_force=-0.0,
+      contact_distance=-0.0,
+  )
+  reversed_record = ContactRecord(
+      step=0,
+      object_a="b",
+      object_b="a",
+      position=(0.0, -0.0, 0.0),
+      normal=(-0.0, 0.0, -1.0),
+      normal_force=0.0,
+      contact_distance=0.0,
+  )
+
+  canonical_bytes = json.dumps(
+      canonical.to_dict(), sort_keys=True, separators=(",", ":")
+  ).encode()
+  reversed_bytes = json.dumps(
+      reversed_record.to_dict(), sort_keys=True, separators=(",", ":")
+  ).encode()
+  assert canonical_bytes == reversed_bytes
+  zero_values = (
+      canonical.position
+      + canonical.normal[:2]
+      + (canonical.normal_force, canonical.contact_distance)
+  )
+  assert all(math.copysign(1.0, value) == 1.0 for value in zero_values)
 
 
 @pytest.mark.parametrize(
@@ -298,9 +366,12 @@ def test_simulation_log_roundtrip_and_overwrite_refusal(tmp_path):
   metadata = json.loads((directory / "metadata.json").read_text())
   assert metadata["schema_version"] == "1.0"
   assert json.loads((directory / "contacts.jsonl").read_text()) == log.contacts[0].to_dict()
+  assert json.loads((directory / "manifest.json").read_text()) == (
+      _expected_manifest(directory)
+  )
   before_refusal = {
       filename: (directory / filename).read_bytes()
-      for filename in ("contacts.jsonl", "states.npy", "metadata.json")
+      for filename in _PAYLOAD_FILENAMES + ("manifest.json",)
   }
   with pytest.raises(FileExistsError):
     write_simulation_log(log, directory)
@@ -310,6 +381,7 @@ def test_simulation_log_roundtrip_and_overwrite_refusal(tmp_path):
   }
   assert sorted(path.name for path in directory.iterdir()) == [
       "contacts.jsonl",
+      "manifest.json",
       "metadata.json",
       "states.npy",
   ]
@@ -332,17 +404,70 @@ def test_states_npy_is_deterministic_across_input_memory_layouts(tmp_path):
   ).read_bytes()
 
 
+def test_identical_overwrite_keeps_every_artifact_byte_identical(tmp_path):
+  directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
+  filenames = _PAYLOAD_FILENAMES + ("manifest.json",)
+  before = {name: (directory / name).read_bytes() for name in filenames}
+
+  write_simulation_log(_simulation_log(), directory, overwrite=True)
+
+  assert before == {name: (directory / name).read_bytes() for name in filenames}
+
+
+def test_signed_zero_and_contact_permutations_produce_identical_artifacts(tmp_path):
+  positive_states = _states()
+  negative_states = _states()
+  negative_states[negative_states == 0.0] = -0.0
+  positive_path = np.array([[0, 0, 0], [0.5, 0, 0], [1, 0, 0]], dtype=float)
+  negative_path = positive_path.copy()
+  negative_path[negative_path == 0.0] = -0.0
+  canonical_contact = ContactRecord(
+      3, "a", "b", (-0.0, 0.0, -0.0), (0.0, -0.0, 1.0), 1.0, -0.0
+  )
+  reversed_contact = ContactRecord(
+      3, "b", "a", (0.0, -0.0, 0.0), (-0.0, 0.0, -1.0), 1.0, 0.0
+  )
+  positive = _simulation_log(
+      states=positive_states,
+      commanded_path=positive_path,
+      contacts=(canonical_contact,),
+      metadata={"zero": 0.0},
+  )
+  negative = _simulation_log(
+      states=negative_states,
+      commanded_path=negative_path,
+      contacts=(reversed_contact,),
+      metadata={"zero": -0.0},
+  )
+
+  positive_directory = write_simulation_log(positive, tmp_path / "positive")
+  negative_directory = write_simulation_log(negative, tmp_path / "negative")
+
+  for filename in _PAYLOAD_FILENAMES + ("manifest.json",):
+    assert (positive_directory / filename).read_bytes() == (
+        negative_directory / filename
+    ).read_bytes()
+
+
 def test_write_simulation_log_finalizes_each_temp_file_with_replace(
     tmp_path, monkeypatch
 ):
   replacements = []
+  directory_fsyncs = []
   real_replace = logging_module.os.replace
+  real_fsync = logging_module.os.fsync
 
   def tracked_replace(source, destination):
     replacements.append((Path(source), Path(destination)))
     return real_replace(source, destination)
 
+  def tracked_fsync(file_descriptor):
+    if stat.S_ISDIR(logging_module.os.fstat(file_descriptor).st_mode):
+      directory_fsyncs.append(file_descriptor)
+    return real_fsync(file_descriptor)
+
   monkeypatch.setattr(logging_module.os, "replace", tracked_replace)
+  monkeypatch.setattr(logging_module.os, "fsync", tracked_fsync)
   directory = tmp_path / "artifact"
 
   write_simulation_log(_simulation_log(), directory)
@@ -351,10 +476,69 @@ def test_write_simulation_log_finalizes_each_temp_file_with_replace(
       "contacts.jsonl",
       "states.npy",
       "metadata.json",
+      "manifest.json",
   ]
   assert all(source.parent == directory for source, _ in replacements)
   assert all(source.name.startswith(".") for source, _ in replacements)
   assert all(source != destination for source, destination in replacements)
+  assert directory_fsyncs
+
+
+@pytest.mark.parametrize("failure_index", range(4))
+def test_replace_failure_never_exposes_a_mixed_generation(
+    tmp_path, monkeypatch, failure_index
+):
+  old_log = _simulation_log(branch="old", contacts=())
+  directory = write_simulation_log(
+      old_log, tmp_path / "artifact"
+  )
+  new_states = _states()
+  new_states[-1, 0, 0] = 1.0
+  new_log = _simulation_log(
+      branch="new", states=new_states, contacts=()
+  )
+  real_replace = logging_module.os.replace
+  call_count = 0
+
+  def fail_at_boundary(source, destination):
+    nonlocal call_count
+    current_call = call_count
+    call_count += 1
+    if current_call == failure_index:
+      raise OSError("injected publication failure")
+    return real_replace(source, destination)
+
+  monkeypatch.setattr(logging_module.os, "replace", fail_at_boundary)
+  with pytest.raises(OSError, match="injected"):
+    write_simulation_log(new_log, directory, overwrite=True)
+
+  try:
+    restored = read_simulation_log(directory)
+  except ValueError as error:
+    assert "corrupt" in str(error).lower() or "incomplete" in str(error).lower()
+  else:
+    assert restored == old_log
+
+
+def test_read_simulation_log_requires_and_validates_manifest(tmp_path):
+  directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
+  assert json.loads((directory / "manifest.json").read_text()) == (
+      _expected_manifest(directory)
+  )
+  (directory / "manifest.json").unlink()
+
+  with pytest.raises(ValueError, match="corrupt|incomplete|manifest"):
+    read_simulation_log(directory)
+
+
+@pytest.mark.parametrize("filename", _PAYLOAD_FILENAMES)
+def test_read_simulation_log_rejects_manifest_payload_mismatch(tmp_path, filename):
+  directory = write_simulation_log(_simulation_log(), tmp_path / filename)
+  with (directory / filename).open("ab") as stream:
+    stream.write(b"tampered")
+
+  with pytest.raises(ValueError, match="corrupt|integrity|manifest"):
+    read_simulation_log(directory)
 
 
 @pytest.mark.parametrize("corruption", ["trailing", "concatenated"])
@@ -369,6 +553,7 @@ def test_read_simulation_log_rejects_bytes_after_npy_payload(tmp_path, corruptio
     extra = stream.getvalue()
   with states_path.open("ab") as stream:
     stream.write(extra)
+  _refresh_manifest(directory)
 
   with pytest.raises(ValueError, match="trailing|payload"):
     read_simulation_log(directory)
@@ -383,6 +568,7 @@ def test_read_simulation_log_rejects_nonnumeric_or_pickled_states(
   values = _states().astype(dtype)
   with states_path.open("wb") as stream:
     np.save(stream, values, allow_pickle=dtype is object)
+  _refresh_manifest(directory)
 
   with pytest.raises(ValueError, match="numeric|object|NumPy"):
     read_simulation_log(directory)
@@ -392,6 +578,7 @@ def test_read_simulation_log_rejects_timedelta_states(tmp_path):
   directory = write_simulation_log(_simulation_log(), tmp_path / "artifact")
   with (directory / "states.npy").open("wb") as stream:
     np.save(stream, _timedelta_states(), allow_pickle=False)
+  _refresh_manifest(directory)
 
   with pytest.raises(ValueError, match="numeric|real"):
     read_simulation_log(directory)
@@ -404,6 +591,7 @@ def test_read_simulation_log_rejects_corrupt_artifacts(tmp_path):
   payload = json.loads(metadata_path.read_text())
   payload["schema_version"] = "999"
   metadata_path.write_text(json.dumps(payload))
+  _refresh_manifest(directory)
 
   with pytest.raises(ValueError, match="schema_version"):
     read_simulation_log(directory)

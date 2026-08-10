@@ -179,6 +179,17 @@ class TemporalEdge:
         or any(right != left + 1 for left, right in zip(step_numbers, step_numbers[1:]))
     ):
       raise ValueError("contact_steps must exactly cover the consecutive episode")
+    if contact_steps:
+      expected_impulse = math.fsum(item.impulse for item in contact_steps)
+      expected_peak_force = max(item.normal_force for item in contact_steps)
+      if not math.isclose(
+          total_impulse, expected_impulse, rel_tol=1e-12, abs_tol=1e-12
+      ):
+        raise ValueError("total_impulse must equal the contact_steps sum")
+      if not math.isclose(
+          peak_force, expected_peak_force, rel_tol=1e-12, abs_tol=1e-12
+      ):
+        raise ValueError("peak_force must equal the contact_steps maximum")
 
     object.__setattr__(self, "object_a", object_a)
     object.__setattr__(self, "object_b", object_b)
@@ -541,6 +552,23 @@ def _distance(left: np.ndarray, right: np.ndarray) -> float:
   ))
 
 
+def _validate_branch_alignment(
+    factual_log: SimulationLog, counterfactual_log: SimulationLog
+) -> None:
+  if not isinstance(factual_log, SimulationLog):
+    raise TypeError("factual_log must be a SimulationLog")
+  if not isinstance(counterfactual_log, SimulationLog):
+    raise TypeError("counterfactual_log must be a SimulationLog")
+  if factual_log.object_ids != counterfactual_log.object_ids:
+    raise ValueError("factual and counterfactual object_ids must be identical")
+  if factual_log.steps != counterfactual_log.steps:
+    raise ValueError("factual and counterfactual steps must be identical")
+  if factual_log.states.shape != counterfactual_log.states.shape:
+    raise ValueError("factual and counterfactual state shapes must be identical")
+  if factual_log.step_rate != counterfactual_log.step_rate:
+    raise ValueError("factual and counterfactual step_rate must be identical")
+
+
 def state_affected(
     factual_log: SimulationLog,
     counterfactual_log: SimulationLog,
@@ -548,24 +576,16 @@ def state_affected(
     position_epsilon: float = 1e-3,
     velocity_epsilon: float = 1e-3,
     quaternion_epsilon: float = 1e-3,
+    start_step: Optional[int] = None,
 ) -> Tuple[str, ...]:
   """Returns non-target IDs whose aligned rigid-body states diverge."""
-  if not isinstance(factual_log, SimulationLog):
-    raise TypeError("factual_log must be a SimulationLog")
-  if not isinstance(counterfactual_log, SimulationLog):
-    raise TypeError("counterfactual_log must be a SimulationLog")
+  _validate_branch_alignment(factual_log, counterfactual_log)
   target = _identifier(target_id, "target_id")
   position_threshold = _nonnegative(position_epsilon, "position_epsilon")
   velocity_threshold = _nonnegative(velocity_epsilon, "velocity_epsilon")
   quaternion_threshold = _nonnegative(
       quaternion_epsilon, "quaternion_epsilon"
   )
-  if factual_log.object_ids != counterfactual_log.object_ids:
-    raise ValueError("factual and counterfactual object_ids must be identical")
-  if factual_log.steps != counterfactual_log.steps:
-    raise ValueError("factual and counterfactual steps must be identical")
-  if factual_log.states.shape != counterfactual_log.states.shape:
-    raise ValueError("factual and counterfactual state shapes must be identical")
   expected_shape = (
       len(factual_log.steps), len(factual_log.object_ids), 13
   )
@@ -578,13 +598,23 @@ def state_affected(
     raise ValueError("state arrays must contain only finite values")
   if target not in factual_log.object_ids:
     raise ValueError("target_id must appear in object_ids")
+  if start_step is None:
+    time_indices = tuple(range(len(factual_log.steps)))
+  else:
+    first_step = _integer(start_step, "start_step")
+    time_indices = tuple(
+        index for index, step in enumerate(factual_log.steps)
+        if step >= first_step
+    )
+    if not time_indices:
+      raise ValueError("start_step must not exceed the final logged step")
 
   affected = []
   for object_index, object_id in enumerate(factual_log.object_ids):
     if object_id == target:
       continue
     diverged = False
-    for time_index in range(len(factual_log.steps)):
+    for time_index in time_indices:
       factual = factual_log.states[time_index, object_index]
       counterfactual = counterfactual_log.states[time_index, object_index]
       position_distance = _distance(
@@ -639,6 +669,7 @@ def extract_ground_truth(
     quaternion_epsilon: float = 1e-3,
 ) -> GroundTruth:
   """Extracts graph deltas, causal reachability, and residual state effects."""
+  _validate_branch_alignment(factual_log, counterfactual_log)
   factual_graph = contact_log_to_temporal_graph(
       factual_log.contacts,
       factual_log.step_rate,
@@ -668,6 +699,7 @@ def extract_ground_truth(
       position_epsilon=position_epsilon,
       velocity_epsilon=velocity_epsilon,
       quaternion_epsilon=quaternion_epsilon,
+      start_step=intervention_start,
   )
   hard_set = set(hard_affected)
   soft_affected = tuple(sorted(set(state_ids) - hard_set - {target_id}))

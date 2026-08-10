@@ -168,6 +168,38 @@ def test_temporal_edge_and_graph_canonicalize_and_validate():
     _edge("a", "b", 2, 2)
 
 
+def test_temporal_edge_validates_summaries_against_contact_steps():
+  contact_steps = (
+      AggregatedContactStep(
+          step=2,
+          object_a="a",
+          object_b="b",
+          position=(0, 0, 0),
+          normal=(1, 0, 0),
+          normal_force=2,
+          impulse=0.1,
+      ),
+      AggregatedContactStep(
+          step=3,
+          object_a="a",
+          object_b="b",
+          position=(0, 0, 0),
+          normal=(1, 0, 0),
+          normal_force=3,
+          impulse=0.2,
+      ),
+  )
+
+  edge = TemporalEdge("a", "b", 2, 4, 0.3, 3.0, contact_steps)
+
+  assert edge.total_impulse == pytest.approx(0.3)
+  with pytest.raises(ValueError, match="total_impulse"):
+    TemporalEdge("a", "b", 2, 4, 0.4, 3.0, contact_steps)
+  with pytest.raises(ValueError, match="peak_force"):
+    TemporalEdge("a", "b", 2, 4, 0.3, 4.0, contact_steps)
+  assert _edge("a", "b", 2, 4, impulse=99, peak=99).contact_steps == ()
+
+
 def test_graph_delta_reports_added_removed_and_metric_changes():
   factual = _graph(
       _edge("a", "b", 0, 2, impulse=1, peak=3),
@@ -362,13 +394,44 @@ def test_state_affected_rejects_misaligned_logs_and_invalid_thresholds():
   factual = _log("factual", ("target", "a"), (0, 1))
   reordered = _log("counterfactual", ("a", "target"), (0, 1))
   shifted = _log("counterfactual", ("target", "a"), (1, 2))
+  different_rate = _log(
+      "counterfactual", ("target", "a"), (0, 1), step_rate=20
+  )
 
   with pytest.raises(ValueError, match="object_ids"):
     state_affected(factual, reordered, "target")
   with pytest.raises(ValueError, match="steps"):
     state_affected(factual, shifted, "target")
+  with pytest.raises(ValueError, match="step_rate"):
+    state_affected(factual, different_rate, "target")
+  with pytest.raises(ValueError, match="step_rate"):
+    extract_ground_truth(factual, different_rate, "target", 0)
   with pytest.raises(ValueError):
     state_affected(factual, factual, "target", position_epsilon=-1)
+
+
+def test_state_affected_start_step_excludes_preintervention_divergence():
+  object_ids = ("target", "a")
+  steps = (0, 5, 10)
+  factual_states = _states(3, 2)
+  counterfactual_states = factual_states.copy()
+  counterfactual_states[0, 1, 0] = 0.1
+  factual = _log("factual", object_ids, steps, states=factual_states)
+  counterfactual = _log(
+      "counterfactual", object_ids, steps, states=counterfactual_states
+  )
+
+  assert state_affected(factual, counterfactual, "target") == ("a",)
+  assert state_affected(
+      factual, counterfactual, "target", start_step=5
+  ) == ()
+  with pytest.raises(ValueError, match="start_step"):
+    state_affected(factual, counterfactual, "target", start_step=11)
+
+  truth = extract_ground_truth(
+      factual, counterfactual, "target", intervention_start=5
+  )
+  assert truth.soft_affected == ()
 
 
 def test_extract_ground_truth_combines_graph_reachability_and_state_effects():
