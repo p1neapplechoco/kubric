@@ -384,6 +384,7 @@ class Intervention(_SchemaMixin):
   recipe: str
   magnitude: float
   time_window: Tuple[float, float]
+  push_mass: float = 1.0
   metadata: Mapping[str, Any] = field(default_factory=dict)
   schema_version: str = SCHEMA_VERSION
 
@@ -399,9 +400,13 @@ class Intervention(_SchemaMixin):
     time_window = _vector(self.time_window, 2, "time_window")
     if time_window[0] < 0.0 or time_window[1] <= time_window[0]:
       raise ValueError("time_window must be a nonnegative half-open interval")
+    push_mass = _real(self.push_mass, "push_mass")
+    if push_mass <= 0.0:
+      raise ValueError("push_mass must be positive")
     object.__setattr__(self, "target_id", target_id)
     object.__setattr__(self, "magnitude", magnitude)
     object.__setattr__(self, "time_window", time_window)
+    object.__setattr__(self, "push_mass", push_mass)
     object.__setattr__(self, "metadata", _metadata(self.metadata))
     object.__setattr__(self, "schema_version", _version(self.schema_version))
 

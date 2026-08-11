@@ -197,12 +197,63 @@ def test_intervention_normalizes_and_serializes():
       recipe="retime",
       magnitude=0.25,
       time_window=[3, 9],
+      push_mass=2,
       metadata={"reason": "counterfactual"},
   )
 
   assert intervention.time_window == (3.0, 9.0)
+  assert intervention.push_mass == 2.0
   assert intervention.to_dict()["recipe"] == "retime"
   assert intervention.schema_version == "1.0"
+
+
+def test_intervention_defaults_and_serializes_push_mass():
+  intervention = Intervention(
+      target_id="ball",
+      recipe="remove_collision",
+      magnitude=0.1,
+      time_window=(0, 10),
+  )
+
+  payload = intervention.to_dict()
+  assert intervention.push_mass == 1.0
+  assert payload["push_mass"] == 1.0
+  assert json.loads(json.dumps(payload))["push_mass"] == 1.0
+
+
+def test_intervention_push_mass_is_immutable():
+  intervention = Intervention(
+      target_id="ball",
+      recipe="remove_collision",
+      magnitude=0.1,
+      time_window=(0, 10),
+  )
+
+  with pytest.raises(FrozenInstanceError):
+    intervention.push_mass = 2.0
+
+
+@pytest.mark.parametrize(
+    "push_mass,error,message",
+    [
+        (True, TypeError, "push_mass must be a real number"),
+        (0, ValueError, "push_mass must be positive"),
+        (-1, ValueError, "push_mass must be positive"),
+        (np.nan, ValueError, "push_mass must be finite"),
+        (np.inf, ValueError, "push_mass must be finite"),
+        (complex(1, 0), TypeError, "push_mass must be a real number"),
+        ("1.0", TypeError, "push_mass must be a real number"),
+    ],
+)
+def test_intervention_rejects_invalid_push_mass(push_mass, error, message):
+  with pytest.raises(error, match=message):
+    Intervention(
+        target_id="ball",
+        recipe="remove_collision",
+        magnitude=0.1,
+        time_window=(0, 10),
+        push_mass=push_mass,
+    )
 
 
 @pytest.mark.parametrize(
