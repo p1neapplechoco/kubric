@@ -18,12 +18,18 @@ import traceback
 import uuid
 from collections import defaultdict
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
+
+try:
+  import fcntl
+except ImportError:  # pragma: no cover - dataset generation targets POSIX workers.
+  fcntl = None
 
 from interventions.logging import (
     ANGULAR_VELOCITY_SLICE,
@@ -152,11 +158,20 @@ class InstanceSpec:
     start = _integer(self.intervention_start_step, "intervention_start_step")
     if float(self.intervention.time_window[0]) != float(start):
       raise ValueError("intervention_start_step must match intervention.time_window")
+    factual_path = _readonly_path(self.factual_path)
+    frame_start, frame_end = self.scene_config.frame_range
+    expected_steps = (
+        (frame_end - frame_start)
+        * self.scene_config.step_rate
+        // self.scene_config.frame_rate
+    )
+    if len(factual_path) != expected_steps:
+      raise ValueError("factual_path length must match SceneConfig duration steps")
     object.__setattr__(self, "attempt_index", attempt)
     object.__setattr__(self, "instance_seed", seed)
     object.__setattr__(self, "instance_id", instance_id)
     object.__setattr__(self, "target_id", target_id)
-    object.__setattr__(self, "factual_path", _readonly_path(self.factual_path))
+    object.__setattr__(self, "factual_path", factual_path)
     object.__setattr__(self, "expected_effect", expected)
     object.__setattr__(self, "intervention_start_step", start)
 
@@ -605,13 +620,98 @@ def _log_parts(log: Any) -> Tuple[Optional[Tuple[str, ...]], Optional[Tuple[int,
   return object_ids, steps, states, contacts, step_rate
 
 
+def _max_vector_magnitude(vectors: np.ndarray) -> float:
+  if not np.isfinite(vectors).all():
+    return float("inf")
+  absolute = np.abs(vectors)
+  scale = np.max(absolute, axis=-1, initial=0.0)
+  normalized = np.zeros_like(absolute)
+  np.divide(
+      absolute,
+      scale[..., None],
+      out=normalized,
+      where=scale[..., None] != 0.0,
+  )
+  with np.errstate(over="ignore", invalid="ignore"):
+    norms = scale * np.sqrt(np.sum(normalized * normalized, axis=-1))
+  return float(np.max(norms, initial=0.0))
+
+
 def _max_speed(states: Optional[np.ndarray], component: slice) -> float:
   if states is None:
     return float("inf")
-  vectors = states[:, :, component]
-  if not np.isfinite(vectors).all():
-    return float("inf")
-  return float(np.max(np.linalg.norm(vectors, axis=2), initial=0.0))
+  return _max_vector_magnitude(states[:, :, component])
+
+
+def _log_commanded_path(log: Any) -> Optional[np.ndarray]:
+  try:
+    value = log.commanded_path
+    if value is None:
+      return None
+    path = np.asarray(value, dtype=np.float64)
+  except (AttributeError, TypeError, ValueError, OverflowError):
+    return None
+  if path.ndim != 2 or path.shape[1:] != (7,) or not np.isfinite(path).all():
+    return None
+  return path
+
+
+def _ids_match_scene(
+    object_ids: Optional[Tuple[str, ...]], expected_ids: Tuple[str, ...]
+) -> bool:
+  return object_ids == expected_ids
+
+
+def _contacts_match_scene(
+    contacts: Optional[Tuple[Any, ...]],
+    expected_ids: Tuple[str, ...],
+    expected_steps: Tuple[int, ...],
+) -> bool:
+  if contacts is None:
+    return False
+  object_ids = frozenset(expected_ids)
+  steps = frozenset(expected_steps)
+  try:
+    return all(
+        record.object_a in object_ids
+        and record.object_b in object_ids
+        and int(record.step) in steps
+        for record in contacts
+    )
+  except (AttributeError, TypeError, ValueError):
+    return False
+
+
+def _paths_match_spec(
+    spec: InstanceSpec,
+    factual_path: Optional[np.ndarray],
+    counterfactual_path: Optional[np.ndarray],
+) -> bool:
+  expected = spec.factual_path
+  if (
+      factual_path is None
+      or counterfactual_path is None
+      or factual_path.shape != expected.shape
+      or counterfactual_path.shape != expected.shape
+      or not np.array_equal(factual_path, expected)
+  ):
+    return False
+  start, end = (int(value) for value in spec.intervention.time_window)
+  if (
+      not np.array_equal(counterfactual_path[:start], expected[:start])
+      or not np.array_equal(counterfactual_path[end:], expected[end:])
+  ):
+    return False
+  if spec.intervention.magnitude == 0.0:
+    return bool(np.array_equal(counterfactual_path, expected))
+  anchors_match = bool(
+      np.array_equal(counterfactual_path[start], expected[start])
+      and np.array_equal(counterfactual_path[end - 1], expected[end - 1])
+  )
+  with np.errstate(over="ignore", invalid="ignore"):
+    offsets = counterfactual_path[:, :3] - expected[:, :3]
+  deviation = _max_vector_magnitude(offsets)
+  return anchors_match and deviation <= spec.intervention.magnitude + 1e-12
 
 
 def _prefix_contacts(contacts: Optional[Tuple[Any, ...]], start: int) -> Optional[Tuple[Any, ...]]:
@@ -664,11 +764,29 @@ def evaluate_qc(
   counterfactual = _log_parts(counterfactual_log)
   f_ids, f_steps, f_states, f_contacts, f_rate = factual
   c_ids, c_steps, c_states, c_contacts, c_rate = counterfactual
+  f_path = _log_commanded_path(factual_log)
+  c_path = _log_commanded_path(counterfactual_log)
+  expected_ids = tuple(sorted(
+      item.object_id for item in spec.scene_config.objects
+  ))
+  frame_start, frame_end = spec.scene_config.frame_range
+  expected_step_count = (
+      (frame_end - frame_start)
+      * spec.scene_config.step_rate
+      // spec.scene_config.frame_rate
+  )
+  expected_steps = tuple(range(expected_step_count))
   reasons = set()
   aligned = (
       f_ids is not None and c_ids is not None
       and f_steps is not None and c_steps is not None
       and f_ids == c_ids and f_steps == c_steps and f_rate == c_rate
+      and _ids_match_scene(f_ids, expected_ids)
+      and f_steps == expected_steps
+      and f_rate == float(spec.scene_config.step_rate)
+      and _contacts_match_scene(f_contacts, expected_ids, expected_steps)
+      and _contacts_match_scene(c_contacts, expected_ids, expected_steps)
+      and _paths_match_spec(spec, f_path, c_path)
       and getattr(factual_log, "branch", None) == "factual"
       and getattr(counterfactual_log, "branch", None) == "counterfactual"
       and f_states is not None and c_states is not None
@@ -711,13 +829,24 @@ def evaluate_qc(
       continue
     target_indices.append((states, ids.index(spec.target_id)))
   bounds = np.asarray(spec.scene_config.scene_bounds, dtype=np.float64)
-  if any(np.any(states[:, index, :3] < bounds[0]) or
-         np.any(states[:, index, :3] > bounds[1])
-         for states, index in target_indices):
-    reasons.add("target_out_of_bounds")
-
   by_id = {item.object_id: item for item in spec.scene_config.objects}
   target_config = by_id[spec.target_id]
+  out_of_bounds = False
+  for states, index in target_indices:
+    for state in states:
+      target_position = state[index, :3]
+      target_extent = _object_extent(target_config, state[index, 3:7])
+      if (
+          np.any(target_position - target_extent < bounds[0] - clip_epsilon)
+          or np.any(target_position + target_extent > bounds[1] + clip_epsilon)
+      ):
+        out_of_bounds = True
+        break
+    if out_of_bounds:
+      break
+  if out_of_bounds:
+    reasons.add("target_out_of_bounds")
+
   static_geometry = tuple(
       item for item in spec.scene_config.objects
       if item.static and item.object_id != spec.target_id
@@ -822,7 +951,13 @@ def _sha_text(*parts: Any) -> str:
 def topology_signature(
     scene_config: SceneConfig, factual_log: Any, target_id: Optional[str] = None
 ) -> str:
-  """Computes an ID-invariant Weisfeiler-Lehman contact topology hash."""
+  """Hashes the ID-invariant, unweighted union contact topology.
+
+  Timing, force, and contact multiplicity are intentionally excluded so split
+  groups describe scene topology rather than making each dynamics trace unique.
+  Component fingerprints supplement Weisfeiler-Lehman colors for disconnected
+  regular graphs such as a six-cycle versus two triangles.
+  """
   if not isinstance(scene_config, SceneConfig):
     raise TypeError("scene_config must be a SceneConfig")
   ids = tuple(item.object_id for item in scene_config.objects)
@@ -873,9 +1008,32 @@ def topology_signature(
   canonical_edges = sorted(
       tuple(sorted((colors[left], colors[right]))) for left, right in edges
   )
+  components = []
+  remaining = set(colors)
+  while remaining:
+    pending = [next(iter(remaining))]
+    component = set()
+    while pending:
+      node = pending.pop()
+      if node in component:
+        continue
+      component.add(node)
+      pending.extend(neighbors[node] - component)
+    remaining.difference_update(component)
+    component_edges = sorted(
+        tuple(sorted((colors[left], colors[right])))
+        for left, right in edges
+        if left in component and right in component
+    )
+    components.append({
+        "nodes": sorted(colors[node] for node in component),
+        "edges": component_edges,
+    })
+  components.sort(key=_canonical_bytes)
   payload = {
       "nodes": sorted(colors.values()),
       "edges": canonical_edges,
+      "components": components,
   }
   return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
@@ -970,6 +1128,39 @@ def assign_grouped_splits(
   return MappingProxyType({key: result[key] for key in sorted(result)})
 
 
+def _fsync_directory(directory: Path) -> None:
+  flags = os.O_RDONLY
+  if hasattr(os, "O_DIRECTORY"):
+    flags |= os.O_DIRECTORY
+  descriptor = os.open(str(directory), flags)
+  try:
+    os.fsync(descriptor)
+  finally:
+    os.close(descriptor)
+
+
+@contextmanager
+def _dataset_lock(root: Path):
+  if fcntl is None:
+    raise RuntimeError("dataset publication requires POSIX advisory locking")
+  root.parent.mkdir(parents=True, exist_ok=True)
+  lock_path = root.parent / ".{}.dataset.lock".format(root.name)
+  descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+  try:
+    try:
+      fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+      raise RuntimeError(
+          "dataset output is locked by another writer: {}".format(root)
+      ) from error
+    yield
+  finally:
+    try:
+      fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+      os.close(descriptor)
+
+
 def _write_once(path: Path, payload: bytes) -> None:
   path.parent.mkdir(parents=True, exist_ok=True)
   temporary = path.parent / ".{}.tmp-{}".format(path.name, uuid.uuid4().hex)
@@ -980,8 +1171,19 @@ def _write_once(path: Path, payload: bytes) -> None:
       os.fsync(stream.fileno())
     try:
       os.link(temporary, path)
-    except FileExistsError:
-      raise FileExistsError("immutable journal record exists: {}".format(path))
+    except FileExistsError as error:
+      try:
+        existing = path.read_bytes()
+      except OSError:
+        raise FileExistsError(
+            "immutable journal record exists: {}".format(path)
+        ) from error
+      if existing == payload:
+        return
+      raise FileExistsError(
+          "immutable journal record conflicts with existing bytes: {}".format(path)
+      ) from error
+    _fsync_directory(path.parent)
   finally:
     try:
       temporary.unlink()
@@ -1000,6 +1202,7 @@ def _write_atomic(path: Path, payload: bytes) -> None:
     temporary = Path(stream.name)
   try:
     os.replace(temporary, path)
+    _fsync_directory(path.parent)
   finally:
     try:
       temporary.unlink()
@@ -1020,12 +1223,81 @@ def _yaml_snapshot(ranges: Mapping[str, Any]) -> bytes:
 def _file_manifest(directory: Path) -> Mapping[str, Any]:
   files = {}
   for path in sorted(directory.rglob("*")):
-    if path.is_file() and path.name != "instance_manifest.json":
+    if path.is_symlink():
+      raise ValueError("instance artifacts cannot contain symbolic links")
+    relative = path.relative_to(directory).as_posix()
+    if path.is_file() and relative != "instance_manifest.json":
       payload = path.read_bytes()
-      files[str(path.relative_to(directory))] = {
+      files[relative] = {
           "sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)
       }
   return files
+
+
+def _validate_instance_artifact(
+    directory: Path,
+    *,
+    instance_id: Optional[str] = None,
+    spec: Optional[InstanceSpec] = None,
+    manifest_sha256: Optional[str] = None,
+    manifest_size: Optional[int] = None,
+) -> Mapping[str, Any]:
+  if directory.is_symlink() or not directory.is_dir():
+    raise ValueError("instance artifact is missing or is not a real directory")
+  try:
+    manifest_payload = (directory / "instance_manifest.json").read_bytes()
+  except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise ValueError("instance artifact manifest is missing or corrupt") from error
+  if manifest_sha256 is not None and hashlib.sha256(
+      manifest_payload
+  ).hexdigest() != manifest_sha256:
+    raise ValueError("instance artifact manifest journal digest mismatch")
+  if manifest_size is not None and len(manifest_payload) != manifest_size:
+    raise ValueError("instance artifact manifest journal size mismatch")
+  try:
+    manifest = json.loads(manifest_payload)
+  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise ValueError("instance artifact manifest is missing or corrupt") from error
+  if not isinstance(manifest, Mapping) or set(manifest) != {"instance_id", "files"}:
+    raise ValueError("instance artifact manifest is corrupt")
+  recorded_id = manifest["instance_id"]
+  if not isinstance(recorded_id, str) or not recorded_id:
+    raise ValueError("instance artifact manifest has an invalid instance_id")
+  if instance_id is not None and recorded_id != instance_id:
+    raise ValueError("instance artifact manifest instance_id mismatch")
+  records = manifest["files"]
+  if not isinstance(records, Mapping):
+    raise ValueError("instance artifact manifest files are corrupt")
+  normalized = {}
+  for relative, record in records.items():
+    parts = Path(relative).parts if isinstance(relative, str) else ()
+    if (
+        not parts
+        or Path(relative).is_absolute()
+        or ".." in parts
+        or not isinstance(record, Mapping)
+        or set(record) != {"sha256", "size"}
+        or not isinstance(record.get("sha256"), str)
+        or len(record["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in record["sha256"])
+        or isinstance(record.get("size"), bool)
+        or not isinstance(record.get("size"), numbers.Integral)
+        or record["size"] < 0
+    ):
+      raise ValueError("instance artifact manifest file record is corrupt")
+    normalized[relative] = {
+        "sha256": record["sha256"], "size": int(record["size"])
+    }
+  if _file_manifest(directory) != normalized:
+    raise ValueError("instance artifact integrity mismatch")
+  if spec is not None:
+    try:
+      spec_payload = (directory / "spec.json").read_bytes()
+    except OSError as error:
+      raise ValueError("instance artifact spec is missing") from error
+    if spec_payload != _canonical_bytes(spec.to_dict()):
+      raise ValueError("instance artifact spec mismatch")
+  return manifest
 
 
 def _publish_instance(
@@ -1038,7 +1310,10 @@ def _publish_instance(
   instances.mkdir(parents=True, exist_ok=True)
   destination = instances / spec.instance_id
   if destination.exists():
-    raise FileExistsError("instance artifact exists: {}".format(destination))
+    _validate_instance_artifact(
+        destination, instance_id=spec.instance_id, spec=spec
+    )
+    return destination
   staging = instances / ".{}.tmp-{}".format(spec.instance_id, uuid.uuid4().hex)
   try:
     write_paired_artifact(
@@ -1057,7 +1332,9 @@ def _publish_instance(
     _write_once(
         staging / "instance_manifest.json", _canonical_bytes(instance_manifest)
     )
+    _fsync_directory(staging)
     os.rename(staging, destination)
+    _fsync_directory(instances)
   except BaseException:
     if staging.exists():
       shutil.rmtree(staging, ignore_errors=True)
@@ -1067,6 +1344,23 @@ def _publish_instance(
 
 def _summary_from_dict(value: Mapping[str, Any]) -> CandidateSummary:
   return CandidateSummary(**dict(value))
+
+
+def _validate_candidate_artifact(
+    root: Path,
+    summary: CandidateSummary,
+    manifest_sha256: str,
+    manifest_size: int,
+) -> None:
+  expected_relative = Path("instances") / summary.instance_id
+  if Path(summary.artifact_path) != expected_relative:
+    raise ValueError("candidate artifact path does not match instance_id")
+  _validate_instance_artifact(
+      root / expected_relative,
+      instance_id=summary.instance_id,
+      manifest_sha256=manifest_sha256,
+      manifest_size=manifest_size,
+  )
 
 
 def _attempt_records(root: Path) -> Tuple[Mapping[str, Any], ...]:
@@ -1092,10 +1386,33 @@ def _manifest(
     split_seed: int,
     fractions: Mapping[str, float],
 ) -> Mapping[str, Any]:
-  candidates = tuple(
-      _summary_from_dict(record["candidate"])
-      for record in records if record.get("status") == "accepted"
-  )
+  candidates = []
+  for record in records:
+    if record.get("status") != "accepted":
+      continue
+    try:
+      candidate = _summary_from_dict(record["candidate"])
+      manifest_sha256 = record["artifact_manifest_sha256"]
+      manifest_size = record["artifact_manifest_size"]
+    except (KeyError, TypeError, ValueError) as error:
+      raise ValueError("accepted attempt journal is corrupt") from error
+    if (
+        not isinstance(manifest_sha256, str)
+        or len(manifest_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in manifest_sha256
+        )
+        or isinstance(manifest_size, bool)
+        or not isinstance(manifest_size, numbers.Integral)
+        or manifest_size < 0
+    ):
+      raise ValueError("accepted attempt journal artifact digest is corrupt")
+    _validate_candidate_artifact(
+        root, candidate, manifest_sha256, int(manifest_size)
+    )
+    candidates.append(candidate)
+  candidates = tuple(candidates)
   selected = select_balanced(candidates, num_instances, seed=balance_seed)
   splits = assign_grouped_splits(selected, fractions, seed=split_seed)
   status = "complete" if len(selected) >= num_instances else "capacity_exhausted"
@@ -1112,7 +1429,7 @@ def _manifest(
   }
 
 
-def run_batch(
+def _run_batch_unlocked(
     ranges: Mapping[str, Any],
     output: PathLike,
     master_seed: int,
@@ -1122,7 +1439,7 @@ def run_batch(
     resume: bool = False,
     workers: int = 1,
 ) -> Mapping[str, Any]:
-  """Runs an immutable, resumable single-worker generation journal."""
+  """Implementation for :func:`run_batch` while its output lock is held."""
   if not isinstance(ranges, Mapping):
     raise TypeError("ranges must be a mapping")
   seed = _integer(master_seed, "master_seed")
@@ -1148,9 +1465,11 @@ def run_batch(
     if resume:
       raise ValueError("cannot resume a missing dataset output")
     root.mkdir(parents=True)
+    _fsync_directory(root.parent)
     (root / "attempts").mkdir()
     (root / "errors").mkdir()
     (root / "instances").mkdir()
+    _fsync_directory(root)
     _write_once(root / "config.yaml", snapshot)
     _write_once(run_path, _canonical_bytes(run_payload))
   else:
@@ -1196,8 +1515,8 @@ def run_batch(
           "qc": qc.to_dict(),
       }
       if qc.accepted:
-        artifact = _publish_instance(root, spec, factual, counterfactual)
         depth, bucket = propagation_hop_depth(truth)
+        artifact_relative = Path("instances") / spec.instance_id
         summary = CandidateSummary(
             spec.instance_id,
             missing,
@@ -1205,9 +1524,20 @@ def run_batch(
             depth,
             bucket,
             topology_signature(spec.scene_config, factual, spec.target_id),
-            str(artifact.relative_to(root)),
+            str(artifact_relative),
         )
-        record.update(status="accepted", candidate=summary.to_dict())
+        artifact = _publish_instance(root, spec, factual, counterfactual)
+        if artifact != root / artifact_relative:
+          raise RuntimeError("instance publisher returned an unexpected path")
+        artifact_manifest = (artifact / "instance_manifest.json").read_bytes()
+        record.update(
+            status="accepted",
+            candidate=summary.to_dict(),
+            artifact_manifest_sha256=hashlib.sha256(
+                artifact_manifest
+            ).hexdigest(),
+            artifact_manifest_size=len(artifact_manifest),
+        )
       else:
         record.update(status="rejected", spec=spec.to_dict())
     except Exception as error:  # Candidate-local failures must not abort later attempts.
@@ -1236,6 +1566,30 @@ def run_batch(
   )
   _write_atomic(root / "manifest.json", _canonical_bytes(result))
   return _freeze(result)
+
+
+def run_batch(
+    ranges: Mapping[str, Any],
+    output: PathLike,
+    master_seed: int,
+    num_instances: int,
+    max_attempts: int,
+    *,
+    resume: bool = False,
+    workers: int = 1,
+) -> Mapping[str, Any]:
+  """Runs an immutable, resumable journal under an exclusive output lock."""
+  root = Path(output)
+  with _dataset_lock(root):
+    return _run_batch_unlocked(
+        ranges,
+        root,
+        master_seed,
+        num_instances,
+        max_attempts,
+        resume=resume,
+        workers=workers,
+    )
 
 
 __all__ = [

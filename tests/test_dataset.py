@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib
 import json
+import os
+import subprocess
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +18,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from interventions import read_paired_artifact
 from interventions.dataset import (
     CandidateSummary,
     InstanceSpec,
@@ -28,7 +35,7 @@ from interventions.dataset import (
     select_balanced,
     topology_signature,
 )
-from interventions.logging import ContactRecord, SimulationLog, read_simulation_log
+from interventions.logging import ContactRecord, SimulationLog
 from interventions.schema import (
     GraphEdgeDelta,
     GroundTruth,
@@ -36,6 +43,9 @@ from interventions.schema import (
     ObjectConfig,
     SceneConfig,
 )
+
+
+_LOG_IDS = ("ball", "floor", "target")
 
 
 def _ranges(expected="null", magnitude=(0.0, 0.0), object_count=(1, 1)):
@@ -135,7 +145,14 @@ def _spec(expected="null", *, scene=None, start=1):
   )
 
 
-def _states(ids=("floor", "target", "ball"), steps=3):
+def _commanded_path(steps=10):
+  path = np.zeros((steps, 7), dtype=np.float64)
+  path[:, 2] = 0.2
+  path[:, 3] = 1.0
+  return path
+
+
+def _states(ids=_LOG_IDS, steps=10):
   states = np.zeros((steps, len(ids), 13), dtype=np.float64)
   states[:, :, 3] = 1.0
   states[:, ids.index("floor"), :3] = (0, 0, -0.25)
@@ -149,19 +166,24 @@ def _log(
     branch,
     *,
     states=None,
-    ids=("floor", "target", "ball"),
-    steps=(0, 1, 2),
+    ids=_LOG_IDS,
+    steps=tuple(range(10)),
     contacts=(),
+    commanded_path=None,
+    step_rate=240,
 ):
   if states is None:
     states = _states(ids, len(steps))
+  if commanded_path is None:
+    commanded_path = _commanded_path(len(steps))
   return SimulationLog(
       branch=branch,
       object_ids=ids,
       steps=steps,
       states=states,
       contacts=contacts,
-      step_rate=240,
+      step_rate=step_rate,
+      commanded_path=commanded_path,
   )
 
 
@@ -228,6 +250,11 @@ def test_seed_and_sampling_are_domain_separated_deterministic_and_side_effect_fr
     first.factual_path[0, 0] = 99
 
 
+def test_instance_spec_path_length_must_match_scene_duration():
+  with pytest.raises(ValueError, match="path|duration|steps"):
+    replace(_spec(), factual_path=_commanded_path(9))
+
+
 def test_load_ranges_copies_and_freezes_yaml(tmp_path):
   config = tmp_path / "ranges.yaml"
   import yaml
@@ -238,6 +265,15 @@ def test_load_ranges_copies_and_freezes_yaml(tmp_path):
   assert loaded["scene"]["step_rate"] == 240
   with pytest.raises(TypeError):
     loaded["scene"]["step_rate"] = 10
+
+
+def test_repository_ranges_preserve_null_effect_as_a_string_and_sample():
+  config = Path(__file__).resolve().parents[1] / "configs" / "scene_ranges.yaml"
+  loaded = load_ranges(config)
+
+  assert loaded["intervention"]["expected_effects"] == ("non_null", "null")
+  specs = tuple(sample_instance_spec(loaded, 20260811, index) for index in range(64))
+  assert {spec.expected_effect for spec in specs} == {"non_null", "null"}
 
 
 def test_sampled_scene_has_explicit_ids_valid_path_and_nonoverlap():
@@ -299,28 +335,28 @@ def test_each_qc_reason_is_reported_independently(case, expected):
     )
   elif case == "prefix_state":
     changed = np.array(counterfactual.states, copy=True)
-    changed[0, 1, 0] += 0.01
+    changed[0, _LOG_IDS.index("target"), 0] += 0.01
     counterfactual = _log("counterfactual", states=changed)
   elif case == "prefix_contact":
     contact = ContactRecord(0, "target", "ball", (0, 0, 0), (1, 0, 0), 1)
     factual = _log("factual", contacts=(contact,))
   elif case == "nonfinite":
     changed = np.array(counterfactual.states, copy=True)
-    changed[2, 2, 0] = np.nan
+    changed[2, _LOG_IDS.index("ball"), 0] = np.nan
     counterfactual = SimpleNamespace(
         **{**counterfactual.__dict__, "states": changed}
     )
   elif case == "linear":
     changed = np.array(counterfactual.states, copy=True)
-    changed[2, 2, 7] = 101
+    changed[2, _LOG_IDS.index("ball"), 7] = 101
     counterfactual = _log("counterfactual", states=changed)
   elif case == "angular":
     changed = np.array(counterfactual.states, copy=True)
-    changed[2, 2, 10] = 101
+    changed[2, _LOG_IDS.index("ball"), 10] = 101
     counterfactual = _log("counterfactual", states=changed)
   elif case == "bounds":
     changed = np.array(counterfactual.states, copy=True)
-    changed[2, 1, 0] = 6
+    changed[2, _LOG_IDS.index("target"), 0] = 6
     counterfactual = _log("counterfactual", states=changed)
   elif case == "clip":
     scene = _scene()
@@ -330,9 +366,16 @@ def test_each_qc_reason_is_reported_independently(case, expected):
     )
     scene = replace(scene, objects=(support,) + scene.objects[1:])
     spec = _spec(scene=scene)
-    changed = np.array(counterfactual.states, copy=True)
+    ids = ("ball", "target", "wall")
+    base = np.zeros((10, 3, 13), dtype=np.float64)
+    base[:, :, 3] = 1.0
+    base[:, 0, :3] = (1, 0, 0.2)
+    base[:, 1, :3] = (0, 0, 0.2)
+    base[:, 2, :3] = (2, 0, 0.2)
+    factual = _log("factual", ids=ids, states=base)
+    changed = np.array(base, copy=True)
     changed[2, 1, :3] = (2, 0, 0.2)
-    counterfactual = _log("counterfactual", states=changed)
+    counterfactual = _log("counterfactual", ids=ids, states=changed)
   elif case == "empty":
     spec = _spec("non_null")
   elif case == "null":
@@ -347,7 +390,7 @@ def test_each_qc_reason_is_reported_independently(case, expected):
 def test_qc_checks_target_and_contacts_in_full_twin_prefix():
   contact = ContactRecord(0, "target", "ball", (0, 0, 0), (1, 0, 0), 1)
   state_changed = np.array(_log("counterfactual").states, copy=True)
-  state_changed[0, 1, 0] = 0.1
+  state_changed[0, _LOG_IDS.index("target"), 0] = 0.1
   counterfactual = _log("counterfactual", states=state_changed)
   factual = _log("factual", contacts=(contact,))
 
@@ -358,8 +401,8 @@ def test_qc_checks_target_and_contacts_in_full_twin_prefix():
 
 def test_qc_collects_sorted_reasons_metrics_and_honors_clip_exemption():
   changed = np.array(_log("counterfactual").states, copy=True)
-  changed[2, 2, 7] = 200
-  changed[2, 2, 10] = 300
+  changed[2, _LOG_IDS.index("ball"), 7] = 200
+  changed[2, _LOG_IDS.index("ball"), 10] = 300
   result = _qc(
       spec=_spec("non_null"),
       counterfactual=_log("counterfactual", states=changed),
@@ -390,6 +433,120 @@ def test_qc_handles_malformed_doubles_without_crashing():
   result = _qc(counterfactual=malformed)
   assert "branch_misaligned" in result.reason_codes
   assert "nonfinite_state" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_object",
+        "permuted_ids",
+        "truncated_steps",
+        "wrong_step_rate",
+        "missing_commanded_path",
+        "wrong_factual_path",
+        "counterfactual_outside_window",
+    ],
+)
+def test_qc_requires_logs_to_match_the_exact_instance_spec(mutation):
+  spec = _spec()
+  factual = _log("factual")
+  counterfactual = _log("counterfactual")
+  if mutation == "missing_object":
+    ids = ("floor", "target")
+    factual = _log("factual", ids=ids, states=_states(ids))
+    counterfactual = _log("counterfactual", ids=ids, states=_states(ids))
+  elif mutation == "permuted_ids":
+    permuted = tuple(reversed(_LOG_IDS))
+    factual = replace(factual, object_ids=permuted)
+    counterfactual = replace(counterfactual, object_ids=permuted)
+  elif mutation == "truncated_steps":
+    steps = tuple(range(9))
+    factual = _log("factual", steps=steps)
+    counterfactual = _log("counterfactual", steps=steps)
+  elif mutation == "wrong_step_rate":
+    factual = replace(factual, step_rate=120)
+    counterfactual = replace(counterfactual, step_rate=120)
+  elif mutation == "missing_commanded_path":
+    factual = replace(factual, commanded_path=None)
+    counterfactual = replace(counterfactual, commanded_path=None)
+  elif mutation == "wrong_factual_path":
+    path = factual.commanded_path.copy()
+    path[2, 0] = 0.1
+    factual = replace(factual, commanded_path=path)
+  else:
+    path = counterfactual.commanded_path.copy()
+    path[5, 0] = 0.1
+    counterfactual = replace(counterfactual, commanded_path=path)
+
+  result = _qc(spec=spec, factual=factual, counterfactual=counterfactual)
+
+  assert "branch_misaligned" in result.reason_codes
+
+
+def test_qc_rejects_counterfactual_path_beyond_intervention_magnitude():
+  intervention = Intervention(
+      "target", "remove_collision", 0.05, (1, 4), push_mass=1.0
+  )
+  spec = replace(
+      _spec(), intervention=intervention, intervention_start_step=1
+  )
+  factual = _log("factual")
+  counterfactual_path = factual.commanded_path.copy()
+  counterfactual_path[2, 0] = 0.1
+
+  result = _qc(
+      spec=spec,
+      factual=factual,
+      counterfactual=_log(
+          "counterfactual", commanded_path=counterfactual_path
+      ),
+  )
+
+  assert "branch_misaligned" in result.reason_codes
+
+
+def test_qc_uses_oriented_target_volume_for_scene_bounds():
+  half_angle = np.pi / 8
+  quaternion = (
+      np.cos(half_angle), 0.0, 0.0, np.sin(half_angle)
+  )
+  scene = _scene()
+  target = replace(
+      scene.objects[1], size=(0.5, 0.1, 0.1), quaternion=quaternion
+  )
+  scene = replace(scene, objects=(scene.objects[0], target, scene.objects[2]))
+  spec = _spec(scene=scene)
+  states = _states()
+  target_index = _LOG_IDS.index("target")
+  states[2, target_index, :3] = (4.6, 0.0, 0.2)
+  states[2, target_index, 3:7] = quaternion
+
+  result = _qc(
+      spec=spec,
+      factual=_log("factual", states=states),
+      counterfactual=_log("counterfactual", states=states),
+  )
+
+  assert "target_out_of_bounds" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("component", "reason"),
+    [
+        (7, "linear_velocity_ceiling"),
+        (10, "angular_velocity_ceiling"),
+    ],
+)
+def test_qc_handles_huge_finite_speed_without_overflow(component, reason):
+  states = _states()
+  states[2, _LOG_IDS.index("ball"), component] = 1e308
+
+  result = _qc(counterfactual=_log("counterfactual", states=states))
+
+  assert result.reason_codes == (reason,)
+  assert np.isfinite(result.metrics[
+      "max_linear_velocity" if component == 7 else "max_angular_velocity"
+  ])
 
 
 @pytest.mark.parametrize(
@@ -448,6 +605,44 @@ def test_topology_signature_is_id_invariant_and_edge_sensitive():
       "factual", ids=log_a.object_ids, steps=(0,), states=log_a.states,
   )
   assert signature != topology_signature(scene_a, no_edge, target_a)
+
+
+def _regular_topology(edges):
+  ids = ("target",) + tuple("node_{}".format(index) for index in range(6))
+  scene = SceneConfig(
+      objects=(ObjectConfig("target", "cube", mass=0, static=True),) + tuple(
+          ObjectConfig(object_id, "sphere") for object_id in ids[1:]
+      ),
+      gravity=(0, 0, 0),
+      scene_bounds=((-5, -5, -5), (5, 5, 5)),
+      frame_range=(0, 1), frame_rate=24, step_rate=240,
+  )
+  states = np.zeros((1, len(ids), 13), dtype=np.float64)
+  states[:, :, 3] = 1.0
+  contacts = tuple(
+      ContactRecord(
+          0, ids[left + 1], ids[right + 1], (0, 0, 0), (1, 0, 0), 1
+      )
+      for left, right in edges
+  )
+  return scene, SimulationLog(
+      "factual", ids, (0,), states, contacts, 240,
+      commanded_path=_commanded_path(1),
+  )
+
+
+def test_topology_signature_distinguishes_cycle_from_two_triangles():
+  cycle_edges = tuple((index, (index + 1) % 6) for index in range(6))
+  triangle_edges = (
+      (0, 1), (1, 2), (2, 0),
+      (3, 4), (4, 5), (5, 3),
+  )
+  cycle_scene, cycle_log = _regular_topology(cycle_edges)
+  triangles_scene, triangles_log = _regular_topology(triangle_edges)
+
+  assert topology_signature(
+      cycle_scene, cycle_log, "target"
+  ) != topology_signature(triangles_scene, triangles_log, "target")
 
 
 def _candidate(index, category, bucket, topology=None):
@@ -523,7 +718,20 @@ def _patch_fast_batch(monkeypatch, *, fail_indices=(), truth_by_index=None):
   def fake_publish(root, spec, factual, counterfactual):
     artifact = root / "instances" / spec.instance_id
     artifact.mkdir()
-    (artifact / "instance_manifest.json").write_text("{}\n", encoding="utf-8")
+    payload = b"synthetic artifact\n"
+    (artifact / "payload.bin").write_bytes(payload)
+    manifest = {
+        "instance_id": spec.instance_id,
+        "files": {
+            "payload.bin": {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+        },
+    }
+    (artifact / "instance_manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return artifact
 
   monkeypatch.setattr(dataset, "_publish_instance", fake_publish)
@@ -567,6 +775,181 @@ def test_batch_journals_errors_and_continues(monkeypatch, tmp_path):
   assert error["error_type"] == "RuntimeError"
   assert attempt["status"] == "error"
   assert (output / "attempts" / "00000001.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "corrupt", "rewritten_manifest"])
+def test_batch_resume_rejects_missing_or_corrupt_candidate_artifact(
+    mutation, monkeypatch, tmp_path
+):
+  _patch_fast_batch(monkeypatch)
+  output = tmp_path / "dataset"
+  result = run_batch(_ranges(), output, 8, 1, 1)
+  artifact = output / "instances" / result["selected_ids"][0]
+  if mutation == "missing":
+    artifact.rename(tmp_path / "moved-artifact")
+  elif mutation == "corrupt":
+    (artifact / "payload.bin").write_bytes(b"tampered\n")
+  else:
+    payload = b"tampered and rehashed\n"
+    (artifact / "payload.bin").write_bytes(payload)
+    rewritten = {
+        "instance_id": result["selected_ids"][0],
+        "files": {
+            "payload.bin": {
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "size": len(payload),
+            }
+        },
+    }
+    (artifact / "instance_manifest.json").write_text(
+        json.dumps(rewritten, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+  with pytest.raises(ValueError, match="artifact|manifest|integrity|missing|corrupt"):
+    run_batch(_ranges(), output, 8, 1, 1, resume=True)
+
+
+def test_batch_recovers_complete_orphan_after_attempt_journal_crash(
+    monkeypatch, tmp_path
+):
+  import interventions.dataset as dataset
+
+  monkeypatch.setattr(
+      dataset,
+      "generate_candidate",
+      lambda spec: (_log("factual"), _log("counterfactual"), _truth()),
+  )
+  monkeypatch.setattr(
+      dataset,
+      "evaluate_qc",
+      lambda *args, **kwargs: QCResult(True, (), {"max_linear_velocity": 0}),
+  )
+
+  def fake_pair_writer(directory, *args, **kwargs):
+    destination = Path(directory)
+    destination.mkdir()
+    (destination / "pair.bin").write_bytes(b"paired artifact\n")
+
+  monkeypatch.setattr(dataset, "write_paired_artifact", fake_pair_writer)
+  real_write_once = dataset._write_once
+  crashed = False
+
+  def crash_before_attempt_record(path, payload):
+    nonlocal crashed
+    if path.parent.name == "attempts" and not crashed:
+      crashed = True
+      raise KeyboardInterrupt("synthetic crash")
+    return real_write_once(path, payload)
+
+  monkeypatch.setattr(dataset, "_write_once", crash_before_attempt_record)
+  output = tmp_path / "dataset"
+  with pytest.raises(KeyboardInterrupt, match="synthetic crash"):
+    run_batch(_ranges(), output, 11, 1, 1)
+  assert len(tuple((output / "instances").iterdir())) == 1
+  assert not (output / "attempts" / "00000000.json").exists()
+
+  monkeypatch.setattr(dataset, "_write_once", real_write_once)
+  resumed = run_batch(_ranges(), output, 11, 1, 1, resume=True)
+
+  assert resumed["status"] == "complete"
+  assert len(resumed["selected_ids"]) == 1
+
+
+def test_batch_recovers_error_record_after_attempt_journal_crash(
+    monkeypatch, tmp_path
+):
+  import interventions.dataset as dataset
+
+  monkeypatch.setattr(
+      dataset,
+      "generate_candidate",
+      lambda spec: (_ for _ in ()).throw(RuntimeError("deterministic failure")),
+  )
+  real_write_once = dataset._write_once
+  crashed = False
+
+  def crash_after_error_record(path, payload):
+    nonlocal crashed
+    if path.parent.name == "attempts" and not crashed:
+      crashed = True
+      raise KeyboardInterrupt("synthetic crash")
+    return real_write_once(path, payload)
+
+  monkeypatch.setattr(dataset, "_write_once", crash_after_error_record)
+  output = tmp_path / "dataset"
+  with pytest.raises(KeyboardInterrupt, match="synthetic crash"):
+    run_batch(_ranges(), output, 19, 1, 1)
+  assert (output / "errors" / "00000000.json").exists()
+  assert not (output / "attempts" / "00000000.json").exists()
+
+  monkeypatch.setattr(dataset, "_write_once", real_write_once)
+  resumed = run_batch(_ranges(), output, 19, 1, 1, resume=True)
+
+  assert resumed["status"] == "capacity_exhausted"
+  attempt = json.loads((output / "attempts" / "00000000.json").read_text())
+  assert attempt["status"] == "error"
+
+
+def test_batch_rejects_a_concurrent_writer(monkeypatch, tmp_path):
+  import interventions.dataset as dataset
+
+  _patch_fast_batch(monkeypatch)
+  generate = dataset.generate_candidate
+  entered = threading.Event()
+  release = threading.Event()
+
+  def slow_generate(spec):
+    entered.set()
+    assert release.wait(10)
+    return generate(spec)
+
+  monkeypatch.setattr(dataset, "generate_candidate", slow_generate)
+  output = tmp_path / "dataset"
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    first = executor.submit(run_batch, _ranges(), output, 13, 1, 1)
+    assert entered.wait(10)
+    second = executor.submit(
+        run_batch, _ranges(), output, 13, 1, 1, resume=True
+    )
+    try:
+      second_error = second.exception(timeout=1)
+    except TimeoutError as error:
+      second_error = error
+    finally:
+      release.set()
+    first_result = first.result(timeout=10)
+
+  assert first_result["status"] == "complete"
+  assert isinstance(second_error, RuntimeError)
+  assert "lock" in str(second_error).lower()
+
+
+def test_journal_publication_fsyncs_parent_directories(monkeypatch, tmp_path):
+  import interventions.dataset as dataset
+
+  directories = []
+  monkeypatch.setattr(
+      dataset,
+      "_fsync_directory",
+      lambda directory: directories.append(Path(directory)),
+      raising=False,
+  )
+
+  dataset._write_once(tmp_path / "immutable.json", b"{}\n")
+  dataset._write_atomic(tmp_path / "manifest.json", b"{}\n")
+
+  assert directories.count(tmp_path) >= 2
+
+
+def test_immutable_write_is_idempotent_only_for_identical_bytes(tmp_path):
+  import interventions.dataset as dataset
+
+  destination = tmp_path / "record.json"
+  dataset._write_once(destination, b"{\"value\":1}\n")
+  dataset._write_once(destination, b"{\"value\":1}\n")
+
+  with pytest.raises(FileExistsError, match="immutable|exists|conflict"):
+    dataset._write_once(destination, b"{\"value\":2}\n")
 
 
 def test_batch_offline_pool_allows_late_stratum_to_displace_early_surplus(
@@ -617,6 +1000,26 @@ def test_cli_modules_are_importable():
   assert callable(dataset_cli.main)
 
 
+@pytest.mark.parametrize(
+    "script_name", ["generate_instance.py", "generate_dataset.py"]
+)
+def test_cli_files_run_directly_outside_the_repository(script_name, tmp_path):
+  project_root = Path(__file__).resolve().parents[1]
+  environment = dict(os.environ)
+  environment["MPLCONFIGDIR"] = str(tmp_path / "mpl")
+  result = subprocess.run(
+      [sys.executable, str(project_root / "scripts" / script_name), "--help"],
+      cwd=tmp_path,
+      env=environment,
+      capture_output=True,
+      text=True,
+      timeout=60,
+      check=False,
+  )
+
+  assert result.returncode == 0, result.stderr
+
+
 def test_real_two_branch_candidate_publishes_and_roundtrips(tmp_path):
   output = tmp_path / "real"
   result = run_batch(_ranges(), output, 44, 1, 1)
@@ -627,8 +1030,9 @@ def test_real_two_branch_candidate_publishes_and_roundtrips(tmp_path):
   manifest = json.loads((artifact / "instance_manifest.json").read_text())
   assert (artifact / "spec.json").exists()
   assert manifest["instance_id"] == instance_id
-  factual = read_simulation_log(artifact / "factual")
-  counterfactual = read_simulation_log(artifact / "counterfactual")
+  factual, counterfactual, truth, provenance = read_paired_artifact(artifact)
   assert factual.branch == "factual"
   assert counterfactual.branch == "counterfactual"
+  assert isinstance(truth, GroundTruth)
+  assert provenance["target_id"] == "target"
   np.testing.assert_array_equal(factual.states, counterfactual.states)

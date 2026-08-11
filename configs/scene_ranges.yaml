@@ -39,7 +39,7 @@ intervention:
   start_step: [2, 8]
   duration_steps: [8, 10]
   push_mass: [0.5, 2.0]
-  expected_effects: [non_null, null]
+  expected_effects: [non_null, "null"]
 
 qc:
   linear_velocity_ceiling: 80.0
