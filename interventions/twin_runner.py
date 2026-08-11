@@ -53,6 +53,7 @@ from interventions.trajectory import (
 PathLike = Union[str, os.PathLike[str]]
 _INITIAL_TOLERANCE = 1e-9
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
+_FLOAT32_GEOMETRY_FRACTION = 1e-3
 _PERTURB_ATTEMPTS = 64
 _PAIR_MANIFEST = "manifest.json"
 _PAIR_GENERATIONS = "generations"
@@ -131,10 +132,27 @@ def _target_config(
 
 def _validate_mapping(scene_config: SceneConfig) -> None:
   """Rejects all unsupported schema-to-Kubric mappings before opening clients."""
-  _validate_float32(scene_config.gravity, "scene gravity")
+  geometry_resolution = min(
+      component
+      for item in scene_config.objects
+      for component in item.size
+  )
+  _validate_float32(
+      scene_config.gravity,
+      "scene gravity",
+      resolution=geometry_resolution * scene_config.step_rate ** 2,
+  )
   if scene_config.camera is not None:
-    _validate_float32(scene_config.camera.position, "camera position")
-    _validate_float32(scene_config.camera.look_at, "camera look_at")
+    _validate_float32(
+        scene_config.camera.position,
+        "camera position",
+        resolution=geometry_resolution,
+    )
+    _validate_float32(
+        scene_config.camera.look_at,
+        "camera look_at",
+        resolution=geometry_resolution,
+    )
   for item in scene_config.objects:
     if item.shape == "sphere" and not (
         item.size[0] == item.size[1] == item.size[2]
@@ -148,16 +166,32 @@ def _validate_mapping(scene_config: SceneConfig) -> None:
               item.object_id
           )
       )
-    _validate_float32(item.position, "{} position".format(item.object_id))
-    _validate_float32(item.size, "{} size".format(item.object_id))
+    item_resolution = min(item.size)
     _validate_float32(
-        item.quaternion, "{} quaternion".format(item.object_id)
+        item.position,
+        "{} position".format(item.object_id),
+        resolution=item_resolution,
     )
     _validate_float32(
-        item.linear_velocity, "{} linear_velocity".format(item.object_id)
+        item.size,
+        "{} size".format(item.object_id),
+        resolution=np.asarray(item.size, dtype=np.float64),
+        positive=True,
     )
     _validate_float32(
-        item.angular_velocity, "{} angular_velocity".format(item.object_id)
+        item.quaternion,
+        "{} quaternion".format(item.object_id),
+        resolution=1.0,
+    )
+    _validate_float32(
+        item.linear_velocity,
+        "{} linear_velocity".format(item.object_id),
+        resolution=item_resolution * scene_config.step_rate,
+    )
+    _validate_float32(
+        item.angular_velocity,
+        "{} angular_velocity".format(item.object_id),
+        resolution=float(scene_config.step_rate),
     )
     logical_id = item.metadata.get("logical_id")
     if logical_id is not None and logical_id != item.object_id:
@@ -168,10 +202,34 @@ def _validate_mapping(scene_config: SceneConfig) -> None:
       )
 
 
-def _validate_float32(values: Any, name: str) -> None:
+def _validate_float32(
+    values: Any,
+    name: str,
+    *,
+    resolution: Any,
+    positive: bool = False,
+) -> None:
+  """Preserves values to 0.1% of their collision-relevant resolution."""
   array = np.asarray(values, dtype=np.float64)
   if not np.isfinite(array).all() or np.any(np.abs(array) > _FLOAT32_MAX):
     raise ValueError("{} must be representable as finite float32 values".format(name))
+  with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+    cast = np.asarray(array, dtype=np.float32)
+  if not np.isfinite(cast).all():
+    raise ValueError("{} must be representable as finite float32 values".format(name))
+  if positive and np.any((array > 0.0) & (cast <= 0.0)):
+    raise ValueError("{} positive values collapse to zero in float32".format(name))
+  roundtrip = cast.astype(np.float64)
+  budget = _FLOAT32_GEOMETRY_FRACTION * np.asarray(
+      resolution, dtype=np.float64
+  )
+  spacing = np.abs(np.spacing(cast)).astype(np.float64)
+  if np.any(np.abs(roundtrip - array) > budget) or np.any(spacing > budget):
+    raise ValueError(
+        "{} loses collision-relevant precision in its float32 roundtrip".format(
+            name
+        )
+    )
 
 
 def _rotation_matrix(quaternion: Iterable[float]) -> np.ndarray:
@@ -186,14 +244,19 @@ def _rotation_matrix(quaternion: Iterable[float]) -> np.ndarray:
   )
 
 
+def _float32_quaternions(values: Any) -> np.ndarray:
+  realized = np.asarray(values, dtype=np.float32).astype(np.float64)
+  return realized / np.linalg.norm(realized, axis=-1, keepdims=True)
+
+
 def _object_aabb(item: ObjectConfig) -> np.ndarray:
-  center = np.asarray(item.position, dtype=np.float64)
+  center = np.asarray(item.position, dtype=np.float32).astype(np.float64)
+  size = np.asarray(item.size, dtype=np.float32).astype(np.float64)
   if item.shape == "sphere":
-    extent = np.full(3, item.size[0], dtype=np.float64)
+    extent = np.full(3, size[0], dtype=np.float64)
   else:
-    extent = np.abs(_rotation_matrix(item.quaternion)) @ np.asarray(
-        item.size, dtype=np.float64
-    )
+    quaternion = _float32_quaternions(item.quaternion)
+    extent = np.abs(_rotation_matrix(quaternion)) @ size
   return np.stack((center - extent, center + extent))
 
 
@@ -208,19 +271,95 @@ def _static_aabbs(
 
 
 def _target_extents(target: ObjectConfig, path: np.ndarray) -> np.ndarray:
+  size = np.asarray(target.size, dtype=np.float32).astype(np.float64)
   if target.shape == "sphere":
-    return np.full((len(path), 3), target.size[0], dtype=np.float64)
-  size = np.asarray(target.size, dtype=np.float64)
+    return np.full((len(path), 3), size[0], dtype=np.float64)
   return np.stack(
       [np.abs(_rotation_matrix(quaternion)) @ size for quaternion in path[:, 3:7]]
   )
 
 
-def _geometry_tolerance(*values: np.ndarray) -> float:
-  scale = max(
-      1.0,
-      *(float(np.max(np.abs(value))) for value in values if value.size),
-  )
+def _quaternion_product(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+  left_w, left_xyz = left[0], left[1:]
+  right_w, right_xyz = right[0], right[1:]
+  return np.concatenate((
+      np.asarray((left_w * right_w - np.dot(left_xyz, right_xyz),)),
+      left_w * right_xyz
+      + right_w * left_xyz
+      + np.cross(left_xyz, right_xyz),
+  ))
+
+
+def _swept_cube_extent(
+    size: np.ndarray, start_quaternion: np.ndarray, end_quaternion: np.ndarray
+) -> np.ndarray:
+  """Exact coordinate envelope along the shortest quaternion interpolation."""
+  start = start_quaternion / np.linalg.norm(start_quaternion)
+  end = end_quaternion / np.linalg.norm(end_quaternion)
+  if np.dot(start, end) < 0.0:
+    end = -end
+  relative = _quaternion_product(start * np.asarray((1, -1, -1, -1)), end)
+  relative /= np.linalg.norm(relative)
+  sine_half_angle = np.linalg.norm(relative[1:])
+  if sine_half_angle <= 8.0 * np.finfo(np.float64).eps:
+    return np.maximum(
+        np.abs(_rotation_matrix(start)) @ size,
+        np.abs(_rotation_matrix(end)) @ size,
+    )
+  angle = 2.0 * np.arctan2(sine_half_angle, max(0.0, relative[0]))
+  axis = relative[1:] / sine_half_angle
+  start_rotation = _rotation_matrix(start)
+  corners = np.asarray([
+      (x * size[0], y * size[1], z * size[2])
+      for x in (-1.0, 1.0)
+      for y in (-1.0, 1.0)
+      for z in (-1.0, 1.0)
+  ])
+  extent = np.zeros(3, dtype=np.float64)
+  for corner in corners:
+    parallel = axis * np.dot(axis, corner)
+    constant = start_rotation @ parallel
+    cosine = start_rotation @ (corner - parallel)
+    sine = start_rotation @ np.cross(axis, corner)
+    for coordinate in range(3):
+      candidates = (0.0, angle)
+      stationary = np.arctan2(sine[coordinate], cosine[coordinate])
+      candidates += tuple(
+          candidate
+          for candidate in (stationary - np.pi, stationary, stationary + np.pi)
+          if 0.0 < candidate < angle
+      )
+      values = (
+          constant[coordinate]
+          + cosine[coordinate] * np.cos(candidate)
+          + sine[coordinate] * np.sin(candidate)
+          for candidate in candidates
+      )
+      extent[coordinate] = max(
+          extent[coordinate], max(abs(value) for value in values)
+      )
+  return extent
+
+
+def _target_segment_extents(target: ObjectConfig, path: np.ndarray) -> np.ndarray:
+  size = np.asarray(target.size, dtype=np.float32).astype(np.float64)
+  if target.shape == "sphere":
+    return np.full((len(path) - 1, 3), size[0], dtype=np.float64)
+  return np.stack([
+      _swept_cube_extent(size, start, end)
+      for start, end in zip(path[:-1, 3:7], path[1:, 3:7])
+  ])
+
+
+def _geometry_tolerance(*values: np.ndarray) -> np.ndarray:
+  """Returns independent round-off allowances for XYZ geometry axes."""
+  scale = np.zeros(3, dtype=np.float64)
+  for value in values:
+    array = np.asarray(value, dtype=np.float64)
+    if array.size:
+      scale = np.maximum(
+          scale, np.max(np.abs(array).reshape((-1, 3)), axis=0)
+      )
   return 16.0 * float(np.finfo(np.float64).eps) * scale
 
 
@@ -257,21 +396,45 @@ def _validate_target_sweep(
     bounds: Tuple[Tuple[float, float, float], Tuple[float, float, float]],
     static_aabbs: Tuple[np.ndarray, ...],
 ) -> None:
-  positions = path[:, :3]
-  extents = _target_extents(target, path)
+  realized_path = np.array(path, dtype=np.float64, copy=True)
+  realized_path[:, :3] = np.asarray(path[:, :3], dtype=np.float32).astype(
+      np.float64
+  )
+  realized_path[:, 3:7] = _float32_quaternions(path[:, 3:7])
+  positions = realized_path[:, :3]
+  extents = _target_extents(target, realized_path)
+  segment_extents = _target_segment_extents(target, realized_path)
   lower = np.asarray(bounds[0], dtype=np.float64)
   upper = np.asarray(bounds[1], dtype=np.float64)
   bounds_tolerance = _geometry_tolerance(positions, extents, lower, upper)
+  bounds_tolerance = np.minimum(
+      bounds_tolerance,
+      np.minimum(extents * 0.25, (upper - lower) * 0.25),
+  )
   if np.any(positions - extents < lower - bounds_tolerance) or np.any(
       positions + extents > upper + bounds_tolerance
   ):
     raise ValueError("target swept volume falls outside scene bounds")
+  segment_minimum = np.minimum(positions[:-1], positions[1:]) - segment_extents
+  segment_maximum = np.maximum(positions[:-1], positions[1:]) + segment_extents
+  segment_tolerance = _geometry_tolerance(
+      segment_minimum, segment_maximum, lower, upper
+  )
+  segment_tolerance = np.minimum(
+      segment_tolerance,
+      np.minimum(segment_extents * 0.25, (upper - lower) * 0.25),
+  )
+  if np.any(segment_minimum < lower - segment_tolerance) or np.any(
+      segment_maximum > upper + segment_tolerance
+  ):
+    raise ValueError("target swept volume falls outside scene bounds")
   for obstacle in static_aabbs:
     for index, (start, end) in enumerate(zip(positions[:-1], positions[1:])):
-      extent = np.maximum(extents[index], extents[index + 1])
+      extent = segment_extents[index]
       minimum = obstacle[0] - extent
       maximum = obstacle[1] + extent
       tolerance = _geometry_tolerance(start, end, minimum, maximum)
+      tolerance = np.minimum(tolerance, (maximum - minimum) * 0.25)
       if _segment_intersects_open_aabb(
           start,
           end,
@@ -281,12 +444,24 @@ def _validate_target_sweep(
         raise ValueError("target swept volume intersects a static obstacle AABB")
 
 
-def _validate_path_float32(path: np.ndarray, step_rate: int) -> None:
-  _validate_float32(path, "commanded path")
+def _validate_path_float32(
+    path: np.ndarray, step_rate: int, target: ObjectConfig
+) -> None:
+  resolution = min(target.size)
+  _validate_float32(
+      path[:, :3], "commanded path position", resolution=resolution
+  )
+  _validate_float32(
+      path[:, 3:7], "commanded path quaternion", resolution=1.0
+  )
   velocities = np.zeros((len(path), 3), dtype=np.float64)
   with np.errstate(over="ignore", invalid="ignore"):
     velocities[1:] = (path[1:, :3] - path[:-1, :3]) * float(step_rate)
-  _validate_float32(velocities, "commanded path velocity")
+  _validate_float32(
+      velocities,
+      "commanded path velocity",
+      resolution=resolution * step_rate,
+  )
 
 
 def _default_path(target: ObjectConfig, steps: int, step_rate: int) -> np.ndarray:
@@ -351,7 +526,7 @@ def _prepare_paths(
   else:
     factual = _explicit_path(factual_path, target, steps)
   validate_path(factual)
-  _validate_path_float32(factual, scene_config.step_rate)
+  _validate_path_float32(factual, scene_config.step_rate, target)
   _validate_target_sweep(factual, target, scene_config.scene_bounds, aabbs)
 
   start, end = window
@@ -377,7 +552,7 @@ def _prepare_paths(
       trial = np.array(factual, dtype=np.float64, copy=True)
       trial[start:end] = candidate
       try:
-        _validate_path_float32(trial, scene_config.step_rate)
+        _validate_path_float32(trial, scene_config.step_rate, target)
         _validate_target_sweep(
             trial, target, scene_config.scene_bounds, aabbs
         )
@@ -392,7 +567,7 @@ def _prepare_paths(
           )
       )
   validate_path(counterfactual)
-  _validate_path_float32(counterfactual, scene_config.step_rate)
+  _validate_path_float32(counterfactual, scene_config.step_rate, target)
   _validate_target_sweep(
       counterfactual, target, scene_config.scene_bounds, aabbs
   )
@@ -628,6 +803,105 @@ def _validate_log_metadata(
     raise ValueError("factual metadata must remain independent of rng_seed")
 
 
+def _target_contact_penetration(
+    log: SimulationLog, target_id: str
+) -> Mapping[int, float]:
+  penetration: Dict[int, float] = {}
+  for record in log.contacts:
+    if target_id not in (record.object_a, record.object_b):
+      continue
+    depth = (
+        0.0
+        if record.contact_distance is None
+        else max(0.0, -float(record.contact_distance))
+    )
+    penetration[record.step] = max(penetration.get(record.step, 0.0), depth)
+  return penetration
+
+
+def _validate_target_state_binding(
+    log: SimulationLog,
+    path: np.ndarray,
+    target: ObjectConfig,
+    scene_config: SceneConfig,
+) -> None:
+  """Binds logged target poses to float32-realized kinematic commands.
+
+  Contact-free maximal-coordinate steps are pose-forced and therefore use a
+  strict float32-ULP comparison.  While the target temporarily carries mass,
+  Bullet's contact solver can move it within a step; those steps additionally
+  allow one commanded step of travel or the recorded penetration depth.
+  """
+  target_index = log.object_ids.index(target.object_id)
+  target_states = log.states[:, target_index]
+  realized_positions32 = np.asarray(path[:, :3], dtype=np.float32)
+  realized_positions = realized_positions32.astype(np.float64)
+  position_tolerance = 4.0 * np.abs(
+      np.spacing(realized_positions32)
+  ).astype(np.float64)
+  realized_quaternions = np.asarray(path[:, 3:7], dtype=np.float32).astype(
+      np.float64
+  )
+  realized_quaternions /= np.linalg.norm(
+      realized_quaternions, axis=1
+  )[:, None]
+  quaternion_tolerance = 8.0 * float(np.finfo(np.float32).eps)
+  quaternion_norm_tolerance = 4.0 * float(np.finfo(np.float32).eps)
+  commanded_velocities = np.zeros((len(path), 3), dtype=np.float64)
+  commanded_velocities[1:] = (
+      path[1:, :3] - path[:-1, :3]
+  ) * float(scene_config.step_rate)
+  dt = 1.0 / float(scene_config.step_rate)
+  gravity_travel = 0.5 * np.linalg.norm(scene_config.gravity) * dt * dt
+  penetrations = _target_contact_penetration(log, target.object_id)
+
+  for offset, step in enumerate(log.steps):
+    position_error = target_states[offset, :3] - realized_positions[offset]
+    state_quaternion = target_states[offset, 3:7]
+    reference_quaternion = realized_quaternions[offset]
+    state_quaternion_norm = float(np.hypot.reduce(state_quaternion))
+    if abs(state_quaternion_norm - 1.0) > quaternion_norm_tolerance:
+      raise ValueError("logged target quaternion norm is not float32-unit")
+    state_quaternion = state_quaternion / state_quaternion_norm
+    if np.dot(state_quaternion, reference_quaternion) < 0.0:
+      state_quaternion = -state_quaternion
+    quaternion_dot = float(np.dot(state_quaternion, reference_quaternion))
+    quaternion_error = 2.0 * np.arccos(
+        np.clip(quaternion_dot, -1.0, 1.0)
+    )
+    if step not in penetrations:
+      if np.any(np.abs(position_error) > position_tolerance[offset]):
+        raise ValueError(
+            "logged target position does not match commanded_path pose"
+        )
+      if quaternion_error > quaternion_tolerance:
+        raise ValueError(
+            "logged target quaternion does not match commanded_path pose"
+        )
+      continue
+
+    one_step_travel = dt * max(
+        np.linalg.norm(commanded_velocities[offset]),
+        np.linalg.norm(target_states[offset, 7:10]),
+    ) + gravity_travel
+    position_allowance = max(
+        penetrations[step], one_step_travel
+    ) + np.linalg.norm(position_tolerance[offset])
+    if np.linalg.norm(position_error) > position_allowance:
+      raise ValueError(
+          "logged target position exceeds its commanded contact-step envelope"
+      )
+    angular_allowance = (
+        penetrations[step] / min(target.size)
+        + np.linalg.norm(target_states[offset, 10:13]) * dt
+        + quaternion_tolerance
+    )
+    if quaternion_error > min(np.pi, angular_allowance):
+      raise ValueError(
+          "logged target quaternion exceeds its commanded contact-step envelope"
+      )
+
+
 def _validate_pair_logs(
     scene_config: SceneConfig,
     intervention: Intervention,
@@ -680,8 +954,14 @@ def _validate_pair_logs(
   validate_path(counterfactual_path)
   aabbs = _static_aabbs(scene_config, target.object_id)
   for path in (factual_path, counterfactual_path):
-    _validate_path_float32(path, scene_config.step_rate)
+    _validate_path_float32(path, scene_config.step_rate, target)
     _validate_target_sweep(path, target, scene_config.scene_bounds, aabbs)
+  _validate_target_state_binding(
+      factual_log, factual_path, target, scene_config
+  )
+  _validate_target_state_binding(
+      counterfactual_log, counterfactual_path, target, scene_config
+  )
   start, end = window
   if not np.array_equal(counterfactual_path[:start], factual_path[:start]) or not np.array_equal(
       counterfactual_path[end:], factual_path[end:]
@@ -818,6 +1098,8 @@ def _pair_publisher_lock(target: Path):
 
 
 def _generation_file_records(directory: Path) -> Mapping[str, Mapping[str, Any]]:
+  if directory.is_symlink():
+    raise ValueError("paired artifact generations cannot be symbolic links")
   records = {}
   for path in sorted(directory.rglob("*")):
     if path.is_symlink():
@@ -833,6 +1115,17 @@ def _generation_file_records(directory: Path) -> Mapping[str, Mapping[str, Any]]
   if not records:
     raise ValueError("paired artifact generation has no payload files")
   return records
+
+
+def _reject_artifact_symlinks(root: Path, relative: Path) -> None:
+  """Rejects symbolic links at the root and every artifact-local component."""
+  if root.is_symlink():
+    raise ValueError("paired artifact path cannot contain symbolic links")
+  current = root
+  for component in relative.parts:
+    current = current / component
+    if current.is_symlink():
+      raise ValueError("paired artifact path cannot contain symbolic links")
 
 
 def _pair_manifest(directory: Path) -> Mapping[str, Any]:
@@ -855,6 +1148,7 @@ def _pair_manifest(directory: Path) -> Mapping[str, Any]:
 
 
 def _validate_pair_manifest(target: Path) -> Mapping[str, Any]:
+  _reject_artifact_symlinks(target, Path(_PAIR_MANIFEST))
   try:
     payload = json.loads((target / _PAIR_MANIFEST).read_text(encoding="utf-8"))
   except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -876,6 +1170,8 @@ def _validate_pair_manifest(target: Path) -> Mapping[str, Any]:
       or not files
   ):
     raise ValueError("paired artifact manifest is malformed")
+  generation_relative = Path(_PAIR_GENERATIONS) / generation
+  _reject_artifact_symlinks(target, generation_relative)
   bare_records = {}
   for relative, record in files.items():
     parts = Path(relative).parts if isinstance(relative, str) else ()
@@ -900,6 +1196,7 @@ def _validate_pair_manifest(target: Path) -> Mapping[str, Any]:
         or record["size"] < 0
     ):
       raise ValueError("paired artifact manifest file record is malformed")
+    _reject_artifact_symlinks(target, Path(expected_path))
     try:
       content = (target / expected_path).read_bytes()
     except OSError as error:

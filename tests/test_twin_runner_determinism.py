@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -555,6 +556,80 @@ def test_pair_validation_binds_counterfactual_path_to_recorded_rng_seed():
     extract_pair_ground_truth(config, intervention, factual, mismatched)
 
 
+@pytest.mark.parametrize("mutation", ["position", "quaternion"])
+def test_pair_validation_rejects_target_pose_unbound_from_commanded_path(
+    mutation, tmp_path
+):
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 3
+  )
+  target_index = factual.object_ids.index("target")
+
+  def corrupt(log):
+    states = log.states.copy()
+    if mutation == "position":
+      states[:, target_index, 0] += 7.0
+    else:
+      states[:, target_index, 3:7] = np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)
+    return _replace_log(log, states=states)
+
+  bad_factual = corrupt(factual)
+  bad_counterfactual = corrupt(counterfactual)
+  with pytest.raises(ValueError, match="target|pose|position|quaternion|commanded"):
+    extract_pair_ground_truth(
+        config, intervention, bad_factual, bad_counterfactual
+    )
+  with pytest.raises(ValueError, match="target|pose|position|quaternion|commanded"):
+    write_paired_artifact(
+        tmp_path / "pair",
+        config,
+        intervention,
+        3,
+        bad_factual,
+        bad_counterfactual,
+    )
+  assert not (tmp_path / "pair").exists()
+
+
+def test_pair_validation_accepts_quaternion_sign_equivalent_target_state():
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 3
+  )
+  target_index = factual.object_ids.index("target")
+
+  def flip(log):
+    states = log.states.copy()
+    states[:, target_index, 3:7] *= -1.0
+    return _replace_log(log, states=states)
+
+  assert extract_pair_ground_truth(
+      config, intervention, flip(factual), flip(counterfactual)
+  ) == GroundTruth(graph_delta=GraphEdgeDelta())
+
+
+def test_pair_validation_rejects_scaled_target_quaternion():
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 3
+  )
+  target_index = factual.object_ids.index("target")
+
+  def scale(log):
+    states = log.states.copy()
+    states[:, target_index, 3:7] *= 1.0 + 8e-7
+    return _replace_log(log, states=states)
+
+  with pytest.raises(ValueError, match="target|quaternion|unit|norm"):
+    extract_pair_ground_truth(
+        config, intervention, scale(factual), scale(counterfactual)
+    )
+
+
 def test_writer_rejects_rng_seed_that_did_not_generate_counterfactual(tmp_path):
   config = _scene(_object("target", static=True))
   intervention = _intervention(magnitude=0)
@@ -617,6 +692,122 @@ def test_swept_cube_uses_quaternion_dependent_extents(monkeypatch):
           restitution=0,
       ),
       _object("wall", size=(2, 0.15, 2), position=(0, 0.55, 0), static=True),
+  )
+
+  with pytest.raises(ValueError, match="volume|obstacle|AABB|intersect"):
+    generate_paired_instance(config, "target", _intervention(magnitude=0), 0)
+  assert constructed == []
+
+
+def test_swept_cube_covers_intermediate_shortest_arc_rotation(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  config = _scene(
+      _object("target", size=1.0, static=True),
+      _object(
+          "wall",
+          size=(0.1, 2.0, 2.0),
+          position=(1.3, 0.0, 0.0),
+          static=True,
+      ),
+  )
+  path = np.zeros((10, 7), dtype=np.float64)
+  path[0, 3] = 1.0
+  path[1:, 3] = np.sqrt(0.5)
+  path[1:, 6] = np.sqrt(0.5)
+
+  with pytest.raises(ValueError, match="volume|obstacle|AABB|rotation"):
+    generate_paired_instance(
+        config,
+        "target",
+        _intervention(magnitude=0),
+        0,
+        factual_path=path,
+    )
+  assert constructed == []
+
+
+def test_geometry_tolerance_does_not_erase_micro_scale_overlap(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  config = _scene(
+      _object("target", shape="sphere", size=1e-16, static=True),
+      _object("wall", size=1e-16, static=True),
+  )
+
+  with pytest.raises(ValueError, match="volume|obstacle|AABB|intersect"):
+    generate_paired_instance(config, "target", _intervention(magnitude=0), 0)
+  assert constructed == []
+
+
+def test_geometry_tolerance_is_local_to_each_axis(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  config = _scene(
+      _object("target", shape="sphere", size=1e-16, static=True),
+      _object(
+          "wall",
+          size=(1e-16, 2.0, 2.0),
+          position=(1.9e-16, 0.0, 0.0),
+          static=True,
+      ),
+  )
+
+  with pytest.raises(ValueError, match="volume|obstacle|AABB|intersect"):
+    generate_paired_instance(config, "target", _intervention(magnitude=0), 0)
+  assert constructed == []
+
+
+def test_sweep_uses_float32_realized_geometry(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  target_size = 0.0940377154715784
+  wall_size = 0.14545904936907372
+  wall_x = 0.23949676988962068
+  assert wall_x > target_size + wall_size
+  assert float(np.float32(wall_x)) < (
+      float(np.float32(target_size)) + float(np.float32(wall_size))
+  )
+  config = _scene(
+      _object("target", shape="sphere", size=target_size, static=True),
+      _object(
+          "wall",
+          size=(wall_size, 1.0, 1.0),
+          position=(wall_x, 0.0, 0.0),
+          static=True,
+      ),
   )
 
   with pytest.raises(ValueError, match="volume|obstacle|AABB|intersect"):
@@ -770,6 +961,83 @@ def test_float32_preflight_rejects_unrepresentable_values_before_client(
   assert constructed == []
 
 
+@pytest.mark.parametrize(
+    "case", ["collapsed_positions", "underflow_size", "lossy_velocity", "lossy_path"]
+)
+def test_float32_preflight_rejects_lossy_geometry_before_client(
+    case, monkeypatch
+):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  bounds = ((-2e9, -2e9, -2e9), (2e9, 2e9, 2e9))
+  factual_path = None
+  if case == "collapsed_positions":
+    config = SceneConfig(
+        objects=(
+            _object("target", position=(1e9, 0, 0), static=True),
+            _object("marker", position=(1e9 + 20, 0, 0)),
+        ),
+        scene_bounds=bounds,
+        gravity=(0, 0, 0),
+        frame_range=(0, 1),
+        frame_rate=24,
+        step_rate=240,
+    )
+    assert np.float32(1e9) == np.float32(1e9 + 20)
+  elif case == "underflow_size":
+    config = _scene(_object("target", size=1e-100, static=True))
+    assert np.float32(1e-100) == 0.0
+  elif case == "lossy_velocity":
+    config = SceneConfig(
+        objects=(
+            _object(
+                "target",
+                position=(0, 0, 0),
+                linear_velocity=(1e9 + 20, 0, 0),
+                static=True,
+            ),
+        ),
+        scene_bounds=bounds,
+        gravity=(0, 0, 0),
+        frame_range=(0, 1),
+        frame_rate=24,
+        step_rate=240,
+    )
+  else:
+    config = SceneConfig(
+        objects=(_object("target", position=(1e9, 0, 0), static=True),),
+        scene_bounds=bounds,
+        gravity=(0, 0, 0),
+        frame_range=(0, 1),
+        frame_rate=24,
+        step_rate=240,
+    )
+    factual_path = np.zeros((10, 7), dtype=np.float64)
+    factual_path[:, 0] = 1e9 + 20
+    factual_path[0, 0] = 1e9
+    factual_path[:, 3] = 1.0
+
+  with pytest.raises(
+      ValueError, match="float32|precision|roundtrip|collapse|zero"
+  ):
+    generate_paired_instance(
+        config,
+        "target",
+        _intervention(magnitude=0),
+        0,
+        factual_path=factual_path,
+    )
+  assert constructed == []
+
+
 def test_kubric_trait_domain_preflight_happens_before_client(monkeypatch):
   import interventions.twin_runner as runner
 
@@ -812,6 +1080,12 @@ def test_wide_margin_contact_versus_miss_extracts_removed_edge_and_path():
   factual, counterfactual = generate_paired_instance(
       config, "target", intervention, 0
   )
+  target_index = factual.object_ids.index("target")
+  contact_pose_drift = np.linalg.norm(
+      factual.states[:, target_index, :3] - factual.commanded_path[:, :3],
+      axis=1,
+  )
+  assert contact_pose_drift.max() > 1e-3
   truth = extract_pair_ground_truth(
       config,
       intervention,
@@ -827,6 +1101,21 @@ def test_wide_margin_contact_versus_miss_extracts_removed_edge_and_path():
   assert truth.graph_delta.added == ()
   assert truth.hard_affected == ("ball",)
   assert truth.propagation_path["ball"] == ("target", "ball")
+
+  contact_step = next(
+      record.step
+      for record in factual.contacts
+      if "target" in (record.object_a, record.object_b)
+  )
+  corrupted_states = factual.states.copy()
+  corrupted_states[contact_step, target_index, 0] += 7.0
+  with pytest.raises(ValueError, match="target|pose|position|commanded"):
+    extract_pair_ground_truth(
+        config,
+        intervention,
+        _replace_log(factual, states=corrupted_states),
+        counterfactual,
+    )
 
 
 def test_pair_artifact_roundtrip_and_canonical_provenance(tmp_path):
@@ -1057,3 +1346,29 @@ def test_pair_publication_fsyncs_generation_and_root(monkeypatch, tmp_path):
 
   assert any(path.name == "generations" for path in calls)
   assert destination in calls
+
+
+@pytest.mark.parametrize("symlink_component", ["generations", "generation"])
+def test_pair_reader_rejects_symlinked_generation_path_component(
+    symlink_component, tmp_path
+):
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 5)
+  destination = tmp_path / "pair"
+  write_paired_artifact(destination, config, intervention, 5, *pair)
+  generation, _ = _pair_generation(destination)
+  outside = tmp_path / "outside"
+  outside.mkdir()
+
+  if symlink_component == "generations":
+    component = destination / "generations"
+    relocated = outside / "generations"
+  else:
+    component = generation
+    relocated = outside / generation.name
+  shutil.move(str(component), relocated)
+  component.symlink_to(relocated, target_is_directory=True)
+
+  with pytest.raises(ValueError, match="symbolic|symlink|artifact path"):
+    read_paired_artifact(destination)
