@@ -46,6 +46,11 @@ from interventions.trajectory import (
     perturb_path,
     validate_path,
 )
+from interventions.twin_runner import (
+    extract_pair_ground_truth,
+    generate_paired_instance,
+    write_paired_artifact,
+)
 
 
 __all__ = [
@@ -75,6 +80,8 @@ __all__ = [
     "contact_log_to_temporal_graph",
     "derive_tags",
     "extract_ground_truth",
+    "extract_pair_ground_truth",
+    "generate_paired_instance",
     "graph_delta",
     "max_position_deviation",
     "perturb_path",
@@ -85,4 +92,5 @@ __all__ = [
     "to_jsonable",
     "validate_path",
     "write_simulation_log",
+    "write_paired_artifact",
 ]
