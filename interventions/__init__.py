@@ -34,7 +34,10 @@ from interventions.logging import (
     state_index,
     write_simulation_log,
 )
-from interventions.kinematic_simulator import KinematicSimulator
+from interventions.kinematic_simulator import (
+    KinematicDragSimulator,
+    KinematicSimulator,
+)
 from interventions.tagging import derive_tags
 from interventions.trajectory import (
     RECIPE_PROFILE_SEMANTICS,
@@ -55,6 +58,7 @@ __all__ = [
     "GroundTruth",
     "INTERVENTION_RECIPES",
     "Intervention",
+    "KinematicDragSimulator",
     "LINEAR_VELOCITY_SLICE",
     "KinematicSimulator",
     "ObjectConfig",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import math
 import numbers
+import uuid
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -18,11 +19,14 @@ from interventions.logging import ContactLogger, SimulationLog
 
 _ZERO3 = (0.0, 0.0, 0.0)
 _QUATERNION_TOLERANCE = 1e-6
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 
 def _logical_id(asset: core.PhysicalObject) -> str:
-  """Returns the explicit logical id, falling back to Kubric's unique uid."""
-  value = asset.metadata.get("logical_id", asset.uid)
+  """Returns the required process-stable logical identifier."""
+  if "logical_id" not in asset.metadata:
+    raise ValueError("asset metadata['logical_id'] is required")
+  value = asset.metadata["logical_id"]
   if not isinstance(value, str) or not value:
     raise ValueError("logical IDs must be non-empty strings")
   return value
@@ -70,6 +74,20 @@ def _positive_mass(value: Any) -> float:
   return result
 
 
+def _commanded_velocities(path: np.ndarray, step_rate: float) -> np.ndarray:
+  """Prevalidates Kubric pose casts and all backward differences."""
+  if np.any(np.abs(path) > _FLOAT32_MAX):
+    raise ValueError("path values must be representable as float32 Kubric traits")
+  velocities = np.zeros((len(path), 3), dtype=np.float64)
+  with np.errstate(over="ignore", invalid="ignore"):
+    velocities[1:] = (path[1:, :3] - path[:-1, :3]) * step_rate
+  if not np.isfinite(velocities).all():
+    raise ValueError("path produces a non-finite commanded velocity")
+  if np.any(np.abs(velocities) > _FLOAT32_MAX):
+    raise ValueError("path velocity must be representable as float32")
+  return velocities
+
+
 def _change_observers(asset: core.Asset) -> Dict[str, Tuple[Any, ...]]:
   """Snapshots traitlets callbacks so the private wrapper can unlink cleanly."""
   notifiers = getattr(asset, "_trait_notifiers", {})
@@ -85,24 +103,126 @@ class KinematicSimulator(PyBullet):
 
   The Kubric asset remains logically static throughout.  Immediately before each
   simulated path sample, its Bullet body temporarily receives ``push_mass`` and
-  the backward-difference velocity.  Its pose is corrected at the next sample,
-  so any within-step drift remains both physical and observable in the log.
+  the backward-difference velocity. Gravity therefore acts on the temporarily
+  massive target for that step; the next command corrects its pose. Any resulting
+  within-step drift remains both physical and observable in the log.
   """
 
   def __init__(self, scene: core.Scene, scratch_dir: Any = None):
     self._closed = False
+    self._closing = False
     self._asset_observers: Dict[core.Asset, List[Tuple[str, Any]]] = {}
     self._checkpoint_ids: set[int] = set()
-    if scratch_dir is None:
-      super().__init__(scene)
-    else:
-      super().__init__(scene, scratch_dir=scratch_dir)
+    self._ownership_body: Optional[int] = None
+    self._ownership_key: Optional[str] = None
+    self._ownership_value: Optional[bytes] = None
+    self._client_id: Optional[int] = None
     try:
+      if scratch_dir is None:
+        super().__init__(scene)
+      else:
+        super().__init__(scene, scratch_dir=scratch_dir)
+    except BaseException:
+      self._cleanup_partial_initialization(scene)
+      raise
+    try:
+      self._client_id = int(self._physics_client._client)  # pylint: disable=protected-access
+      self._install_ownership_canary()
+      self._physics_client.resetSimulation = self._reject_reset_simulation
       self._physics_client.setTimeStep(1.0 / float(scene.step_rate))
+      self._step_rate_observer = self._handle_step_rate_change
+      self.scene_observers.setdefault("step_rate", []).append(
+          self._step_rate_observer
+      )
+      scene.observe(self._step_rate_observer, names="step_rate", type="change")
       self._validate_logical_ids()
     except BaseException:
-      self.close()
+      if self._ownership_value is None:
+        self._cleanup_partial_initialization(scene)
+      else:
+        self.close()
       raise
+
+  def _cleanup_partial_initialization(self, scene: core.Scene) -> None:
+    """Disconnects a client when Kubric scene linking fails inside super()."""
+    client = getattr(self, "_physics_client", None)
+    client_id = getattr(client, "_client", -1)
+    self._closing = True
+    try:
+      if self in scene.views:
+        try:
+          scene.unlink_view(self)
+        except BaseException:
+          pass
+      for asset in tuple(self._asset_observers):
+        self._unobserve_asset(asset)
+      for name, callbacks in getattr(self, "scene_observers", {}).items():
+        for callback in callbacks:
+          try:
+            scene.unobserve(callback, names=name, type="change")
+          except (KeyError, ValueError):
+            pass
+      if isinstance(client_id, numbers.Integral) and client_id >= 0:
+        try:
+          if pb.isConnected(int(client_id)):
+            pb.disconnect(int(client_id))
+        except pb.error:
+          pass
+    finally:
+      if client is not None:
+        client._client = -1  # pylint: disable=protected-access
+      self._closed = True
+      self._closing = False
+
+  @staticmethod
+  def _reject_reset_simulation(*args, **kwargs) -> None:
+    del args, kwargs
+    raise RuntimeError(
+        "resetSimulation is unsupported; close and create a new simulator"
+    )
+
+  def _install_ownership_canary(self) -> None:
+    """Marks this Bullet world so recycled integer client IDs are detectable."""
+    token = uuid.uuid4().hex
+    body = int(self._physics_client.createMultiBody(
+        baseMass=0.0,
+        baseCollisionShapeIndex=-1,
+        baseVisualShapeIndex=-1,
+    ))
+    key = "kubric_kinematic_owner_{}".format(uuid.uuid4().hex)
+    self._physics_client.addUserData(body, key, token)
+    self._ownership_body = body
+    self._ownership_key = key
+    self._ownership_value = token.encode("utf-8")
+
+  def _owns_client(self) -> bool:
+    if (
+        self._client_id is None
+        or self._ownership_body is None
+        or self._ownership_key is None
+        or self._ownership_value is None
+    ):
+      return False
+    try:
+      if not pb.isConnected(self._client_id):
+        return False
+      user_data_id = pb.getUserDataId(
+          self._ownership_body,
+          self._ownership_key,
+          physicsClientId=self._client_id,
+      )
+      if user_data_id < 0:
+        return False
+      return (
+          pb.getUserData(user_data_id, physicsClientId=self._client_id)
+          == self._ownership_value
+      )
+    except pb.error:
+      return False
+
+  def _handle_step_rate_change(self, change: Any) -> None:
+    if self._owns_client():
+      self._physics_client.setTimeStep(1.0 / float(change.new))
 
   def add(self, asset: core.Asset) -> None:
     """Links an asset while retaining the observers needed for clean close()."""
@@ -116,28 +236,43 @@ class KinematicSimulator(PyBullet):
         if not any(callback is item for item in previous):
           added.append((name, callback))
 
+  def _unobserve_asset(self, asset: core.Asset) -> None:
+    for name, callback in self._asset_observers.pop(asset, ()):
+      try:
+        asset.unobserve(callback, names=name, type="change")
+      except (KeyError, ValueError):
+        pass
+
   def remove_asset(self, asset: core.Asset) -> None:
-    """Allows close() to unlink cleanly even after an external disconnect."""
-    if self.is_connected:
-      super().remove_asset(asset)
+    """Removes a body and its exact callbacks without leaving stale setters."""
+    try:
+      if not self._closing and self._owns_client():
+        super().remove_asset(asset)
+    finally:
+      self._unobserve_asset(asset)
 
   @property
   def bullet_client(self):
     """The private client wrapper, with this connection id pre-bound."""
+    self._require_connected()
     return self._physics_client
 
   @property
+  def physics_client(self) -> int:
+    """Returns the owned integer client id, rejecting recycled connections."""
+    self._require_connected()
+    assert self._client_id is not None
+    return self._client_id
+
+  @property
   def is_connected(self) -> bool:
-    if self._closed:
-      return False
-    try:
-      return bool(self._physics_client.isConnected())
-    except pb.error:
-      return False
+    return not self._closed and self._owns_client()
 
   def _require_connected(self) -> None:
     if not self.is_connected:
-      raise RuntimeError("KinematicSimulator is closed or disconnected")
+      raise RuntimeError(
+          "KinematicSimulator connection ownership is stale, closed, or disconnected"
+      )
 
   def __enter__(self) -> "KinematicSimulator":
     self._require_connected()
@@ -152,18 +287,15 @@ class KinematicSimulator(PyBullet):
     """Unlinks and disconnects this simulator; repeated calls are harmless."""
     if self._closed:
       return
+    owned = self._owns_client()
+    self._closing = True
     scene = self.scene
     try:
       if scene is not None and self in scene.views:
         scene.unlink_view(self)
     finally:
-      for asset, callbacks in tuple(self._asset_observers.items()):
-        for name, callback in callbacks:
-          try:
-            asset.unobserve(callback, names=name, type="change")
-          except (KeyError, ValueError):
-            pass
-      self._asset_observers.clear()
+      for asset in tuple(self._asset_observers):
+        self._unobserve_asset(asset)
       if scene is not None:
         for name, callbacks in self.scene_observers.items():
           for callback in callbacks:
@@ -172,14 +304,26 @@ class KinematicSimulator(PyBullet):
             except (KeyError, ValueError):
               pass
       try:
-        if self.is_connected:
-          self._physics_client.disconnect()
+        if owned and self._client_id is not None:
+          pb.disconnect(self._client_id)
+      except pb.error:
+        pass
       finally:
-        # Kubric's wrapper does not invalidate this id itself.  Without doing so,
+        # Kubric's wrapper does not invalidate this id itself. Without doing so,
         # its later __del__ may disconnect an unrelated connection that reused it.
         self._physics_client._client = -1  # pylint: disable=protected-access
         self._checkpoint_ids.clear()
         self._closed = True
+        self._closing = False
+
+  def __del__(self):
+    try:
+      self.close()
+    except BaseException:
+      try:
+        self._physics_client._client = -1  # pylint: disable=protected-access
+      except BaseException:
+        pass
 
   def _physical_assets(self) -> Tuple[core.PhysicalObject, ...]:
     assets = (
@@ -276,6 +420,50 @@ class KinematicSimulator(PyBullet):
       for member in ("position", "quaternion", "velocity", "angular_velocity"):
         asset.keyframe_insert(member, frame)
 
+  @contextlib.contextmanager
+  def _suspend_asset_observers(
+      self, assets: Iterable[core.PhysicalObject]
+  ) -> Iterator[None]:
+    detached = []
+    for asset in assets:
+      for name, callback in self._asset_observers.get(asset, ()):
+        asset.unobserve(callback, names=name, type="change")
+        detached.append((asset, name, callback))
+    try:
+      yield
+    finally:
+      for asset, name, callback in detached:
+        tracked = self._asset_observers.get(asset, ())
+        still_tracked = any(
+            tracked_name == name and tracked_callback is callback
+            for tracked_name, tracked_callback in tracked
+        )
+        if (
+            self._owns_client()
+            and asset in self.scene.assets
+            and self in asset.linked_objects
+            and still_tracked
+        ):
+          asset.observe(callback, names=name, type="change")
+
+  def _publish_keyframes(
+      self,
+      assets: Tuple[core.PhysicalObject, ...],
+      records: Iterable[Tuple[np.ndarray, int]],
+      final_state: np.ndarray,
+  ) -> None:
+    """Publishes recorded states without feeding float32 traits into Bullet."""
+    with self._suspend_asset_observers(assets):
+      try:
+        for state, frame in records:
+          self._write_keyframe(assets, state, frame)
+      finally:
+        for asset, values in zip(assets, final_state):
+          asset.position = values[0:3]
+          asset.quaternion = values[3:7]
+          asset.velocity = values[7:10]
+          asset.angular_velocity = values[10:13]
+
   def run_with_intervention(
       self,
       target: core.PhysicalObject,
@@ -304,6 +492,8 @@ class KinematicSimulator(PyBullet):
       raise ValueError("start_step must be a nonnegative integer")
     if not isinstance(branch, str) or not branch.strip():
       raise ValueError("branch must be a non-empty string")
+    step_rate = float(self.scene.step_rate)
+    commanded_velocities = _commanded_velocities(path_value, step_rate)
     self._validate_logical_ids()
     target_id = _logical_id(target)
     body = self._body(target)
@@ -315,7 +505,7 @@ class KinematicSimulator(PyBullet):
     }
 
     if contact_logger is None:
-      logger = ContactLogger(body_to_object_id, self.scene.step_rate)
+      logger = ContactLogger(body_to_object_id, step_rate)
     else:
       logger = contact_logger
       if not callable(getattr(logger, "clear", None)) or not callable(
@@ -327,19 +517,15 @@ class KinematicSimulator(PyBullet):
     target.metadata["kinematic_emulation"] = True
     states = np.empty((len(path_value), len(assets), 13), dtype=np.float64)
     steps = tuple(start_step + offset for offset in range(len(path_value)))
-    cadence = self.scene.step_rate // self.scene.frame_rate
-    previous_position: Optional[np.ndarray] = None
+    cadence = int(step_rate) // self.scene.frame_rate
+    keyframe_records: List[Tuple[np.ndarray, int]] = []
 
-    try:
-      for offset, (absolute_step, command) in enumerate(zip(steps, path_value)):
-        if previous_position is None:
-          commanded_velocity = np.zeros(3, dtype=np.float64)
-        else:
-          commanded_velocity = (
-              command[:3] - previous_position
-          ) * float(self.scene.step_rate)
-        previous_position = command[:3].copy()
-
+    for offset, (absolute_step, command, commanded_velocity) in enumerate(
+        zip(steps, path_value, commanded_velocities)
+    ):
+      if float(self.scene.step_rate) != step_rate:
+        raise RuntimeError("scene.step_rate changed during intervention run")
+      try:
         self.bullet_client.changeDynamics(body, -1, mass=push_mass_value)
         self.bullet_client.resetBaseVelocity(
             body,
@@ -360,13 +546,18 @@ class KinematicSimulator(PyBullet):
         logger.log(absolute_step, raw_contacts)
         state = self._snapshot(assets)
         states[offset] = state
+        if float(self.scene.step_rate) != step_rate:
+          raise RuntimeError("scene.step_rate changed during intervention run")
         if write_keyframes and absolute_step % cadence == 0:
           frame = self.scene.frame_start + absolute_step // cadence
-          self._write_keyframe(assets, state, frame)
-    finally:
-      # Bypass Kubric's static setter: its logical static flag never changes.
-      if self.is_connected:
-        self.bullet_client.changeDynamics(body, -1, mass=0.0)
+          keyframe_records.append((state.copy(), frame))
+      finally:
+        # Bypass Kubric's static setter: its logical static flag never changes.
+        if self.is_connected:
+          self.bullet_client.changeDynamics(body, -1, mass=0.0)
+
+    if write_keyframes:
+      self._publish_keyframes(assets, keyframe_records, states[-1])
 
     return SimulationLog(
         branch=branch,
@@ -374,16 +565,19 @@ class KinematicSimulator(PyBullet):
         steps=steps,
         states=states,
         contacts=tuple(logger.records),
-        step_rate=float(self.scene.step_rate),
+        step_rate=step_rate,
         commanded_path=path_value,
         metadata={
             "target_id": target_id,
             "kinematic_emulation": True,
             "push_mass": push_mass_value,
-            "dt": 1.0 / float(self.scene.step_rate),
+            "dt": 1.0 / step_rate,
             "velocity_estimator": "backward_difference",
         },
     )
 
 
-__all__ = ["KinematicSimulator"]
+KinematicDragSimulator = KinematicSimulator
+
+
+__all__ = ["KinematicDragSimulator", "KinematicSimulator"]
