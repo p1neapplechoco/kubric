@@ -221,6 +221,30 @@ def test_intervention_defaults_and_serializes_push_mass():
   assert json.loads(json.dumps(payload))["push_mass"] == 1.0
 
 
+def test_intervention_preserves_five_positional_argument_binding():
+  metadata = {"source": "legacy"}
+
+  intervention = Intervention(
+      "ball", "retime", 0.25, (3, 9), metadata
+  )
+
+  assert intervention.metadata == metadata
+  assert intervention.schema_version == "1.0"
+  assert intervention.push_mass == 1.0
+
+
+def test_intervention_preserves_six_positional_argument_binding():
+  metadata = {"source": "legacy"}
+
+  intervention = Intervention(
+      "ball", "retime", 0.25, (3, 9), metadata, "1.0"
+  )
+
+  assert intervention.metadata == metadata
+  assert intervention.schema_version == "1.0"
+  assert intervention.push_mass == 1.0
+
+
 def test_intervention_push_mass_is_immutable():
   intervention = Intervention(
       target_id="ball",

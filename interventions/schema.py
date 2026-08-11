@@ -384,9 +384,9 @@ class Intervention(_SchemaMixin):
   recipe: str
   magnitude: float
   time_window: Tuple[float, float]
-  push_mass: float = 1.0
   metadata: Mapping[str, Any] = field(default_factory=dict)
   schema_version: str = SCHEMA_VERSION
+  push_mass: float = 1.0
 
   def __post_init__(self) -> None:
     target_id = _nonempty_string(self.target_id, "target_id")
