@@ -255,6 +255,18 @@ def test_instance_spec_path_length_must_match_scene_duration():
     replace(_spec(), factual_path=_commanded_path(9))
 
 
+@pytest.mark.parametrize("time_window", [(1, 20), (1, 3.5)])
+def test_instance_spec_requires_bounded_integer_intervention_window(time_window):
+  intervention = Intervention(
+      "target", "remove_collision", 0.0, time_window, push_mass=1.0
+  )
+
+  with pytest.raises((TypeError, ValueError), match="time_window|window"):
+    replace(
+        _spec(), intervention=intervention, intervention_start_step=1
+    )
+
+
 def test_load_ranges_copies_and_freezes_yaml(tmp_path):
   config = tmp_path / "ranges.yaml"
   import yaml
@@ -435,6 +447,32 @@ def test_qc_handles_malformed_doubles_without_crashing():
   assert "nonfinite_state" in result.reason_codes
 
 
+@pytest.mark.parametrize("malformation", ["fractional_steps", "fractional_contact"])
+def test_qc_rejects_lossy_integer_coercion(malformation):
+  factual = _log("factual")
+  counterfactual = _log("counterfactual")
+  if malformation == "fractional_steps":
+    steps = tuple(index + 0.5 for index in range(10))
+    factual = SimpleNamespace(**{**factual.__dict__, "steps": steps})
+    counterfactual = SimpleNamespace(
+        **{**counterfactual.__dict__, "steps": steps}
+    )
+  else:
+    contact = SimpleNamespace(
+        step=0.5, object_a="target", object_b="ball"
+    )
+    factual = SimpleNamespace(
+        **{**factual.__dict__, "contacts": (contact,)}
+    )
+    counterfactual = SimpleNamespace(
+        **{**counterfactual.__dict__, "contacts": (contact,)}
+    )
+
+  result = _qc(factual=factual, counterfactual=counterfactual)
+
+  assert result.reason_codes == ("branch_misaligned",)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -607,10 +645,12 @@ def test_topology_signature_is_id_invariant_and_edge_sensitive():
   assert signature != topology_signature(scene_a, no_edge, target_a)
 
 
-def _regular_topology(edges):
-  ids = ("target",) + tuple("node_{}".format(index) for index in range(6))
+def _regular_topology(edges, prefix=""):
+  ids = (prefix + "target",) + tuple(
+      prefix + "node_{}".format(index) for index in range(6)
+  )
   scene = SceneConfig(
-      objects=(ObjectConfig("target", "cube", mass=0, static=True),) + tuple(
+      objects=(ObjectConfig(ids[0], "cube", mass=0, static=True),) + tuple(
           ObjectConfig(object_id, "sphere") for object_id in ids[1:]
       ),
       gravity=(0, 0, 0),
@@ -628,7 +668,7 @@ def _regular_topology(edges):
   return scene, SimulationLog(
       "factual", ids, (0,), states, contacts, 240,
       commanded_path=_commanded_path(1),
-  )
+  ), ids[0]
 
 
 def test_topology_signature_distinguishes_cycle_from_two_triangles():
@@ -637,12 +677,36 @@ def test_topology_signature_distinguishes_cycle_from_two_triangles():
       (0, 1), (1, 2), (2, 0),
       (3, 4), (4, 5), (5, 3),
   )
-  cycle_scene, cycle_log = _regular_topology(cycle_edges)
-  triangles_scene, triangles_log = _regular_topology(triangle_edges)
+  cycle_scene, cycle_log, cycle_target = _regular_topology(cycle_edges)
+  triangles_scene, triangles_log, triangles_target = _regular_topology(
+      triangle_edges
+  )
 
   assert topology_signature(
-      cycle_scene, cycle_log, "target"
-  ) != topology_signature(triangles_scene, triangles_log, "target")
+      cycle_scene, cycle_log, cycle_target
+  ) != topology_signature(triangles_scene, triangles_log, triangles_target)
+
+
+def test_topology_signature_exactly_distinguishes_k33_from_triangular_prism():
+  k33_edges = tuple(
+      (left, right) for left in range(3) for right in range(3, 6)
+  )
+  prism_edges = (
+      (0, 1), (1, 2), (2, 0),
+      (3, 4), (4, 5), (5, 3),
+      (0, 3), (1, 4), (2, 5),
+  )
+  k33_scene, k33_log, k33_target = _regular_topology(k33_edges)
+  prism_scene, prism_log, prism_target = _regular_topology(prism_edges)
+  renamed_scene, renamed_log, renamed_target = _regular_topology(
+      prism_edges, "renamed_"
+  )
+
+  prism_signature = topology_signature(prism_scene, prism_log, prism_target)
+  assert topology_signature(k33_scene, k33_log, k33_target) != prism_signature
+  assert topology_signature(
+      renamed_scene, renamed_log, renamed_target
+  ) == prism_signature
 
 
 def _candidate(index, category, bucket, topology=None):
@@ -715,8 +779,10 @@ def _patch_fast_batch(monkeypatch, *, fail_indices=(), truth_by_index=None):
       lambda *args, **kwargs: QCResult(True, (), {"max_linear_velocity": 0}),
   )
 
-  def fake_publish(root, spec, factual, counterfactual):
+  def fake_publish(root, spec, factual, counterfactual, ground_truth=None):
     artifact = root / "instances" / spec.instance_id
+    if artifact.exists():
+      return artifact
     artifact.mkdir()
     payload = b"synthetic artifact\n"
     (artifact / "payload.bin").write_bytes(payload)
@@ -814,10 +880,13 @@ def test_batch_recovers_complete_orphan_after_attempt_journal_crash(
 ):
   import interventions.dataset as dataset
 
+  factual = _log("factual")
+  counterfactual = _log("counterfactual")
+  truth = _truth()
   monkeypatch.setattr(
       dataset,
       "generate_candidate",
-      lambda spec: (_log("factual"), _log("counterfactual"), _truth()),
+      lambda spec: (factual, counterfactual, truth),
   )
   monkeypatch.setattr(
       dataset,
@@ -831,6 +900,35 @@ def test_batch_recovers_complete_orphan_after_attempt_journal_crash(
     (destination / "pair.bin").write_bytes(b"paired artifact\n")
 
   monkeypatch.setattr(dataset, "write_paired_artifact", fake_pair_writer)
+  expected_spec = sample_instance_spec(_ranges(), 11, 0)
+  monkeypatch.setattr(
+      dataset,
+      "read_paired_artifact",
+      lambda directory: (
+          factual,
+          counterfactual,
+          truth,
+          {
+              "schema_version": expected_spec.scene_config.schema_version,
+              "target_id": expected_spec.target_id,
+              "rng_seed": expected_spec.instance_seed,
+              "scene_config": expected_spec.scene_config.to_dict(),
+              "intervention": expected_spec.intervention.to_dict(),
+              "factual": "factual",
+              "counterfactual": "counterfactual",
+              "tags": ["null_effect", "target_only"],
+              "extraction_thresholds": {
+                  "force_threshold": 0.0,
+                  "min_episode_impulse": 0.0,
+                  "force_tolerance": 1e-6,
+                  "position_epsilon": 1e-3,
+                  "velocity_epsilon": 1e-3,
+                  "quaternion_epsilon": 1e-3,
+              },
+          },
+      ),
+      raising=False,
+  )
   real_write_once = dataset._write_once
   crashed = False
 
@@ -855,16 +953,108 @@ def test_batch_recovers_complete_orphan_after_attempt_journal_crash(
   assert len(resumed["selected_ids"]) == 1
 
 
+def test_batch_rejects_divergent_complete_orphan_rerun(monkeypatch, tmp_path):
+  import interventions.dataset as dataset
+
+  persisted_factual = _log("factual")
+  persisted_counterfactual = _log("counterfactual")
+  divergent_states = np.array(persisted_counterfactual.states, copy=True)
+  divergent_states[5, _LOG_IDS.index("ball"), 0] += 0.25
+  divergent_counterfactual = _log(
+      "counterfactual", states=divergent_states
+  )
+  truth = _truth()
+  generated = 0
+
+  def changing_generate(spec):
+    nonlocal generated
+    generated += 1
+    counterfactual = (
+        persisted_counterfactual if generated == 1 else divergent_counterfactual
+    )
+    return persisted_factual, counterfactual, truth
+
+  monkeypatch.setattr(dataset, "generate_candidate", changing_generate)
+  monkeypatch.setattr(
+      dataset,
+      "evaluate_qc",
+      lambda *args, **kwargs: QCResult(True, (), {"max_linear_velocity": 0}),
+  )
+
+  def fake_pair_writer(directory, *args, **kwargs):
+    destination = Path(directory)
+    destination.mkdir()
+    (destination / "pair.bin").write_bytes(b"first generated pair\n")
+
+  monkeypatch.setattr(dataset, "write_paired_artifact", fake_pair_writer)
+  expected_spec = sample_instance_spec(_ranges(), 29, 0)
+  provenance = {
+      "schema_version": expected_spec.scene_config.schema_version,
+      "target_id": expected_spec.target_id,
+      "rng_seed": expected_spec.instance_seed,
+      "scene_config": expected_spec.scene_config.to_dict(),
+      "intervention": expected_spec.intervention.to_dict(),
+      "factual": "factual",
+      "counterfactual": "counterfactual",
+      "tags": ["null_effect", "target_only"],
+      "extraction_thresholds": {
+          "force_threshold": 0.0,
+          "min_episode_impulse": 0.0,
+          "force_tolerance": 1e-6,
+          "position_epsilon": 1e-3,
+          "velocity_epsilon": 1e-3,
+          "quaternion_epsilon": 1e-3,
+      },
+  }
+  monkeypatch.setattr(
+      dataset,
+      "read_paired_artifact",
+      lambda directory: (
+          persisted_factual, persisted_counterfactual, truth, provenance
+      ),
+      raising=False,
+  )
+  real_write_once = dataset._write_once
+  crashed = False
+
+  def crash_before_attempt(path, payload):
+    nonlocal crashed
+    if path.parent.name == "attempts" and not crashed:
+      crashed = True
+      raise KeyboardInterrupt("synthetic orphan crash")
+    return real_write_once(path, payload)
+
+  monkeypatch.setattr(dataset, "_write_once", crash_before_attempt)
+  output = tmp_path / "dataset"
+  with pytest.raises(KeyboardInterrupt, match="orphan crash"):
+    run_batch(_ranges(), output, 29, 1, 1)
+
+  monkeypatch.setattr(dataset, "_write_once", real_write_once)
+  resumed = run_batch(_ranges(), output, 29, 1, 1, resume=True)
+
+  assert generated == 2
+  assert resumed["status"] == "capacity_exhausted"
+  assert resumed["selected_ids"] == ()
+  attempt = json.loads((output / "attempts" / "00000000.json").read_text())
+  assert attempt["status"] == "error"
+  assert "orphan" in attempt["message"].lower() or "mismatch" in attempt[
+      "message"
+  ].lower()
+
+
 def test_batch_recovers_error_record_after_attempt_journal_crash(
     monkeypatch, tmp_path
 ):
   import interventions.dataset as dataset
 
-  monkeypatch.setattr(
-      dataset,
-      "generate_candidate",
-      lambda spec: (_ for _ in ()).throw(RuntimeError("deterministic failure")),
-  )
+  generated = 0
+
+  def changing_failure(spec):
+    nonlocal generated
+    generated += 1
+    raise RuntimeError("failure-{}".format(generated))
+
+  monkeypatch.setattr(dataset, "generate_candidate", changing_failure)
   real_write_once = dataset._write_once
   crashed = False
 
@@ -881,13 +1071,17 @@ def test_batch_recovers_error_record_after_attempt_journal_crash(
     run_batch(_ranges(), output, 19, 1, 1)
   assert (output / "errors" / "00000000.json").exists()
   assert not (output / "attempts" / "00000000.json").exists()
+  original_error = (output / "errors" / "00000000.json").read_bytes()
 
   monkeypatch.setattr(dataset, "_write_once", real_write_once)
   resumed = run_batch(_ranges(), output, 19, 1, 1, resume=True)
 
   assert resumed["status"] == "capacity_exhausted"
+  assert generated == 1
+  assert (output / "errors" / "00000000.json").read_bytes() == original_error
   attempt = json.loads((output / "attempts" / "00000000.json").read_text())
   assert attempt["status"] == "error"
+  assert attempt["message"] == "failure-1"
 
 
 def test_batch_rejects_a_concurrent_writer(monkeypatch, tmp_path):
@@ -922,6 +1116,75 @@ def test_batch_rejects_a_concurrent_writer(monkeypatch, tmp_path):
   assert first_result["status"] == "complete"
   assert isinstance(second_error, RuntimeError)
   assert "lock" in str(second_error).lower()
+
+
+def test_batch_lock_cannot_be_bypassed_with_output_symlink_alias(
+    monkeypatch, tmp_path
+):
+  import interventions.dataset as dataset
+
+  _patch_fast_batch(monkeypatch)
+  generate = dataset.generate_candidate
+  entered = threading.Event()
+  release = threading.Event()
+  calls = 0
+
+  def block_first_generate(spec):
+    nonlocal calls
+    calls += 1
+    if calls == 1:
+      entered.set()
+      assert release.wait(10)
+    return generate(spec)
+
+  monkeypatch.setattr(dataset, "generate_candidate", block_first_generate)
+  output = tmp_path / "dataset"
+  alias = tmp_path / "dataset-alias"
+  with ThreadPoolExecutor(max_workers=1) as executor:
+    first = executor.submit(run_batch, _ranges(), output, 31, 1, 1)
+    assert entered.wait(10)
+    alias.symlink_to(output, target_is_directory=True)
+    try:
+      try:
+        run_batch(_ranges(), alias, 31, 1, 1, resume=True)
+      except Exception as error:  # Captured so the first writer is always released.
+        second_error = error
+      else:
+        second_error = None
+    finally:
+      release.set()
+    first.result(timeout=10)
+
+  assert isinstance(second_error, RuntimeError)
+  assert "lock" in str(second_error).lower()
+
+
+def test_fresh_batch_initialization_is_atomic_across_interrupt(
+    monkeypatch, tmp_path
+):
+  import interventions.dataset as dataset
+
+  _patch_fast_batch(monkeypatch)
+  real_write_once = dataset._write_once
+  interrupted = False
+
+  def interrupt_first_write(path, payload):
+    nonlocal interrupted
+    if not interrupted:
+      interrupted = True
+      raise KeyboardInterrupt("initialization interrupted")
+    return real_write_once(path, payload)
+
+  monkeypatch.setattr(dataset, "_write_once", interrupt_first_write)
+  output = tmp_path / "dataset"
+  with pytest.raises(KeyboardInterrupt, match="initialization interrupted"):
+    run_batch(_ranges(), output, 37, 1, 1)
+
+  assert not output.exists()
+  assert not tuple(tmp_path.glob(".dataset.init-*"))
+  monkeypatch.setattr(dataset, "_write_once", real_write_once)
+  result = run_batch(_ranges(), output, 37, 1, 1)
+  assert result["status"] == "complete"
 
 
 def test_journal_publication_fsyncs_parent_directories(monkeypatch, tmp_path):
@@ -998,6 +1261,50 @@ def test_cli_modules_are_importable():
   dataset_cli = importlib.import_module("scripts.generate_dataset")
   assert callable(instance_cli.main)
   assert callable(dataset_cli.main)
+
+
+def test_generate_instance_cli_passes_truth_to_publisher(
+    monkeypatch, tmp_path, capsys
+):
+  import scripts.generate_instance as instance_cli
+
+  spec = _spec()
+  factual = _log("factual")
+  counterfactual = _log("counterfactual")
+  truth = _truth()
+  published = []
+  monkeypatch.setattr(instance_cli, "load_ranges", lambda path: _ranges())
+  monkeypatch.setattr(
+      instance_cli, "sample_instance_spec", lambda *args: spec
+  )
+  monkeypatch.setattr(
+      instance_cli,
+      "generate_candidate",
+      lambda candidate: (factual, counterfactual, truth),
+  )
+  monkeypatch.setattr(
+      instance_cli,
+      "evaluate_qc",
+      lambda *args, **kwargs: QCResult(True, (), {}),
+  )
+
+  def publish(root, candidate, factual_log, counterfactual_log, candidate_truth):
+    published.append(
+        (candidate, factual_log, counterfactual_log, candidate_truth)
+    )
+    return root / "instances" / candidate.instance_id
+
+  monkeypatch.setattr(instance_cli, "_publish_instance", publish)
+  exit_code = instance_cli.main([
+      "--config", str(tmp_path / "ranges.yaml"),
+      "--output", str(tmp_path / "output"),
+      "--seed", "3",
+      "--attempt-index", "0",
+  ])
+
+  assert exit_code == 0
+  assert published == [(spec, factual, counterfactual, truth)]
+  assert json.loads(capsys.readouterr().out)["status"] == "accepted"
 
 
 @pytest.mark.parametrize(

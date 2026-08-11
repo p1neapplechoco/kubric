@@ -8,6 +8,7 @@ Bullet clients through :mod:`interventions.twin_runner`.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import numbers
@@ -22,7 +23,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -47,6 +48,7 @@ from interventions.trajectory import build_path
 from interventions.twin_runner import (
     extract_pair_ground_truth,
     generate_paired_instance,
+    read_paired_artifact,
     write_paired_artifact,
 )
 
@@ -55,6 +57,7 @@ PathLike = Union[str, os.PathLike[str]]
 _EXPECTED_EFFECTS = frozenset(("non_null", "null"))
 _HOP_BUCKETS = ("0", "1", "2", "3+")
 _SPLITS = ("train", "val", "test")
+_MAX_TOPOLOGY_CANONICAL_PERMUTATIONS = 100_000
 
 
 def _identifier(value: Any, name: str) -> str:
@@ -155,10 +158,22 @@ class InstanceSpec:
     expected = _identifier(self.expected_effect, "expected_effect")
     if expected not in _EXPECTED_EFFECTS:
       raise ValueError("expected_effect must be 'non_null' or 'null'")
-    start = _integer(self.intervention_start_step, "intervention_start_step")
-    if float(self.intervention.time_window[0]) != float(start):
-      raise ValueError("intervention_start_step must match intervention.time_window")
     factual_path = _readonly_path(self.factual_path)
+    start = _integer(self.intervention_start_step, "intervention_start_step")
+    if any(
+        not float(value).is_integer()
+        for value in self.intervention.time_window
+    ):
+      raise ValueError("intervention.time_window endpoints must be integers")
+    window_start, window_end = (
+        int(value) for value in self.intervention.time_window
+    )
+    if window_start != start:
+      raise ValueError("intervention_start_step must match intervention.time_window")
+    if not 0 <= window_start < window_end <= len(factual_path):
+      raise ValueError(
+          "intervention.time_window must lie within the factual_path"
+      )
     frame_start, frame_end = self.scene_config.frame_range
     expected_steps = (
         (frame_end - frame_start)
@@ -606,14 +621,22 @@ def _log_parts(log: Any) -> Tuple[Optional[Tuple[str, ...]], Optional[Tuple[int,
                                   Optional[float]]:
   try:
     object_ids = tuple(log.object_ids)
-    steps = tuple(int(step) for step in log.steps)
+    raw_steps = tuple(log.steps)
     states = np.asarray(log.states, dtype=np.float64)
     contacts = tuple(log.contacts)
     step_rate = float(log.step_rate)
   except (AttributeError, TypeError, ValueError, OverflowError):
     return None, None, None, None, None
+  steps = (
+      tuple(int(step) for step in raw_steps)
+      if all(
+          not isinstance(step, bool) and isinstance(step, numbers.Integral)
+          for step in raw_steps
+      )
+      else None
+  )
   if (
-      states.ndim != 3 or states.shape != (len(steps), len(object_ids), 13)
+      states.ndim != 3 or states.shape != (len(raw_steps), len(object_ids), 13)
       or not math.isfinite(step_rate) or step_rate <= 0
   ):
     return object_ids, steps, None, contacts, step_rate
@@ -675,6 +698,8 @@ def _contacts_match_scene(
     return all(
         record.object_a in object_ids
         and record.object_b in object_ids
+        and not isinstance(record.step, bool)
+        and isinstance(record.step, numbers.Integral)
         and int(record.step) in steps
         for record in contacts
     )
@@ -718,9 +743,17 @@ def _prefix_contacts(contacts: Optional[Tuple[Any, ...]], start: int) -> Optiona
   if contacts is None:
     return None
   try:
-    return tuple(record for record in contacts if int(record.step) < start)
+    normalized = tuple(
+        (record, record.step)
+        for record in contacts
+        if not isinstance(record.step, bool)
+        and isinstance(record.step, numbers.Integral)
+    )
   except (AttributeError, TypeError, ValueError):
     return None
+  if len(normalized) != len(contacts):
+    return None
+  return tuple(record for record, step in normalized if int(step) < start)
 
 
 def _rotation_extent(size: Sequence[float], quaternion: Sequence[float]) -> np.ndarray:
@@ -955,8 +988,9 @@ def topology_signature(
 
   Timing, force, and contact multiplicity are intentionally excluded so split
   groups describe scene topology rather than making each dynamics trace unique.
-  Component fingerprints supplement Weisfeiler-Lehman colors for disconnected
-  regular graphs such as a six-cycle versus two triangles.
+  The colored adjacency is canonically minimized over every label-preserving
+  permutation.  A hard permutation limit keeps the exact method bounded; the
+  default scene configuration (at most seven nodes) is comfortably below it.
   """
   if not isinstance(scene_config, SceneConfig):
     raise TypeError("scene_config must be a SceneConfig")
@@ -996,44 +1030,35 @@ def topology_signature(
   for left, right in edges:
     neighbors[left].add(right)
     neighbors[right].add(left)
-  colors = {node: _sha_text(label) for node, label in labels.items()}
-  for _ in range(len(colors)):
-    refined = {
-        node: _sha_text(colors[node], *sorted(colors[item] for item in neighbors[node]))
-        for node in colors
-    }
-    if refined == colors:
-      break
-    colors = refined
-  canonical_edges = sorted(
-      tuple(sorted((colors[left], colors[right]))) for left, right in edges
+  groups = defaultdict(list)
+  for node, label in labels.items():
+    groups[label].append(node)
+  ordered_groups = tuple(
+      (label, tuple(sorted(groups[label]))) for label in sorted(groups)
   )
-  components = []
-  remaining = set(colors)
-  while remaining:
-    pending = [next(iter(remaining))]
-    component = set()
-    while pending:
-      node = pending.pop()
-      if node in component:
-        continue
-      component.add(node)
-      pending.extend(neighbors[node] - component)
-    remaining.difference_update(component)
-    component_edges = sorted(
-        tuple(sorted((colors[left], colors[right])))
-        for left, right in edges
-        if left in component and right in component
+  permutation_count = math.prod(
+      math.factorial(len(nodes)) for _, nodes in ordered_groups
+  )
+  if permutation_count > _MAX_TOPOLOGY_CANONICAL_PERMUTATIONS:
+    raise ValueError(
+        "exact topology canonicalization exceeds the safe permutation limit"
     )
-    components.append({
-        "nodes": sorted(colors[node] for node in component),
-        "edges": component_edges,
-    })
-  components.sort(key=_canonical_bytes)
+  canonical_adjacency = None
+  permutation_pools = tuple(
+      itertools.permutations(nodes) for _, nodes in ordered_groups
+  )
+  for group_order in itertools.product(*permutation_pools):
+    order = tuple(node for group in group_order for node in group)
+    adjacency = "".join(
+        "1" if order[right] in neighbors[order[left]] else "0"
+        for left in range(len(order))
+        for right in range(left + 1, len(order))
+    )
+    if canonical_adjacency is None or adjacency < canonical_adjacency:
+      canonical_adjacency = adjacency
   payload = {
-      "nodes": sorted(colors.values()),
-      "edges": canonical_edges,
-      "components": components,
+      "labels": [(label, len(nodes)) for label, nodes in ordered_groups],
+      "adjacency": canonical_adjacency or "",
   }
   return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 
@@ -1305,6 +1330,7 @@ def _publish_instance(
     spec: InstanceSpec,
     factual: SimulationLog,
     counterfactual: SimulationLog,
+    ground_truth: GroundTruth,
 ) -> Path:
   instances = root / "instances"
   instances.mkdir(parents=True, exist_ok=True)
@@ -1313,6 +1339,30 @@ def _publish_instance(
     _validate_instance_artifact(
         destination, instance_id=spec.instance_id, spec=spec
     )
+    persisted_factual, persisted_counterfactual, persisted_truth, provenance = (
+        read_paired_artifact(destination)
+    )
+    expected_provenance = {
+        "schema_version": spec.scene_config.schema_version,
+        "target_id": spec.target_id,
+        "rng_seed": spec.instance_seed,
+        "scene_config": spec.scene_config.to_dict(),
+        "intervention": spec.intervention.to_dict(),
+        "factual": "factual",
+        "counterfactual": "counterfactual",
+    }
+    if (
+        persisted_factual != factual
+        or persisted_counterfactual != counterfactual
+        or persisted_truth != ground_truth
+        or any(
+            to_jsonable(provenance.get(key)) != to_jsonable(value)
+            for key, value in expected_provenance.items()
+        )
+    ):
+      raise ValueError(
+          "complete orphan artifact does not match regenerated candidate"
+      )
     return destination
   staging = instances / ".{}.tmp-{}".format(spec.instance_id, uuid.uuid4().hex)
   try:
@@ -1344,6 +1394,39 @@ def _publish_instance(
 
 def _summary_from_dict(value: Mapping[str, Any]) -> CandidateSummary:
   return CandidateSummary(**dict(value))
+
+
+def _read_orphan_error(
+    root: Path, attempt_index: int
+) -> Optional[Mapping[str, Any]]:
+  path = root / "errors" / "{:08d}.json".format(attempt_index)
+  if not path.exists():
+    return None
+  if path.is_symlink() or not path.is_file():
+    raise ValueError("corrupt error journal: {}".format(path))
+  try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+  except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise ValueError("corrupt error journal: {}".format(path)) from error
+  expected_keys = {"attempt_index", "error_type", "message", "traceback"}
+  if (
+      not isinstance(payload, Mapping)
+      or set(payload) != expected_keys
+      or isinstance(payload.get("attempt_index"), bool)
+      or not isinstance(payload.get("attempt_index"), numbers.Integral)
+      or int(payload["attempt_index"]) != attempt_index
+      or not isinstance(payload.get("error_type"), str)
+      or not payload["error_type"]
+      or not isinstance(payload.get("message"), str)
+      or not isinstance(payload.get("traceback"), str)
+  ):
+    raise ValueError("corrupt error journal: {}".format(path))
+  return {
+      "attempt_index": attempt_index,
+      "error_type": payload["error_type"],
+      "message": payload["message"],
+      "traceback": payload["traceback"],
+  }
 
 
 def _validate_candidate_artifact(
@@ -1429,6 +1512,33 @@ def _manifest(
   }
 
 
+def _initialize_dataset_root(
+    root: Path, snapshot: bytes, run_payload: Mapping[str, Any]
+) -> None:
+  """Publishes a complete fresh journal skeleton with one atomic rename."""
+  root.parent.mkdir(parents=True, exist_ok=True)
+  staging = Path(tempfile.mkdtemp(
+      prefix=".{}.init-".format(root.name), dir=root.parent
+  ))
+  try:
+    (staging / "attempts").mkdir()
+    (staging / "errors").mkdir()
+    (staging / "instances").mkdir()
+    _write_once(staging / "config.yaml", snapshot)
+    _write_once(staging / "run.json", _canonical_bytes(run_payload))
+    _fsync_directory(staging)
+    os.rename(staging, root)
+    _fsync_directory(root.parent)
+  except BaseException:
+    if staging.exists():
+      shutil.rmtree(staging, ignore_errors=True)
+      try:
+        _fsync_directory(root.parent)
+      except OSError:
+        pass
+    raise
+
+
 def _run_batch_unlocked(
     ranges: Mapping[str, Any],
     output: PathLike,
@@ -1464,14 +1574,7 @@ def _run_batch_unlocked(
   if not root.exists():
     if resume:
       raise ValueError("cannot resume a missing dataset output")
-    root.mkdir(parents=True)
-    _fsync_directory(root.parent)
-    (root / "attempts").mkdir()
-    (root / "errors").mkdir()
-    (root / "instances").mkdir()
-    _fsync_directory(root)
-    _write_once(root / "config.yaml", snapshot)
-    _write_once(run_path, _canonical_bytes(run_payload))
+    _initialize_dataset_root(root, snapshot, run_payload)
   else:
     try:
       existing = json.loads(run_path.read_text(encoding="utf-8"))
@@ -1504,54 +1607,60 @@ def _run_batch_unlocked(
     if missing is None:
       break
     attempt_path = root / "attempts" / "{:08d}.json".format(missing)
-    try:
-      spec = sample_instance_spec(ranges, seed, missing)
-      factual, counterfactual, truth = generate_candidate(spec)
-      qc = evaluate_qc(spec, factual, counterfactual, truth, qc_config)
-      record: Dict[str, Any] = {
-          "attempt_index": missing,
-          "instance_id": spec.instance_id,
-          "instance_seed": spec.instance_seed,
-          "qc": qc.to_dict(),
-      }
-      if qc.accepted:
-        depth, bucket = propagation_hop_depth(truth)
-        artifact_relative = Path("instances") / spec.instance_id
-        summary = CandidateSummary(
-            spec.instance_id,
-            missing,
-            primary_category(truth),
-            depth,
-            bucket,
-            topology_signature(spec.scene_config, factual, spec.target_id),
-            str(artifact_relative),
+    orphan_error = _read_orphan_error(root, missing)
+    if orphan_error is not None:
+      record = {**orphan_error, "status": "error"}
+    else:
+      try:
+        spec = sample_instance_spec(ranges, seed, missing)
+        factual, counterfactual, truth = generate_candidate(spec)
+        qc = evaluate_qc(spec, factual, counterfactual, truth, qc_config)
+        record = {
+            "attempt_index": missing,
+            "instance_id": spec.instance_id,
+            "instance_seed": spec.instance_seed,
+            "qc": qc.to_dict(),
+        }
+        if qc.accepted:
+          depth, bucket = propagation_hop_depth(truth)
+          artifact_relative = Path("instances") / spec.instance_id
+          summary = CandidateSummary(
+              spec.instance_id,
+              missing,
+              primary_category(truth),
+              depth,
+              bucket,
+              topology_signature(spec.scene_config, factual, spec.target_id),
+              str(artifact_relative),
+          )
+          artifact = _publish_instance(
+              root, spec, factual, counterfactual, truth
+          )
+          if artifact != root / artifact_relative:
+            raise RuntimeError("instance publisher returned an unexpected path")
+          artifact_manifest = (artifact / "instance_manifest.json").read_bytes()
+          record.update(
+              status="accepted",
+              candidate=summary.to_dict(),
+              artifact_manifest_sha256=hashlib.sha256(
+                  artifact_manifest
+              ).hexdigest(),
+              artifact_manifest_size=len(artifact_manifest),
+          )
+        else:
+          record.update(status="rejected", spec=spec.to_dict())
+      except Exception as error:  # Candidate-local failures continue the batch.
+        error_record = {
+            "attempt_index": missing,
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+        }
+        _write_once(
+            root / "errors" / "{:08d}.json".format(missing),
+            _canonical_bytes(error_record),
         )
-        artifact = _publish_instance(root, spec, factual, counterfactual)
-        if artifact != root / artifact_relative:
-          raise RuntimeError("instance publisher returned an unexpected path")
-        artifact_manifest = (artifact / "instance_manifest.json").read_bytes()
-        record.update(
-            status="accepted",
-            candidate=summary.to_dict(),
-            artifact_manifest_sha256=hashlib.sha256(
-                artifact_manifest
-            ).hexdigest(),
-            artifact_manifest_size=len(artifact_manifest),
-        )
-      else:
-        record.update(status="rejected", spec=spec.to_dict())
-    except Exception as error:  # Candidate-local failures must not abort later attempts.
-      error_record = {
-          "attempt_index": missing,
-          "error_type": type(error).__name__,
-          "message": str(error),
-          "traceback": traceback.format_exc(),
-      }
-      _write_once(
-          root / "errors" / "{:08d}.json".format(missing),
-          _canonical_bytes(error_record),
-      )
-      record = {**error_record, "status": "error"}
+        record = {**error_record, "status": "error"}
     _write_once(attempt_path, _canonical_bytes(record))
     occupied.add(missing)
     records = _attempt_records(root)
@@ -1579,7 +1688,7 @@ def run_batch(
     workers: int = 1,
 ) -> Mapping[str, Any]:
   """Runs an immutable, resumable journal under an exclusive output lock."""
-  root = Path(output)
+  root = Path(output).resolve(strict=False)
   with _dataset_lock(root):
     return _run_batch_unlocked(
         ranges,

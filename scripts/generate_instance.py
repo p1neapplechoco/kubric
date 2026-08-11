@@ -39,7 +39,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     qc = evaluate_qc(spec, factual, counterfactual, truth, ranges.get("qc", {}))
     root = Path(args.output)
     root.mkdir(parents=True, exist_ok=True)
-    artifact = _publish_instance(root, spec, factual, counterfactual)
+    artifact = _publish_instance(root, spec, factual, counterfactual, truth)
     payload = {
         "status": "accepted" if qc.accepted else "rejected",
         "instance_id": spec.instance_id,
