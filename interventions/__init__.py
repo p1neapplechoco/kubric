@@ -49,6 +49,7 @@ from interventions.trajectory import (
 from interventions.twin_runner import (
     extract_pair_ground_truth,
     generate_paired_instance,
+    read_paired_artifact,
     write_paired_artifact,
 )
 
@@ -85,12 +86,13 @@ __all__ = [
     "graph_delta",
     "max_position_deviation",
     "perturb_path",
+    "read_paired_artifact",
     "read_simulation_log",
     "state_affected",
     "state_index",
     "temporal_reachability",
     "to_jsonable",
     "validate_path",
-    "write_simulation_log",
     "write_paired_artifact",
+    "write_simulation_log",
 ]

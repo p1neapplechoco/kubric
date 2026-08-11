@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pybullet as pb
@@ -19,8 +22,10 @@ from interventions import (
     KinematicDragSimulator,
     ObjectConfig,
     SceneConfig,
+    SimulationLog,
     extract_pair_ground_truth,
     generate_paired_instance,
+    read_paired_artifact,
     read_simulation_log,
     write_paired_artifact,
 )
@@ -90,6 +95,15 @@ def _assert_physics_equal(left, right):
   np.testing.assert_array_equal(left.states, right.states)
   assert left.contacts == right.contacts
   np.testing.assert_array_equal(left.commanded_path, right.commanded_path)
+
+
+def _replace_log(log, **changes):
+  return dataclasses.replace(log, **changes)
+
+
+def _pair_generation(directory):
+  manifest = json.loads((directory / "manifest.json").read_text())
+  return directory / "generations" / manifest["generation"], manifest
 
 
 def test_default_path_uses_schema_exclusive_duration_and_velocity_formula():
@@ -402,6 +416,378 @@ def test_repeated_calls_do_not_leak_pybullet_connections():
   assert _connected_count() == before
 
 
+@pytest.mark.parametrize("time_window", [(3, 4), (3, 5)])
+def test_nonzero_intervention_requires_three_anchored_samples(time_window):
+  config = _scene(_object("target", static=True))
+  with pytest.raises(ValueError, match="three|3|samples"):
+    generate_paired_instance(
+        config,
+        "target",
+        _intervention(magnitude=0.5, time_window=time_window),
+        0,
+    )
+
+
+def test_extraction_and_writer_reject_swapped_branches(tmp_path):
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 2
+  )
+
+  with pytest.raises(ValueError, match="branch|factual|counterfactual"):
+    extract_pair_ground_truth(config, intervention, counterfactual, factual)
+  with pytest.raises(ValueError, match="branch|factual|counterfactual"):
+    write_paired_artifact(
+        tmp_path / "pair",
+        config,
+        intervention,
+        2,
+        counterfactual,
+        factual,
+    )
+  assert not (tmp_path / "pair").exists()
+
+
+def test_pair_validation_rejects_unrelated_schema_and_intervention():
+  config = _scene(
+      _object("target", static=True),
+      _object("ball", shape="sphere", position=(5, 0, 0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 2
+  )
+  unrelated_scene = _scene(
+      _object("target", static=True, mass=4),
+      _object("ball", shape="sphere", position=(5, 0, 0)),
+  )
+  unrelated_intervention = _intervention(
+      magnitude=0.25, recipe="break_contact"
+  )
+
+  with pytest.raises(ValueError, match="scene|provenance|config"):
+    extract_pair_ground_truth(
+        unrelated_scene, intervention, factual, counterfactual
+    )
+  with pytest.raises(ValueError, match="intervention|provenance"):
+    extract_pair_ground_truth(
+        config, unrelated_intervention, factual, counterfactual
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation, message",
+    [
+        ("branch", "branch"),
+        ("object_order", "object_ids|order"),
+        ("steps", "steps|duration"),
+        ("step_rate", "step_rate"),
+        ("target_metadata", "target_id|metadata"),
+        ("push_mass_metadata", "push_mass|metadata"),
+        ("dt_metadata", "dt|metadata"),
+        ("path_width", "commanded_path|shape"),
+        ("outside_window", "window|commanded_path"),
+        ("excess_magnitude", "magnitude|commanded_path"),
+    ],
+)
+def test_pair_validation_rejects_malformed_log_provenance(mutation, message):
+  config = _scene(
+      _object("target", static=True),
+      _object("ball", shape="sphere", position=(5, 0, 0)),
+  )
+  intervention = _intervention(magnitude=0.5)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 3
+  )
+  bad = counterfactual
+  if mutation == "branch":
+    bad = _replace_log(bad, branch="wrong")
+  elif mutation == "object_order":
+    bad = _replace_log(bad, object_ids=tuple(reversed(bad.object_ids)))
+  elif mutation == "steps":
+    bad = _replace_log(bad, steps=tuple(step + 1 for step in bad.steps))
+  elif mutation == "step_rate":
+    bad = _replace_log(bad, step_rate=120)
+  elif mutation in {"target_metadata", "push_mass_metadata", "dt_metadata"}:
+    metadata = dict(bad.metadata)
+    key, value = {
+        "target_metadata": ("target_id", "ball"),
+        "push_mass_metadata": ("push_mass", 9.0),
+        "dt_metadata": ("dt", 0.25),
+    }[mutation]
+    metadata[key] = value
+    bad = _replace_log(bad, metadata=metadata)
+  else:
+    if mutation == "path_width":
+      path = bad.commanded_path[:, :3]
+    else:
+      path = bad.commanded_path.copy()
+    if mutation == "outside_window":
+      path[9, 1] += 0.1
+    elif mutation == "excess_magnitude":
+      path[4, 1] += 1.0
+    bad = _replace_log(bad, commanded_path=path)
+
+  with pytest.raises(ValueError, match=message):
+    extract_pair_ground_truth(config, intervention, factual, bad)
+
+
+def test_pair_validation_binds_counterfactual_path_to_recorded_rng_seed():
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0.5)
+  factual, counterfactual_seed_3 = generate_paired_instance(
+      config, "target", intervention, 3
+  )
+  _, counterfactual_seed_4 = generate_paired_instance(
+      config, "target", intervention, 4
+  )
+  assert not np.array_equal(
+      counterfactual_seed_3.commanded_path,
+      counterfactual_seed_4.commanded_path,
+  )
+  mismatched = _replace_log(
+      counterfactual_seed_3,
+      commanded_path=counterfactual_seed_4.commanded_path,
+  )
+
+  with pytest.raises(ValueError, match="rng_seed|recipe|commanded_path|provenance"):
+    extract_pair_ground_truth(config, intervention, factual, mismatched)
+
+
+def test_writer_rejects_rng_seed_that_did_not_generate_counterfactual(tmp_path):
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 4
+  )
+
+  with pytest.raises(ValueError, match="rng_seed|provenance"):
+    write_paired_artifact(
+        tmp_path / "pair",
+        config,
+        intervention,
+        5,
+        factual,
+        counterfactual,
+    )
+
+
+def test_swept_sphere_volume_rejects_obstacle_clipping_before_client(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  config = _scene(
+      _object("target", shape="sphere", size=0.5, static=True),
+      _object("wall", size=(0.6, 2, 2), position=(1.0, 0, 0), static=True),
+  )
+
+  with pytest.raises(ValueError, match="volume|obstacle|AABB|intersect"):
+    generate_paired_instance(config, "target", _intervention(magnitude=0), 0)
+  assert constructed == []
+
+
+def test_swept_cube_uses_quaternion_dependent_extents(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  half_angle = np.pi / 8
+  config = _scene(
+      ObjectConfig(
+          "target",
+          "cube",
+          size=(0.5, 0.1, 0.1),
+          quaternion=(np.cos(half_angle), 0, 0, np.sin(half_angle)),
+          static=True,
+          friction=0,
+          restitution=0,
+      ),
+      _object("wall", size=(2, 0.15, 2), position=(0, 0.55, 0), static=True),
+  )
+
+  with pytest.raises(ValueError, match="volume|obstacle|AABB|intersect"):
+    generate_paired_instance(config, "target", _intervention(magnitude=0), 0)
+  assert constructed == []
+
+
+def test_swept_volume_rejects_scene_bound_clipping_before_client(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  config = SceneConfig(
+      objects=(_object("target", shape="sphere", size=0.5, static=True),),
+      scene_bounds=((-1, -1, -1), (0.25, 1, 1)),
+      gravity=(0, 0, 0),
+      frame_range=(0, 1),
+      frame_rate=24,
+      step_rate=240,
+  )
+
+  with pytest.raises(ValueError, match="volume|bounds"):
+    generate_paired_instance(config, "target", _intervention(magnitude=0), 0)
+  assert constructed == []
+
+
+def test_swept_volume_allows_exact_static_tangency():
+  config = _scene(
+      _object("target", shape="sphere", size=0.5, static=True),
+      _object("wall", size=(0.6, 2, 2), position=(1.1, 0, 0), static=True),
+  )
+  factual, counterfactual = generate_paired_instance(
+      config, "target", _intervention(magnitude=0), 0
+  )
+  _assert_physics_equal(factual, counterfactual)
+
+
+@pytest.mark.parametrize("target_z, accepted", [(0.5, True), (0.49, False)])
+def test_floor_support_contact_is_allowed_but_penetration_is_rejected(
+    target_z, accepted
+):
+  config = _scene(
+      _object(
+          "target",
+          shape="sphere",
+          size=0.5,
+          position=(0, 0, target_z),
+          static=True,
+      ),
+      _object(
+          "floor",
+          size=(4, 4, 0.25),
+          position=(0, 0, -0.25),
+          static=True,
+          metadata={"qc_clip_exempt": True},
+      ),
+  )
+  if accepted:
+    factual, counterfactual = generate_paired_instance(
+        config, "target", _intervention(magnitude=0), 0
+    )
+    _assert_physics_equal(factual, counterfactual)
+  else:
+    with pytest.raises(ValueError, match="volume|obstacle|AABB|intersect"):
+      generate_paired_instance(
+          config, "target", _intervention(magnitude=0), 0
+      )
+
+
+def test_floor_tangency_tolerates_sub_ulp_interpolation_drift():
+  target_size = 0.3
+  config = _scene(
+      _object(
+          "target",
+          shape="sphere",
+          size=target_size,
+          position=(0, 0, target_size),
+          static=True,
+      ),
+      _object(
+          "floor",
+          size=(4, 4, 0.25),
+          position=(0, 0, -0.25),
+          static=True,
+          metadata={"qc_clip_exempt": True},
+      ),
+  )
+  path = np.zeros((10, 7), dtype=np.float64)
+  path[:, 2] = target_size
+  path[:, 3] = 1.0
+  path[1:, 2] = np.nextafter(target_size, -np.inf)
+  assert np.max(target_size - path[:, 2]) < 1e-15
+
+  factual, counterfactual = generate_paired_instance(
+      config,
+      "target",
+      _intervention(magnitude=0),
+      0,
+      factual_path=path,
+  )
+  _assert_physics_equal(factual, counterfactual)
+
+
+@pytest.mark.parametrize("field", ["position", "size", "linear_velocity", "path"])
+def test_float32_preflight_rejects_unrepresentable_values_before_client(
+    field, monkeypatch
+):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  huge = 1e100
+  kwargs = {"static": True}
+  bounds = ((-1e101, -1e101, -1e101), (1e101, 1e101, 1e101))
+  if field != "path":
+    kwargs[field] = (huge, huge, huge) if field != "size" else huge
+  config = SceneConfig(
+      objects=(_object("target", **kwargs),),
+      scene_bounds=bounds,
+      gravity=(0, 0, 0),
+      frame_range=(0, 1),
+      frame_rate=24,
+      step_rate=240,
+  )
+  factual_path = None
+  if field == "path":
+    factual_path = np.zeros((10, 7), dtype=np.float64)
+    factual_path[:, 3] = 1
+    factual_path[1:, 0] = huge
+
+  with pytest.raises(ValueError, match="float32|represent"):
+    generate_paired_instance(
+        config,
+        "target",
+        _intervention(magnitude=0),
+        0,
+        factual_path=factual_path,
+    )
+  assert constructed == []
+
+
+def test_kubric_trait_domain_preflight_happens_before_client(monkeypatch):
+  import interventions.twin_runner as runner
+
+  constructed = []
+
+  class CountingSimulator(KinematicDragSimulator):
+    def __init__(self, *args, **kwargs):
+      constructed.append(True)
+      super().__init__(*args, **kwargs)
+
+  monkeypatch.setattr(runner, "KinematicDragSimulator", CountingSimulator)
+  config = _scene(_object("target", static=True, friction=1.5))
+
+  with pytest.raises(ValueError, match="friction|Kubric|domain"):
+    generate_paired_instance(config, "target", _intervention(magnitude=0), 0)
+  assert constructed == []
+
+
 def test_wide_margin_contact_versus_miss_extracts_removed_edge_and_path():
   config = SceneConfig(
       objects=(
@@ -460,17 +846,42 @@ def test_pair_artifact_roundtrip_and_canonical_provenance(tmp_path):
       counterfactual,
   )
 
-  assert read_simulation_log(destination / "factual") == factual
-  assert read_simulation_log(destination / "counterfactual") == counterfactual
-  assert json.loads((destination / "ground_truth.json").read_text()) == truth.to_dict()
-  pair = json.loads((destination / "pair.json").read_text())
+  generation, manifest = _pair_generation(destination)
+  assert read_simulation_log(generation / "factual") == factual
+  assert read_simulation_log(generation / "counterfactual") == counterfactual
+  assert json.loads((generation / "ground_truth.json").read_text()) == truth.to_dict()
+  pair = json.loads((generation / "pair.json").read_text())
   assert pair["scene_config"] == config.to_dict()
   assert pair["intervention"] == intervention.to_dict()
   assert pair["target_id"] == "target"
   assert pair["rng_seed"] == 8
   assert pair["schema_version"] == config.schema_version
   assert pair["tags"] == ["null_effect", "target_only"]
-  assert (destination / "pair.json").read_bytes().endswith(b"\n")
+  assert pair["extraction_thresholds"] == {
+      "force_threshold": 0.0,
+      "force_tolerance": 1e-6,
+      "min_episode_impulse": 0.0,
+      "position_epsilon": 1e-3,
+      "quaternion_epsilon": 1e-3,
+      "velocity_epsilon": 1e-3,
+  }
+  assert (generation / "pair.json").read_bytes().endswith(b"\n")
+  assert manifest["schema_version"] == config.schema_version
+  assert len(manifest["generation"]) == 64
+  for relative, record in manifest["files"].items():
+    payload = (destination / record["path"]).read_bytes()
+    assert record["path"] == "generations/{}/{}".format(
+        manifest["generation"], relative
+    )
+    assert record["size"] == len(payload)
+    assert record["sha256"] == hashlib.sha256(payload).hexdigest()
+  read_factual, read_counterfactual, read_truth, provenance = (
+      read_paired_artifact(destination)
+  )
+  assert read_factual == factual
+  assert read_counterfactual == counterfactual
+  assert read_truth == truth
+  assert provenance == pair
   with pytest.raises(FileExistsError):
     write_paired_artifact(
         destination, config, intervention, 8, factual, counterfactual
@@ -504,4 +915,145 @@ def test_pair_artifact_failure_leaves_no_destination_or_staging(monkeypatch, tmp
     )
 
   assert not destination.exists()
-  assert list(tmp_path.iterdir()) == []
+  assert all("tmp" not in path.name for path in tmp_path.iterdir())
+
+
+def test_artifact_persists_complete_normalized_thresholds_that_change_labels(
+    tmp_path,
+):
+  config = _scene(
+      _object("target", static=True),
+      _object("ball", shape="sphere", position=(5, 0, 0)),
+  )
+  intervention = _intervention(magnitude=0.5)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 7
+  )
+  ball_index = counterfactual.object_ids.index("ball")
+  changed_states = counterfactual.states.copy()
+  changed_states[2:, ball_index, 0] += 0.01
+  counterfactual = _replace_log(counterfactual, states=changed_states)
+
+  low_truth = write_paired_artifact(
+      tmp_path / "low",
+      config,
+      intervention,
+      7,
+      factual,
+      counterfactual,
+      position_epsilon=np.float32(0.001),
+  )
+  high_truth = write_paired_artifact(
+      tmp_path / "high",
+      config,
+      intervention,
+      7,
+      factual,
+      counterfactual,
+      position_epsilon=0.1,
+  )
+
+  assert low_truth.soft_affected == ("ball",)
+  assert high_truth.soft_affected == ()
+  low_generation, _ = _pair_generation(tmp_path / "low")
+  high_generation, _ = _pair_generation(tmp_path / "high")
+  low_pair = json.loads((low_generation / "pair.json").read_text())
+  high_pair = json.loads((high_generation / "pair.json").read_text())
+  assert low_pair["extraction_thresholds"]["position_epsilon"] == float(
+      np.float32(0.001)
+  )
+  assert high_pair["extraction_thresholds"]["position_epsilon"] == 0.1
+  assert set(low_pair["extraction_thresholds"]) == {
+      "force_threshold",
+      "min_episode_impulse",
+      "force_tolerance",
+      "position_epsilon",
+      "velocity_epsilon",
+      "quaternion_epsilon",
+  }
+
+
+def test_overwrite_failure_keeps_previous_manifest_reader_visible(
+    monkeypatch, tmp_path
+):
+  import interventions.twin_runner as runner
+
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  first = generate_paired_instance(config, "target", intervention, 1)
+  second = generate_paired_instance(config, "target", intervention, 2)
+  destination = tmp_path / "pair"
+  write_paired_artifact(destination, config, intervention, 1, *first)
+  old_manifest = (destination / "manifest.json").read_bytes()
+  old_generation, _ = _pair_generation(destination)
+  real_replace = runner.os.replace
+
+  def fail_pointer(source, target):
+    if Path(target) == destination / "manifest.json":
+      raise OSError("pointer publish exploded")
+    return real_replace(source, target)
+
+  monkeypatch.setattr(runner.os, "replace", fail_pointer)
+  with pytest.raises(OSError, match="pointer publish exploded"):
+    write_paired_artifact(
+        destination, config, intervention, 2, *second, overwrite=True
+    )
+
+  assert (destination / "manifest.json").read_bytes() == old_manifest
+  assert read_simulation_log(old_generation / "factual") == first[0]
+  assert read_simulation_log(old_generation / "counterfactual") == first[1]
+
+
+def test_concurrent_overwrites_publish_one_complete_generation(tmp_path):
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  pairs = {
+      seed: generate_paired_instance(config, "target", intervention, seed)
+      for seed in (3, 4)
+  }
+  destination = tmp_path / "pair"
+
+  def publish(seed):
+    return write_paired_artifact(
+        destination,
+        config,
+        intervention,
+        seed,
+        *pairs[seed],
+        overwrite=True,
+    )
+
+  with ThreadPoolExecutor(max_workers=2) as executor:
+    results = tuple(executor.map(publish, (3, 4)))
+
+  assert results[0] == results[1]
+  generation, manifest = _pair_generation(destination)
+  pair = json.loads((generation / "pair.json").read_text())
+  assert pair["rng_seed"] in (3, 4)
+  chosen = pairs[pair["rng_seed"]]
+  assert read_simulation_log(generation / "factual") == chosen[0]
+  assert read_simulation_log(generation / "counterfactual") == chosen[1]
+  for record in manifest["files"].values():
+    payload = (destination / record["path"]).read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == record["sha256"]
+
+
+def test_pair_publication_fsyncs_generation_and_root(monkeypatch, tmp_path):
+  import interventions.twin_runner as runner
+
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 1)
+  calls = []
+  real_fsync = runner._fsync_directory
+
+  def record(path):
+    calls.append(Path(path))
+    return real_fsync(path)
+
+  monkeypatch.setattr(runner, "_fsync_directory", record)
+  destination = tmp_path / "pair"
+  write_paired_artifact(destination, config, intervention, 1, *pair)
+
+  assert any(path.name == "generations" for path in calls)
+  assert destination in calls
