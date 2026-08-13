@@ -27,9 +27,10 @@ parser.add_argument('--secondly', action='store_true', help="automatic version, 
 args, unknown = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + unknown
 
-# --- Compute the version (for both nightly and normal)
-now = datetime.now()
-VERSION = None
+# --- Use a reproducible version unless an explicit release mode is requested.
+VERSION = "0.0.0"
+NAME = "kubric"
+now = datetime.now() if args.nightly or args.secondly else None
 if args.tag is not None:
   assert len(args.tag)>1 and args.tag[0]=="v"
   VERSION = args.tag[1:]
@@ -37,7 +38,7 @@ if args.tag is not None:
 if args.nightly:
   VERSION = f"{now.year}.{now.month}.{now.day}"
   NAME="kubric-nightly"
-if args.secondly or VERSION is None:  #< contingency plan
+if args.secondly:
   VERSION = f"{now.year}.{now.month}.{now.day}.{now.hour}.{now.minute}.{now.second}"
   NAME="kubric-secondly"
 try:
@@ -55,9 +56,6 @@ def set_version_in_file(version="HEAD"):
       else:
         f.write(line)
 
-# --- Auto-update the build version in the library
-set_version_in_file(VERSION)
-
 # --- cache readme into a string
 README = ""
 if Path("README.md").exists():
@@ -68,35 +66,38 @@ if Path("README.md").exists():
 REQS = [line.strip() for line in open("requirements.txt")]
 INSTALL_PACKAGES = [line for line in REQS if not line.startswith("#")]
 
-# --- Build the whl file
-setuptools.setup(
-    name=NAME,
-    version=VERSION,
-    author="Kubric team",
-    author_email="kubric+dev@google.com",
-    description="A data generation pipeline for creating semi-realistic synthetic multi-object "
-                "videos with rich annotations such as instance segmentation, depth maps, "
-                "and optical flow.",
-    license="Apache 2.0",
-    install_requires=INSTALL_PACKAGES,
-    long_description=README,
-    long_description_content_type="text/markdown",
-    url="https://github.com/google-research/kubric",
-    packages=setuptools.find_packages(),
-    data_files=[
-        ("share/kubric/configs", ["configs/scene_ranges.yaml"]),
-    ],
-    classifiers=[
-        "Development Status :: 2 - Pre-Alpha",
-        "Programming Language :: Python :: 3.9",
-        "Intended Audience :: Developers",
-        "Intended Audience :: Science/Research",
-        "License :: OSI Approved :: Apache Software License",
-        "Topic :: Multimedia :: Graphics :: 3D Rendering",
-        "Topic :: Scientific/Engineering :: Artificial Intelligence",
-    ],
-    python_requires='>=3.9',
-)
-
-# --- Revert the version in the local folder
-set_version_in_file("HEAD")
+# --- Build with the selected version without persistently changing the source tree.
+ini_file_path = Path(__file__).parent / "kubric" / "__init__.py"
+original_ini_file = ini_file_path.read_bytes()
+try:
+  set_version_in_file(VERSION)
+  setuptools.setup(
+      name=NAME,
+      version=VERSION,
+      author="Kubric team",
+      author_email="kubric+dev@google.com",
+      description="A data generation pipeline for creating semi-realistic synthetic multi-object "
+                  "videos with rich annotations such as instance segmentation, depth maps, "
+                  "and optical flow.",
+      license="Apache 2.0",
+      install_requires=INSTALL_PACKAGES,
+      long_description=README,
+      long_description_content_type="text/markdown",
+      url="https://github.com/google-research/kubric",
+      packages=setuptools.find_packages(),
+      data_files=[
+          ("share/kubric/configs", ["configs/scene_ranges.yaml"]),
+      ],
+      classifiers=[
+          "Development Status :: 2 - Pre-Alpha",
+          "Programming Language :: Python :: 3.9",
+          "Intended Audience :: Developers",
+          "Intended Audience :: Science/Research",
+          "License :: OSI Approved :: Apache Software License",
+          "Topic :: Multimedia :: Graphics :: 3D Rendering",
+          "Topic :: Scientific/Engineering :: Artificial Intelligence",
+      ],
+      python_requires='>=3.9',
+  )
+finally:
+  ini_file_path.write_bytes(original_ini_file)
