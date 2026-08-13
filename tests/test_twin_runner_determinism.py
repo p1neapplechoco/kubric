@@ -123,6 +123,19 @@ def _replace_pair_counterfactual(directory, counterfactual):
   )
 
 
+def _replace_pair_payload(directory, payload):
+  import interventions.twin_runner as runner
+
+  generation, _ = _pair_generation(directory)
+  (generation / "pair.json").write_bytes(runner._canonical_json(payload))
+  manifest = runner._pair_manifest(generation)
+  replacement = generation.parent / manifest["generation"]
+  generation.rename(replacement)
+  (directory / "manifest.json").write_bytes(
+      runner._canonical_json(manifest)
+  )
+
+
 def test_default_path_uses_schema_exclusive_duration_and_velocity_formula():
   target = _object(
       "target",
@@ -1850,6 +1863,7 @@ def test_pair_artifact_roundtrip_and_canonical_provenance(tmp_path):
   assert pair["target_id"] == "target"
   assert pair["rng_seed"] == 8
   assert pair["schema_version"] == config.schema_version
+  assert pair["trust_model"] == "caller_trusted_unattested_logs_v1"
   assert pair["tags"] == ["null_effect", "target_only"]
   assert pair["extraction_thresholds"] == {
       "force_threshold": 0.0,
@@ -1880,6 +1894,37 @@ def test_pair_artifact_roundtrip_and_canonical_provenance(tmp_path):
     write_paired_artifact(
         destination, config, intervention, 8, factual, counterfactual
     )
+
+
+def test_pair_reader_rejects_unknown_trust_model(tmp_path):
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+  destination = tmp_path / "pair"
+  write_paired_artifact(destination, config, intervention, 8, *pair)
+  generation, _ = _pair_generation(destination)
+  payload = json.loads((generation / "pair.json").read_text())
+  payload["trust_model"] = "simulator_origin_attested_v1"
+  _replace_pair_payload(destination, payload)
+
+  with pytest.raises(ValueError, match="trust model"):
+    read_paired_artifact(destination)
+
+
+def test_pair_reader_normalizes_legacy_missing_trust_model(tmp_path):
+  config = _scene(_object("target", static=True))
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+  destination = tmp_path / "pair"
+  write_paired_artifact(destination, config, intervention, 8, *pair)
+  generation, _ = _pair_generation(destination)
+  payload = json.loads((generation / "pair.json").read_text())
+  payload.pop("trust_model", None)
+  _replace_pair_payload(destination, payload)
+
+  _, _, _, provenance = read_paired_artifact(destination)
+
+  assert provenance["trust_model"] == "caller_trusted_unattested_logs_v1"
 
 
 @pytest.mark.parametrize(
@@ -1986,6 +2031,8 @@ def test_artifact_persists_complete_normalized_thresholds_that_change_labels(
       np.float32(0.001)
   )
   assert high_pair["extraction_thresholds"]["position_epsilon"] == 0.1
+  assert low_pair["trust_model"] == "caller_trusted_unattested_logs_v1"
+  assert high_pair["trust_model"] == "caller_trusted_unattested_logs_v1"
   assert set(low_pair["extraction_thresholds"]) == {
       "force_threshold",
       "min_episode_impulse",

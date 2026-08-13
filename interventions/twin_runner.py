@@ -59,6 +59,7 @@ _FLOAT32_GEOMETRY_FRACTION = 1e-3
 _PERTURB_ATTEMPTS = 64
 _PAIR_MANIFEST = "manifest.json"
 _PAIR_GENERATIONS = "generations"
+PAIR_TRUST_MODEL = "caller_trusted_unattested_logs_v1"
 _EXTRACTION_THRESHOLDS = {
     "force_threshold": 0.0,
     "min_episode_impulse": 0.0,
@@ -1215,7 +1216,15 @@ def extract_pair_ground_truth(
     counterfactual_log: SimulationLog,
     **thresholds: Any,
 ) -> GroundTruth:
-  """Extracts causal labels while excluding static environment propagation."""
+  """Extracts causal labels while excluding static environment propagation.
+
+  ``factual_log`` and ``counterfactual_log`` are trusted in-memory inputs.
+  Validation checks their structure and config/provenance consistency, but does
+  not attest that a simulator produced them.  Canonical oracle creation goes
+  through :func:`generate_paired_instance` or the dataset ``run_batch`` path.
+  If these logs are published, manifest hashes detect later artifact changes;
+  they do not authenticate the original in-memory inputs.
+  """
   if not isinstance(intervention, Intervention):
     raise TypeError("intervention must be an Intervention")
   target, window = _validate_pair_logs(
@@ -1567,7 +1576,15 @@ def _ground_truth_from_payload(payload: Mapping[str, Any]) -> GroundTruth:
 def read_paired_artifact(
     directory: PathLike,
 ) -> Tuple[SimulationLog, SimulationLog, GroundTruth, Mapping[str, Any]]:
-  """Reads and integrity-validates the generation selected by ``manifest.json``."""
+  """Reads and integrity-validates the ``manifest.json`` generation.
+
+  The loaded ``SimulationLog`` objects trace back to trusted, unattested
+  in-memory inputs.  Validation checks structure and config/provenance
+  consistency, but does not attest that a simulator produced them.  Manifest
+  hashes detect post-publication changes only.  The returned ``trust_model``
+  makes this boundary explicit.  Canonical oracle creation uses
+  :func:`generate_paired_instance` or dataset ``run_batch``.
+  """
   source = Path(directory)
   manifest = _validate_pair_manifest(source)
   generation = source / _PAIR_GENERATIONS / manifest["generation"]
@@ -1583,8 +1600,20 @@ def read_paired_artifact(
       "tags",
       "extraction_thresholds",
   }
-  if set(pair_payload) != expected_pair_keys:
+  actual_pair_keys = set(pair_payload)
+  if actual_pair_keys not in (
+      expected_pair_keys,
+      expected_pair_keys | {"trust_model"},
+  ):
     raise ValueError("pair.json has missing or unexpected fields")
+  if (
+      "trust_model" in pair_payload
+      and pair_payload["trust_model"] != PAIR_TRUST_MODEL
+  ):
+    raise ValueError("pair.json trust model is unsupported")
+  # Current-schema artifacts predating the explicit field have the same trust
+  # boundary.  Normalize them so every reader caller sees the model.
+  pair_payload["trust_model"] = PAIR_TRUST_MODEL
   if (
       pair_payload["schema_version"] != SCHEMA_VERSION
       or pair_payload["factual"] != "factual"
@@ -1646,7 +1675,14 @@ def write_paired_artifact(
     overwrite: bool = False,
     **thresholds: Any,
 ) -> GroundTruth:
-  """Publishes an immutable pair generation through an atomic manifest pointer."""
+  """Publishes an immutable pair generation through an atomic manifest pointer.
+
+  The ``SimulationLog`` arguments are trusted inputs.  Validation checks their
+  structure and config/provenance consistency, but does not attest simulator
+  origin.  Manifest hashes detect post-publication changes only; they do not
+  authenticate the original in-memory inputs.  Canonical oracle creation uses
+  :func:`generate_paired_instance` or dataset ``run_batch``.
+  """
   if not isinstance(overwrite, bool):
     raise TypeError("overwrite must be a bool")
   seed = _rng_seed(rng_seed)
@@ -1687,6 +1723,7 @@ def write_paired_artifact(
       "intervention": intervention,
       "factual": "factual",
       "counterfactual": "counterfactual",
+      "trust_model": PAIR_TRUST_MODEL,
       "tags": tags,
       "extraction_thresholds": normalized_thresholds,
   }
@@ -1718,6 +1755,7 @@ def write_paired_artifact(
 
 
 __all__ = [
+    "PAIR_TRUST_MODEL",
     "extract_pair_ground_truth",
     "generate_paired_instance",
     "read_paired_artifact",
