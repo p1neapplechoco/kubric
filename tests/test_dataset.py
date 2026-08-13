@@ -255,6 +255,15 @@ def test_instance_spec_path_length_must_match_scene_duration():
     replace(_spec(), factual_path=_commanded_path(9))
 
 
+def test_instance_spec_allows_null_controls_only_at_zero_magnitude():
+  intervention = Intervention(
+      "target", "remove_collision", 0.1, (1, 3), push_mass=1.0
+  )
+
+  with pytest.raises(ValueError, match="null.*magnitude|magnitude.*null"):
+    replace(_spec(), intervention=intervention)
+
+
 @pytest.mark.parametrize("time_window", [(1, 20), (1, 3.5)])
 def test_instance_spec_requires_bounded_integer_intervention_window(time_window):
   intervention = Intervention(
@@ -279,13 +288,14 @@ def test_load_ranges_copies_and_freezes_yaml(tmp_path):
     loaded["scene"]["step_rate"] = 10
 
 
-def test_repository_ranges_preserve_null_effect_as_a_string_and_sample():
+def test_repository_ranges_sample_only_non_null_interventions():
   config = Path(__file__).resolve().parents[1] / "configs" / "scene_ranges.yaml"
   loaded = load_ranges(config)
 
-  assert loaded["intervention"]["expected_effects"] == ("non_null", "null")
+  assert loaded["intervention"]["expected_effects"] == ("non_null",)
   specs = tuple(sample_instance_spec(loaded, 20260811, index) for index in range(64))
-  assert {spec.expected_effect for spec in specs} == {"non_null", "null"}
+  assert {spec.expected_effect for spec in specs} == {"non_null"}
+  assert all(spec.intervention.magnitude > 0 for spec in specs)
 
 
 def _factual_sweep_reaches_initial_dynamic_volume(spec):
@@ -333,7 +343,7 @@ def test_repository_ranges_sample_a_diverse_interaction_corridor():
       "break_contact",
       "maintain_contact",
   }
-  assert {spec.expected_effect for spec in specs} == {"non_null", "null"}
+  assert {spec.expected_effect for spec in specs} == {"non_null"}
   assert {len(spec.scene_config.objects) - 2 for spec in specs} == {2, 3, 4, 5}
   assert 0.45 <= interaction_fraction <= 0.75
 
@@ -381,7 +391,7 @@ def test_invalid_ranges_are_rejected():
         ("angular", ("angular_velocity_ceiling",)),
         ("bounds", ("target_out_of_bounds",)),
         ("clip", ("target_static_clip",)),
-        ("empty", ("empty_affected",)),
+        ("empty", ("empty_affected", "recipe_outcome_mismatch")),
         ("null", ("expected_null_mismatch",)),
     ],
 )
@@ -474,7 +484,10 @@ def test_qc_collects_sorted_reasons_metrics_and_honors_clip_exemption():
 
   assert result.reason_codes == tuple(sorted(result.reason_codes))
   assert set(result.reason_codes) == {
-      "angular_velocity_ceiling", "empty_affected", "linear_velocity_ceiling"
+      "angular_velocity_ceiling",
+      "empty_affected",
+      "linear_velocity_ceiling",
+      "recipe_outcome_mismatch",
   }
   assert result.metrics["max_linear_velocity"] == pytest.approx(200)
   assert result.metrics["max_angular_velocity"] == pytest.approx(300)
@@ -576,7 +589,7 @@ def test_qc_rejects_counterfactual_path_beyond_intervention_magnitude():
       "target", "remove_collision", 0.05, (1, 4), push_mass=1.0
   )
   spec = replace(
-      _spec(), intervention=intervention, intervention_start_step=1
+      _spec("non_null"), intervention=intervention, intervention_start_step=1
   )
   factual = _log("factual")
   counterfactual_path = factual.commanded_path.copy()
@@ -591,6 +604,118 @@ def test_qc_rejects_counterfactual_path_beyond_intervention_magnitude():
   )
 
   assert "branch_misaligned" in result.reason_codes
+
+
+def _non_null_recipe_spec(recipe):
+  intervention = Intervention(
+      "target", recipe, 0.1, (1, 4), push_mass=1.0
+  )
+  return replace(
+      _spec("non_null"),
+      intervention=intervention,
+      intervention_start_step=1,
+  )
+
+
+@pytest.mark.parametrize(
+    ("recipe", "delta_bucket"),
+    [
+        ("create_collision", "added"),
+        ("remove_collision", "removed"),
+        ("break_contact", "removed"),
+    ],
+)
+def test_qc_accepts_direct_target_outcome_for_contact_recipe(
+    recipe, delta_bucket
+):
+  delta = {delta_bucket: (_edge(),)}
+  truth = _truth(
+      **delta,
+      hard=("ball",),
+      paths={"ball": ("target", "ball")},
+  )
+
+  result = _qc(spec=_non_null_recipe_spec(recipe), truth=truth)
+
+  assert result.accepted
+  assert result.reason_codes == ()
+
+
+@pytest.mark.parametrize(
+    "recipe", ["create_collision", "remove_collision", "break_contact"]
+)
+def test_qc_rejects_named_state_only_outcome(recipe):
+  truth = _truth(
+      hard=("ball",), paths={"ball": ("target", "ball")}
+  )
+
+  result = _qc(spec=_non_null_recipe_spec(recipe), truth=truth)
+
+  assert result.reason_codes == ("recipe_outcome_mismatch",)
+
+
+def test_qc_rejects_downstream_only_removal_for_target_recipe():
+  truth = _truth(
+      removed=(_edge("ball", "floor"),),
+      hard=("ball",),
+      paths={"ball": ("target", "ball")},
+  )
+
+  result = _qc(
+      spec=_non_null_recipe_spec("remove_collision"), truth=truth
+  )
+
+  assert result.reason_codes == ("recipe_outcome_mismatch",)
+
+
+def test_qc_maintain_contact_requires_same_dynamic_peer_in_both_branches():
+  contact = ContactRecord(
+      2, "target", "ball", (0, 0, 0), (1, 0, 0), 1
+  )
+  truth = _truth(
+      hard=("ball",), paths={"ball": ("target", "ball")}
+  )
+  spec = _non_null_recipe_spec("maintain_contact")
+
+  accepted = _qc(
+      spec=spec,
+      factual=_log("factual", contacts=(contact,)),
+      counterfactual=_log("counterfactual", contacts=(contact,)),
+      truth=truth,
+  )
+  static_contact = ContactRecord(
+      2, "target", "floor", (0, 0, 0), (1, 0, 0), 1
+  )
+  rejected = _qc(
+      spec=spec,
+      factual=_log("factual", contacts=(static_contact,)),
+      counterfactual=_log("counterfactual", contacts=(static_contact,)),
+      truth=truth,
+  )
+
+  assert accepted.accepted
+  assert rejected.reason_codes == ("recipe_outcome_mismatch",)
+
+
+def test_qc_retime_requires_commanded_path_delta_inside_window():
+  spec = _non_null_recipe_spec("retime")
+  truth = _truth(
+      hard=("ball",), paths={"ball": ("target", "ball")}
+  )
+  changed_path = _commanded_path()
+  changed_path[2, 0] = 0.05
+
+  accepted = _qc(
+      spec=spec,
+      counterfactual=_log(
+          "counterfactual", commanded_path=changed_path
+      ),
+      truth=truth,
+  )
+  rejected = _qc(spec=spec, truth=truth)
+
+  assert accepted.accepted
+  assert rejected.reason_codes == ("recipe_outcome_mismatch",)
 
 
 def test_qc_uses_oriented_target_volume_for_scene_bounds():
@@ -829,6 +954,25 @@ def _patch_fast_batch(monkeypatch, *, fail_indices=(), truth_by_index=None):
       lambda *args, **kwargs: QCResult(True, (), {"max_linear_velocity": 0}),
   )
 
+  def fake_evidence(root, spec, qc_config):
+    truth = _truth() if truth_by_index is None else truth_by_index(spec.attempt_index)
+    depth, bucket = propagation_hop_depth(truth)
+    factual = _log("factual")
+    return (
+        QCResult(True, (), {"max_linear_velocity": 0}),
+        CandidateSummary(
+            spec.instance_id,
+            spec.attempt_index,
+            primary_category(truth),
+            depth,
+            bucket,
+            topology_signature(spec.scene_config, factual, spec.target_id),
+            str(Path("instances") / spec.instance_id),
+        ),
+    )
+
+  monkeypatch.setattr(dataset, "_recompute_candidate_evidence", fake_evidence)
+
   def fake_publish(root, spec, factual, counterfactual, ground_truth=None):
     artifact = root / "instances" / spec.instance_id
     if artifact.exists():
@@ -836,14 +980,12 @@ def _patch_fast_batch(monkeypatch, *, fail_indices=(), truth_by_index=None):
     artifact.mkdir()
     payload = b"synthetic artifact\n"
     (artifact / "payload.bin").write_bytes(payload)
+    (artifact / "spec.json").write_bytes(
+        dataset._canonical_bytes(spec.to_dict())
+    )
     manifest = {
         "instance_id": spec.instance_id,
-        "files": {
-            "payload.bin": {
-                "sha256": hashlib.sha256(payload).hexdigest(),
-                "size": len(payload),
-            }
-        },
+        "files": dataset._file_manifest(artifact),
     }
     (artifact / "instance_manifest.json").write_text(
         json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8"
@@ -877,6 +1019,49 @@ def test_batch_resume_uses_attempt_truth_and_refuses_mismatch(monkeypatch, tmp_p
   changed["target"]["x"] = [-0.5, -0.5]
   with pytest.raises(ValueError, match="config"):
     run_batch(changed, output, 5, 2, 3, resume=True)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "category",
+        "hop_depth_and_bucket",
+        "topology_signature",
+        "candidate_attempt_index",
+        "instance_id",
+        "instance_seed",
+        "qc",
+    ],
+)
+def test_batch_resume_recomputes_accepted_journal_evidence(
+    mutation, monkeypatch, tmp_path
+):
+  _patch_fast_batch(monkeypatch)
+  output = tmp_path / "dataset"
+  run_batch(_ranges(), output, 41, 1, 1)
+  attempt_path = output / "attempts" / "00000000.json"
+  attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+  if mutation == "category":
+    attempt["candidate"]["category"] = "state_only"
+  elif mutation == "hop_depth_and_bucket":
+    attempt["candidate"]["hop_depth"] = 1
+    attempt["candidate"]["hop_bucket"] = "1"
+  elif mutation == "topology_signature":
+    attempt["candidate"]["topology_signature"] = "tampered"
+  elif mutation == "candidate_attempt_index":
+    attempt["candidate"]["attempt_index"] = 1
+  elif mutation == "instance_id":
+    attempt["instance_id"] = "instance_tampered"
+  elif mutation == "instance_seed":
+    attempt["instance_seed"] += 1
+  else:
+    attempt["qc"]["metrics"]["max_linear_velocity"] = 123
+  attempt_path.write_text(
+      json.dumps(attempt, sort_keys=True) + "\n", encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="accepted attempt journal|evidence|mismatch"):
+    run_batch(_ranges(), output, 41, 1, 1, resume=True)
 
 
 def test_batch_journals_errors_and_continues(monkeypatch, tmp_path):

@@ -158,6 +158,8 @@ class InstanceSpec:
     expected = _identifier(self.expected_effect, "expected_effect")
     if expected not in _EXPECTED_EFFECTS:
       raise ValueError("expected_effect must be 'non_null' or 'null'")
+    if expected == "null" and self.intervention.magnitude != 0.0:
+      raise ValueError("null expected_effect requires zero intervention magnitude")
     factual_path = _readonly_path(self.factual_path)
     start = _integer(self.intervention_start_step, "intervention_start_step")
     if any(
@@ -772,6 +774,74 @@ def _object_extent(item: ObjectConfig, quaternion: Sequence[float]) -> np.ndarra
   return _rotation_extent(item.size, quaternion)
 
 
+def _target_incident(edges: Iterable[Mapping[str, Any]], target_id: str) -> bool:
+  return any(
+      target_id in (edge["object_a"], edge["object_b"])
+      for edge in edges
+  )
+
+
+def _dynamic_target_peers(
+    contacts: Optional[Tuple[Any, ...]],
+    target_id: str,
+    dynamic_ids: frozenset[str],
+    start: int,
+    end: int,
+) -> frozenset[str]:
+  if contacts is None:
+    return frozenset()
+  peers = set()
+  for record in contacts:
+    if not start <= int(record.step) < end or record.normal_force <= 0.0:
+      continue
+    endpoints = (record.object_a, record.object_b)
+    if target_id not in endpoints:
+      continue
+    peer = endpoints[1] if endpoints[0] == target_id else endpoints[0]
+    if peer in dynamic_ids:
+      peers.add(peer)
+  return frozenset(peers)
+
+
+def _recipe_outcome_matches(
+    spec: InstanceSpec,
+    ground_truth: GroundTruth,
+    factual_contacts: Optional[Tuple[Any, ...]],
+    counterfactual_contacts: Optional[Tuple[Any, ...]],
+    factual_path: Optional[np.ndarray],
+    counterfactual_path: Optional[np.ndarray],
+) -> bool:
+  recipe = spec.intervention.recipe
+  delta = ground_truth.graph_delta
+  if recipe == "create_collision":
+    return _target_incident(delta.added, spec.target_id)
+  if recipe in {"remove_collision", "break_contact"}:
+    return _target_incident(delta.removed, spec.target_id)
+  start, end = (int(value) for value in spec.intervention.time_window)
+  if recipe == "maintain_contact":
+    dynamic_ids = frozenset(
+        item.object_id for item in spec.scene_config.objects
+        if not item.static and item.object_id != spec.target_id
+    )
+    factual_peers = _dynamic_target_peers(
+        factual_contacts, spec.target_id, dynamic_ids, start, end
+    )
+    counterfactual_peers = _dynamic_target_peers(
+        counterfactual_contacts, spec.target_id, dynamic_ids, start, end
+    )
+    return bool(factual_peers.intersection(counterfactual_peers))
+  if recipe == "retime":
+    return bool(
+        spec.intervention.magnitude != 0.0
+        and factual_path is not None
+        and counterfactual_path is not None
+        and not np.array_equal(
+            factual_path[start:end], counterfactual_path[start:end]
+        )
+    )
+  return False  # Intervention validates recipes; defensive fail closed.
+
+
 def evaluate_qc(
     spec: InstanceSpec,
     factual_log: Any,
@@ -921,6 +991,15 @@ def evaluate_qc(
     reasons.add("empty_affected")
   if spec.expected_effect == "null" and (affected or graph_changed):
     reasons.add("expected_null_mismatch")
+  if (
+      aligned
+      and valid_truth
+      and spec.expected_effect == "non_null"
+      and not _recipe_outcome_matches(
+          spec, ground_truth, f_contacts, c_contacts, f_path, c_path
+      )
+  ):
+    reasons.add("recipe_outcome_mismatch")
   if not valid_truth:
     reasons.add("branch_misaligned")
 
@@ -1438,6 +1517,7 @@ def _validate_candidate_artifact(
     summary: CandidateSummary,
     manifest_sha256: str,
     manifest_size: int,
+    spec: InstanceSpec,
 ) -> None:
   expected_relative = Path("instances") / summary.instance_id
   if Path(summary.artifact_path) != expected_relative:
@@ -1445,6 +1525,7 @@ def _validate_candidate_artifact(
   _validate_instance_artifact(
       root / expected_relative,
       instance_id=summary.instance_id,
+      spec=spec,
       manifest_sha256=manifest_sha256,
       manifest_size=manifest_size,
   )
@@ -1463,9 +1544,45 @@ def _attempt_records(root: Path) -> Tuple[Mapping[str, Any], ...]:
   return tuple(records)
 
 
+def _recompute_candidate_evidence(
+    root: Path,
+    spec: InstanceSpec,
+    qc_config: Mapping[str, Any],
+) -> Tuple[QCResult, CandidateSummary]:
+  """Derives accepted evidence from the validated public pair artifact."""
+  artifact_relative = Path("instances") / spec.instance_id
+  artifact = root / artifact_relative
+  factual, counterfactual, truth, provenance = read_paired_artifact(artifact)
+  expected_provenance = {
+      "schema_version": spec.scene_config.schema_version,
+      "target_id": spec.target_id,
+      "rng_seed": spec.instance_seed,
+      "scene_config": spec.scene_config.to_dict(),
+      "intervention": spec.intervention.to_dict(),
+  }
+  if not isinstance(provenance, Mapping) or any(
+      to_jsonable(provenance.get(key)) != to_jsonable(value)
+      for key, value in expected_provenance.items()
+  ):
+    raise ValueError("accepted artifact provenance does not match sampled spec")
+  qc = evaluate_qc(spec, factual, counterfactual, truth, qc_config)
+  depth, bucket = propagation_hop_depth(truth)
+  summary = CandidateSummary(
+      spec.instance_id,
+      spec.attempt_index,
+      primary_category(truth),
+      depth,
+      bucket,
+      topology_signature(spec.scene_config, factual, spec.target_id),
+      str(artifact_relative),
+  )
+  return qc, summary
+
+
 def _manifest(
     root: Path,
     config_sha256: str,
+    ranges: Mapping[str, Any],
     master_seed: int,
     num_instances: int,
     records: Sequence[Mapping[str, Any]],
@@ -1473,16 +1590,37 @@ def _manifest(
     split_seed: int,
     fractions: Mapping[str, float],
 ) -> Mapping[str, Any]:
+  qc_config = dict(_section(to_jsonable(ranges), "qc"))
   candidates = []
   for record in records:
     if record.get("status") != "accepted":
       continue
     try:
+      if set(record) != {
+          "attempt_index",
+          "instance_id",
+          "instance_seed",
+          "qc",
+          "status",
+          "candidate",
+          "artifact_manifest_sha256",
+          "artifact_manifest_size",
+      }:
+        raise ValueError("unexpected accepted journal fields")
+      attempt_index = _integer(record["attempt_index"], "attempt_index")
+      spec = sample_instance_spec(ranges, master_seed, attempt_index)
       candidate = _summary_from_dict(record["candidate"])
       manifest_sha256 = record["artifact_manifest_sha256"]
       manifest_size = record["artifact_manifest_size"]
     except (KeyError, TypeError, ValueError) as error:
       raise ValueError("accepted attempt journal is corrupt") from error
+    if (
+        record["instance_id"] != spec.instance_id
+        or record["instance_seed"] != spec.instance_seed
+        or candidate.instance_id != spec.instance_id
+        or candidate.attempt_index != spec.attempt_index
+    ):
+      raise ValueError("accepted attempt journal evidence mismatch")
     if (
         not isinstance(manifest_sha256, str)
         or len(manifest_sha256) != 64
@@ -1496,9 +1634,18 @@ def _manifest(
     ):
       raise ValueError("accepted attempt journal artifact digest is corrupt")
     _validate_candidate_artifact(
-        root, candidate, manifest_sha256, int(manifest_size)
+        root, candidate, manifest_sha256, int(manifest_size), spec
     )
-    candidates.append(candidate)
+    recomputed_qc, recomputed_candidate = _recompute_candidate_evidence(
+        root, spec, qc_config
+    )
+    if (
+        not recomputed_qc.accepted
+        or to_jsonable(record["qc"]) != to_jsonable(recomputed_qc.to_dict())
+        or candidate.to_dict() != recomputed_candidate.to_dict()
+    ):
+      raise ValueError("accepted attempt journal evidence mismatch")
+    candidates.append(recomputed_candidate)
   candidates = tuple(candidates)
   selected = select_balanced(candidates, num_instances, seed=balance_seed)
   splits = assign_grouped_splits(selected, fractions, seed=split_seed)
@@ -1667,15 +1814,11 @@ def _run_batch_unlocked(
         record = {**error_record, "status": "error"}
     _write_once(attempt_path, _canonical_bytes(record))
     occupied.add(missing)
-    records = _attempt_records(root)
-    current = _manifest(
-        root, config_hash, seed, count, records, balance_seed, split_seed, fractions
-    )
-    _write_atomic(root / "manifest.json", _canonical_bytes(current))
 
   records = _attempt_records(root)
   result = _manifest(
-      root, config_hash, seed, count, records, balance_seed, split_seed, fractions
+      root, config_hash, ranges, seed, count, records,
+      balance_seed, split_seed, fractions,
   )
   _write_atomic(root / "manifest.json", _canonical_bytes(result))
   return _freeze(result)
