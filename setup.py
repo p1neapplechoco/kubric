@@ -83,6 +83,9 @@ setuptools.setup(
     long_description_content_type="text/markdown",
     url="https://github.com/google-research/kubric",
     packages=setuptools.find_packages(),
+    data_files=[
+        ("share/kubric/configs", ["configs/scene_ranges.yaml"]),
+    ],
     classifiers=[
         "Development Status :: 2 - Pre-Alpha",
         "Programming Language :: Python :: 3.9",
