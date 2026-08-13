@@ -30,6 +30,7 @@ from interventions import (
     read_paired_artifact,
     read_simulation_log,
     write_paired_artifact,
+    write_simulation_log,
 )
 
 
@@ -106,6 +107,20 @@ def _replace_log(log, **changes):
 def _pair_generation(directory):
   manifest = json.loads((directory / "manifest.json").read_text())
   return directory / "generations" / manifest["generation"], manifest
+
+
+def _replace_pair_counterfactual(directory, counterfactual):
+  import interventions.twin_runner as runner
+
+  generation, _ = _pair_generation(directory)
+  shutil.rmtree(generation / "counterfactual")
+  write_simulation_log(counterfactual, generation / "counterfactual")
+  manifest = runner._pair_manifest(generation)
+  replacement = generation.parent / manifest["generation"]
+  generation.rename(replacement)
+  (directory / "manifest.json").write_bytes(
+      runner._canonical_json(manifest)
+  )
 
 
 def test_default_path_uses_schema_exclusive_duration_and_velocity_formula():
@@ -195,6 +210,40 @@ def test_prefix_states_contacts_and_first_non_target_state_are_exact_twins():
   )
   ball = factual.object_ids.index("ball")
   np.testing.assert_array_equal(factual.states[0, ball], counterfactual.states[0, ball])
+
+
+@pytest.mark.parametrize(
+    ("intervention_start", "message"),
+    [(3, "before intervention start"), (0, "first logged step")],
+)
+def test_pair_writer_rejects_non_target_twin_prefix_mismatch(
+    intervention_start, message, tmp_path
+):
+  config = _scene(
+      _object("target", static=True),
+      _object("ball", shape="sphere", position=(5, 0, 0)),
+  )
+  intervention = _intervention(time_window=(intervention_start, 9))
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 7
+  )
+  ball = counterfactual.object_ids.index("ball")
+  states = counterfactual.states.copy()
+  states[0, ball, 0] += 0.01
+  mismatched = _replace_log(counterfactual, states=states)
+  destination = tmp_path / "pair"
+
+  with pytest.raises(ValueError, match=message):
+    write_paired_artifact(
+        destination,
+        config,
+        intervention,
+        7,
+        factual,
+        mismatched,
+    )
+
+  assert not destination.exists()
 
 
 def test_zero_magnitude_has_identical_physics_and_empty_ground_truth():
@@ -1831,6 +1880,35 @@ def test_pair_artifact_roundtrip_and_canonical_provenance(tmp_path):
     write_paired_artifact(
         destination, config, intervention, 8, factual, counterfactual
     )
+
+
+@pytest.mark.parametrize(
+    ("intervention_start", "message"),
+    [(3, "before intervention start"), (0, "first logged step")],
+)
+def test_pair_reader_rejects_non_target_twin_prefix_mismatch(
+    intervention_start, message, tmp_path
+):
+  config = _scene(
+      _object("target", static=True),
+      _object("ball", shape="sphere", position=(5, 0, 0)),
+  )
+  intervention = _intervention(time_window=(intervention_start, 9))
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 7
+  )
+  destination = tmp_path / "pair"
+  write_paired_artifact(
+      destination, config, intervention, 7, factual, counterfactual
+  )
+  ball = counterfactual.object_ids.index("ball")
+  states = counterfactual.states.copy()
+  states[0, ball, 0] += 0.01
+  mismatched = _replace_log(counterfactual, states=states)
+  _replace_pair_counterfactual(destination, mismatched)
+
+  with pytest.raises(ValueError, match=message):
+    read_paired_artifact(destination)
 
 
 def test_pair_artifact_failure_leaves_no_destination_or_staging(monkeypatch, tmp_path):

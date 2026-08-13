@@ -1199,6 +1199,12 @@ def _validate_pair_logs(
     raise ValueError(
         "counterfactual commanded_path does not match recipe and rng_seed provenance"
     )
+  try:
+    _enforce_twin_consistency(
+        factual_log, counterfactual_log, target.object_id, start
+    )
+  except RuntimeError as error:
+    raise ValueError(str(error)) from error
   return target, window
 
 
