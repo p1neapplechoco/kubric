@@ -29,6 +29,7 @@ except ImportError:  # pragma: no cover - pair publication targets POSIX workers
 from interventions.graph_extraction import extract_ground_truth
 from interventions.kinematic_simulator import KinematicDragSimulator
 from interventions.logging import (
+    ContactRecord,
     SimulationLog,
     read_simulation_log,
     write_simulation_log,
@@ -55,8 +56,6 @@ PathLike = Union[str, os.PathLike[str]]
 _INITIAL_TOLERANCE = 1e-9
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_GEOMETRY_FRACTION = 1e-3
-_CONTACT_MANIFOLD_DRIFT_FRACTION = 0.5
-_CONTACT_GEOMETRY_TOLERANCE_FRACTION = 1e-3
 _PERTURB_ATTEMPTS = 64
 _PAIR_MANIFEST = "manifest.json"
 _PAIR_GENERATIONS = "generations"
@@ -822,41 +821,15 @@ def _stable_norm(values: Any) -> float:
   return result
 
 
-def _stable_distance(left: Any, right: Any) -> float:
-  """Computes Euclidean distance without NumPy subtraction overflow."""
-  left_array = np.asarray(left, dtype=np.float64)
-  right_array = np.asarray(right, dtype=np.float64)
-  result = math.hypot(*(
-      float(left_value) - float(right_value)
-      for left_value, right_value in zip(left_array.flat, right_array.flat)
-  ))
-  if not math.isfinite(result):
-    raise ValueError("vector distance must be finite")
-  return result
+def _validate_contact_integrity(log: SimulationLog) -> None:
+  """Binds canonical contacts to persisted raw Bullet provenance.
 
-
-def _validate_contact_integrity(
-    log: SimulationLog, scene_config: SceneConfig
-) -> None:
-  """Validates contact identity and conservative rigid-body geometry.
-
-  ``ContactRecord.position`` stores one of Bullet's two surface points, but
-  endpoint canonicalization deliberately does not retain which one.  A sound
-  backend-neutral check therefore requires that point to lie within each
-  body's circumsphere after allowing the recorded point separation.  Bullet's
-  manifold point can lag a post-step center, so this check also allows half the
-  smaller endpoint radius.  Both separation and drift stay bounded by object
-  scale; log velocities cannot expand the geometry envelope.
+  Pair artifacts hash this metadata in their manifests. Direct in-memory logs
+  remain trusted inputs: authenticating coordinated mutations would require a
+  signature or replaying the simulation.
   """
   steps = frozenset(log.steps)
   indices = {object_id: index for index, object_id in enumerate(log.object_ids)}
-  by_id = {item.object_id: item for item in scene_config.objects}
-  radii = {
-      object_id: _circumscribed_radius(by_id[object_id])
-      for object_id in log.object_ids
-  }
-  step_offsets = {step: offset for offset, step in enumerate(log.steps)}
-
   for record in log.contacts:
     if (
         isinstance(record.step, bool)
@@ -878,71 +851,175 @@ def _validate_contact_integrity(
         or float(record.normal_force) <= 0.0
     ):
       raise ValueError("contact normal_force must be finite and positive")
+  if "raw_contact_provenance" not in log.metadata:
+    raise ValueError("log metadata is missing raw contact provenance")
+  entries = log.metadata["raw_contact_provenance"]
+  if isinstance(entries, (str, bytes, set, frozenset, Mapping)):
+    raise ValueError("raw contact provenance must be an ordered sequence")
+  try:
+    entries = tuple(entries)
+  except TypeError as error:
+    raise ValueError("raw contact provenance must be an ordered sequence") from error
 
+  expected_keys = {
+      "step", "bullet_object_a", "bullet_object_b", "position_on_a",
+      "position_on_b", "normal_on_b", "contact_distance", "normal_force",
+  }
+
+  def vector(value: Any, name: str) -> Tuple[float, float, float]:
     try:
-      point = np.asarray(record.position, dtype=np.float64)
+      array = np.asarray(tuple(value), dtype=np.float64)
     except (TypeError, ValueError, OverflowError) as error:
-      raise ValueError("contact position must be a finite XYZ vector") from error
-    if point.shape != (3,) or not np.isfinite(point).all():
-      raise ValueError("contact position must be a finite XYZ vector")
-    if record.contact_distance is None:
-      distance = 0.0
-    elif (
-        isinstance(record.contact_distance, bool)
-        or not isinstance(record.contact_distance, numbers.Real)
-    ):
-      raise ValueError("contact distance must be finite")
-    else:
-      distance = float(record.contact_distance)
-      if not np.isfinite(distance):
-        raise ValueError("contact distance must be finite")
+      raise ValueError(
+          "raw contact {} must be a finite XYZ vector".format(name)
+      ) from error
+    if array.shape != (3,) or not np.isfinite(array).all():
+      raise ValueError("raw contact {} must be a finite XYZ vector".format(name))
+    return tuple(0.0 if value == 0.0 else float(value) for value in array)
 
-    radius_a = radii[record.object_a]
-    radius_b = radii[record.object_b]
-    offset = step_offsets[int(record.step)]
-    center_a = log.states[offset, indices[record.object_a], :3]
-    center_b = log.states[offset, indices[record.object_b], :3]
-    manifold_drift = (
-        _CONTACT_MANIFOLD_DRIFT_FRACTION * min(radius_a, radius_b)
-    )
-    geometry_scale = max(
-        radius_a,
-        radius_b,
-        abs(distance),
-        _stable_norm(point),
-        _stable_norm(center_a),
-        _stable_norm(center_b),
-    )
-    tolerance = min(
-        64.0 * float(np.finfo(np.float32).eps) * geometry_scale,
-        _CONTACT_GEOMETRY_TOLERANCE_FRACTION * min(radius_a, radius_b),
-    )
-    separation = abs(distance)
-    if separation > radius_a + radius_b + tolerance:
-      raise ValueError("contact distance exceeds endpoint geometry")
+  raw_keys = []
+  reconstructed = []
+  for entry in entries:
+    if not isinstance(entry, Mapping) or set(entry) != expected_keys:
+      raise ValueError("raw contact provenance entry is malformed")
+    step = entry["step"]
+    object_a = entry["bullet_object_a"]
+    object_b = entry["bullet_object_b"]
     if (
-        _stable_distance(point, center_a)
-        > radius_a + separation + manifold_drift + tolerance
-        or _stable_distance(point, center_b)
-        > radius_b + separation + manifold_drift + tolerance
+        isinstance(step, bool)
+        or not isinstance(step, numbers.Integral)
+        or step not in steps
     ):
-      raise ValueError("contact position is inconsistent with endpoint geometry")
+      raise ValueError("raw contact step must be an integer in log.steps")
+    if (
+        not isinstance(object_a, str)
+        or not isinstance(object_b, str)
+        or object_a == object_b
+        or object_a not in indices
+        or object_b not in indices
+    ):
+      raise ValueError("raw contact endpoints must be known distinct object IDs")
+    position_on_a = vector(entry["position_on_a"], "position_on_a")
+    position_on_b = vector(entry["position_on_b"], "position_on_b")
+    normal_on_b = vector(entry["normal_on_b"], "normal_on_b")
+    distance = entry["contact_distance"]
+    force = entry["normal_force"]
+    if (
+        isinstance(distance, bool)
+        or not isinstance(distance, numbers.Real)
+        or not math.isfinite(float(distance))
+        or isinstance(force, bool)
+        or not isinstance(force, numbers.Real)
+        or not math.isfinite(float(force))
+        or float(force) <= 0.0
+    ):
+      raise ValueError("raw contact distance/force must be finite and force positive")
+    raw_key = (
+        int(step), object_a, object_b, position_on_a, position_on_b,
+        normal_on_b, float(distance), float(force),
+    )
+    raw_keys.append(raw_key)
+    reconstructed.append(ContactRecord(
+        step=int(step),
+        object_a=object_a,
+        object_b=object_b,
+        position=position_on_b,
+        normal=normal_on_b,
+        contact_distance=float(distance),
+        normal_force=float(force),
+    ))
+  if raw_keys != sorted(raw_keys):
+    raise ValueError("raw contact provenance must be canonically ordered")
+
+  def contact_key(record: ContactRecord) -> Tuple[Any, ...]:
+    return (
+        record.step, record.object_a, record.object_b, record.position,
+        record.normal, record.normal_force, record.contact_distance is None,
+        0.0 if record.contact_distance is None else record.contact_distance,
+    )
+
+  if tuple(sorted(reconstructed, key=contact_key)) != log.contacts:
+    raise ValueError("contacts do not match raw Bullet provenance")
 
 
-def _target_contact_penetration(
-    log: SimulationLog, target_id: str
+def _target_manifold_penetrations(
+    log: SimulationLog, target: ObjectConfig
 ) -> Mapping[int, float]:
-  penetration: Dict[int, float] = {}
+  """Validates hash-bound raw manifold evidence and aggregates it per step."""
+  if "target_manifold_penetrations" not in log.metadata:
+    raise ValueError("log metadata is missing target manifold evidence")
+  entries = log.metadata["target_manifold_penetrations"]
+  if isinstance(entries, (str, bytes, set, frozenset, Mapping)):
+    raise ValueError("target manifold evidence must be an ordered sequence")
+  try:
+    entries = tuple(entries)
+  except TypeError as error:
+    raise ValueError("target manifold evidence must be an ordered sequence") from error
+
+  steps = frozenset(log.steps)
+  target_radius = _circumscribed_radius(target)
+  seen = set()
+  canonical = []
+  result: Dict[int, float] = {}
+  for entry in entries:
+    if not isinstance(entry, Mapping) or set(entry) != {
+        "step", "object_id", "depth"
+    }:
+      raise ValueError("target manifold evidence entries are malformed")
+    step = entry["step"]
+    peer = entry["object_id"]
+    depth = entry["depth"]
+    if (
+        isinstance(step, bool)
+        or not isinstance(step, numbers.Integral)
+        or step not in steps
+    ):
+      raise ValueError("target manifold step must be an integer in log.steps")
+    if (
+        not isinstance(peer, str)
+        or peer == target.object_id
+        or peer not in log.object_ids
+    ):
+      raise ValueError("target manifold object_id must name a distinct log object")
+    if (
+        isinstance(depth, bool)
+        or not isinstance(depth, numbers.Real)
+        or not math.isfinite(float(depth))
+        or float(depth) <= 0.0
+        or float(depth) > target_radius
+    ):
+      raise ValueError("target manifold depth must be finite and geometry-bounded")
+    identity = (int(step), peer)
+    if identity in seen:
+      raise ValueError("target manifold evidence contains a duplicate entry")
+    seen.add(identity)
+    canonical.append(identity)
+    result[int(step)] = max(result.get(int(step), 0.0), float(depth))
+  if canonical != sorted(canonical):
+    raise ValueError("target manifold evidence must be canonically ordered")
+
+  # Every retained positive-force penetration originates from the same raw
+  # manifold stream and therefore must be represented by the side channel.
+  evidence = {
+      (int(entry["step"]), entry["object_id"]): float(entry["depth"])
+      for entry in entries
+  }
   for record in log.contacts:
-    if target_id not in (record.object_a, record.object_b):
+    if target.object_id not in (record.object_a, record.object_b):
       continue
-    depth = (
+    peer = (
+        record.object_b if record.object_a == target.object_id else record.object_a
+    )
+    contact_depth = (
         0.0
         if record.contact_distance is None
         else max(0.0, -float(record.contact_distance))
     )
-    penetration[record.step] = max(penetration.get(record.step, 0.0), depth)
-  return penetration
+    if contact_depth > 0.0:
+      expected = min(target_radius, contact_depth)
+      if evidence.get((record.step, peer), -1.0) + 1e-12 < expected:
+        raise ValueError("target contact is missing matching manifold evidence")
+  return result
 
 
 def _validate_target_state_binding(
@@ -956,9 +1033,10 @@ def _validate_target_state_binding(
   Contact-free maximal-coordinate steps are pose-forced and therefore use a
   strict float32-ULP comparison.  While the target temporarily carries mass,
   Bullet's contact solver can move it within a step.  The allowance is the
-  larger of commanded one-step travel and recorded penetration, plus gravity
-  and float32 round-off.  Penetration is capped at one target circumscribed
-  radius; unbound logged velocities never expand either pose envelope.
+  larger of commanded one-step travel and the exact post-step manifold
+  penetration recorded by the simulator, plus gravity and float32 round-off.
+  The evidence is bounded by target geometry; unbound logged velocities never
+  expand either pose envelope.
   """
   target_index = log.object_ids.index(target.object_id)
   target_states = log.states[:, target_index]
@@ -981,7 +1059,7 @@ def _validate_target_state_binding(
   ) * float(scene_config.step_rate)
   dt = 1.0 / float(scene_config.step_rate)
   gravity_travel = 0.5 * _stable_norm(scene_config.gravity) * dt * dt
-  penetrations = _target_contact_penetration(log, target.object_id)
+  penetrations = _target_manifold_penetrations(log, target)
   target_radius = _circumscribed_radius(target)
   angular_cap = min(np.pi, target_radius / min(target.size))
 
@@ -1072,8 +1150,6 @@ def _validate_pair_logs(
       intervention,
       rng_seed=rng_seed,
   )
-  _validate_contact_integrity(factual_log, scene_config)
-  _validate_contact_integrity(counterfactual_log, scene_config)
   if factual_log.commanded_path is None or counterfactual_log.commanded_path is None:
     raise ValueError("paired logs require commanded_path values")
   factual_path = _explicit_path(factual_log.commanded_path, target, steps)
@@ -1087,6 +1163,8 @@ def _validate_pair_logs(
   for path in (factual_path, counterfactual_path):
     _validate_path_float32(path, scene_config.step_rate, target)
     _validate_target_sweep(path, target, scene_config.scene_bounds, aabbs)
+  _validate_contact_integrity(factual_log)
+  _validate_contact_integrity(counterfactual_log)
   _validate_target_state_binding(
       factual_log, factual_path, target, scene_config
   )

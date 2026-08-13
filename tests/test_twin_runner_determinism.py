@@ -738,8 +738,7 @@ def test_pair_validation_rejects_contact_geometry_far_from_both_bodies():
   assert tampered.contacts[0].contact_distance == -0.1
 
 
-@pytest.mark.parametrize("contact_x", [1e-16, 1e-7])
-def test_contact_geometry_tolerance_preserves_micro_scale(contact_x):
+def test_raw_contact_provenance_preserves_micro_scale():
   scale = 1e-16
   config = _scene(
       _object("target", shape="sphere", size=scale, static=True),
@@ -753,23 +752,30 @@ def test_contact_geometry_tolerance_preserves_micro_scale(contact_x):
       step=1,
       object_a="ball",
       object_b="target",
-      position=(contact_x, 0.0, 0.0),
+      position=(1e-16, 0.0, 0.0),
       normal=(1.0, 0.0, 0.0),
       normal_force=1.0,
       contact_distance=0.0,
   )
   clean_factual = _replace_log(factual, contacts=())
-  tampered = _replace_log(counterfactual, contacts=(contact,))
+  metadata = dict(counterfactual.metadata)
+  metadata["raw_contact_provenance"] = ({
+      "step": 1,
+      "bullet_object_a": "ball",
+      "bullet_object_b": "target",
+      "position_on_a": (1e-16, 0.0, 0.0),
+      "position_on_b": (1e-16, 0.0, 0.0),
+      "normal_on_b": (1.0, 0.0, 0.0),
+      "contact_distance": 0.0,
+      "normal_force": 1.0,
+  },)
+  tampered = _replace_log(
+      counterfactual, contacts=(contact,), metadata=metadata
+  )
 
-  if contact_x == 1e-16:
-    extract_pair_ground_truth(
-        config, intervention, clean_factual, tampered
-    )
-  else:
-    with pytest.raises(ValueError, match="contact|geometry|position"):
-      extract_pair_ground_truth(
-          config, intervention, clean_factual, tampered
-      )
+  extract_pair_ground_truth(
+      config, intervention, clean_factual, tampered
+  )
 
 
 def test_pair_validation_rejects_unbounded_contact_penetration():
@@ -827,7 +833,7 @@ def test_zero_force_contact_cannot_relax_target_pose_binding():
 
 @pytest.mark.parametrize("mutation", ["position", "quaternion"])
 def test_pair_validation_caps_fabricated_contact_pose_envelope(mutation):
-  ball_x = 7.4 if mutation == "position" else 0.6
+  ball_x = 7.4 if mutation == "position" else 0.4
   config = _scene(
       _object("target", shape="sphere", static=True),
       _object("ball", shape="sphere", position=(ball_x, 0.0, 0.0)),
@@ -858,7 +864,7 @@ def test_pair_validation_caps_fabricated_contact_pose_envelope(mutation):
   )
 
   with pytest.raises(
-      ValueError, match="target|pose|position|quaternion|envelope"
+      ValueError, match="target|pose|position|quaternion|envelope|provenance"
   ):
     extract_pair_ground_truth(config, intervention, factual, tampered)
 
@@ -867,7 +873,7 @@ def test_pair_validation_caps_fabricated_contact_pose_envelope(mutation):
 def test_logged_target_velocity_cannot_expand_contact_pose_envelope(mutation):
   config = _scene(
       _object("target", shape="sphere", static=True),
-      _object("ball", shape="sphere", position=(0.56, 0.0, 0.0)),
+      _object("ball", shape="sphere", position=(0.47, 0.0, 0.0)),
   )
   intervention = _intervention(magnitude=0)
   factual, counterfactual = generate_paired_instance(
@@ -888,10 +894,10 @@ def test_logged_target_velocity_cannot_expand_contact_pose_envelope(mutation):
     )
     states[1, target_index, 10] = angle * config.step_rate
   fake_contact = ContactRecord(
-      step=1,
+      step=0,
       object_a="ball",
       object_b="target",
-      position=(0.28, 0.0, 0.0),
+      position=(0.235, 0.0, 0.0),
       normal=(1.0, 0.0, 0.0),
       normal_force=1.0,
       contact_distance=-0.03,
@@ -901,7 +907,7 @@ def test_logged_target_velocity_cannot_expand_contact_pose_envelope(mutation):
   )
 
   with pytest.raises(
-      ValueError, match="target|position|quaternion|velocity|envelope"
+      ValueError, match="target|position|quaternion|velocity|envelope|provenance"
   ):
     extract_pair_ground_truth(config, intervention, factual, tampered)
 
@@ -909,7 +915,7 @@ def test_logged_target_velocity_cannot_expand_contact_pose_envelope(mutation):
 def test_huge_finite_logged_velocity_is_rejected_without_overflow_warning():
   config = _scene(
       _object("target", shape="sphere", static=True),
-      _object("ball", shape="sphere", position=(0.56, 0.0, 0.0)),
+      _object("ball", shape="sphere", position=(0.47, 0.0, 0.0)),
   )
   intervention = _intervention(magnitude=0)
   factual, counterfactual = generate_paired_instance(
@@ -920,10 +926,10 @@ def test_huge_finite_logged_velocity_is_rejected_without_overflow_warning():
   states[1, target_index, 0] += 0.2
   states[1, target_index, 7:10] = 1e308
   fake_contact = ContactRecord(
-      step=1,
+      step=0,
       object_a="ball",
       object_b="target",
-      position=(0.28, 0.0, 0.0),
+      position=(0.235, 0.0, 0.0),
       normal=(1.0, 0.0, 0.0),
       normal_force=1.0,
       contact_distance=-0.03,
@@ -932,7 +938,9 @@ def test_huge_finite_logged_velocity_is_rejected_without_overflow_warning():
       counterfactual, states=states, contacts=(fake_contact,)
   )
 
-  with pytest.raises(ValueError, match="target|position|envelope"):
+  with pytest.raises(
+      ValueError, match="target|position|envelope|contact|separation"
+  ):
     extract_pair_ground_truth(config, intervention, factual, tampered)
 
 
@@ -1424,13 +1432,346 @@ def test_wide_margin_contact_versus_miss_extracts_removed_edge_and_path():
   )
   corrupted_states = factual.states.copy()
   corrupted_states[contact_step, target_index, 0] += 7.0
-  with pytest.raises(ValueError, match="target|pose|position|commanded"):
+  with pytest.raises(
+      ValueError, match="target|pose|position|commanded|contact|separation"
+  ):
     extract_pair_ground_truth(
         config,
         intervention,
         _replace_log(factual, states=corrupted_states),
         counterfactual,
     )
+
+
+@pytest.mark.parametrize("target_radius", [0.1, 0.25, 0.5])
+@pytest.mark.parametrize("ball_radius", [0.1, 0.25, 0.5])
+@pytest.mark.parametrize("displacement", [1.0, 2.0, 4.0, 8.0])
+def test_real_sphere_manifold_geometry_accepts_commanded_motion(
+    target_radius, ball_radius, displacement
+):
+  config = SceneConfig(
+      objects=(
+          _object(
+              "target", shape="sphere", size=target_radius, mass=0,
+              static=True, position=(-2, 0, target_radius), friction=.2,
+              restitution=.1,
+          ),
+          _object(
+              "ball", shape="sphere", size=ball_radius, mass=1,
+              position=(0, 0, ball_radius), friction=.2, restitution=.1,
+          ),
+      ),
+      seed=1,
+      scene_bounds=((-20, -20, -20), (20, 20, 20)),
+      gravity=(0, 0, 0),
+      frame_range=(0, 24),
+      frame_rate=24,
+      step_rate=48,
+  )
+  path = np.zeros((48, 7), dtype=np.float64)
+  path[:, 0] = np.linspace(-2, -2 + displacement, 48)
+  path[:, 2] = target_radius
+  path[:, 3] = 1.0
+  intervention = Intervention(
+      "target", "break_contact", 0, (4, 44), push_mass=1
+  )
+
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 1, factual_path=path
+  )
+  extract_pair_ground_truth(
+      config, intervention, factual, counterfactual
+  )
+
+
+@pytest.mark.parametrize("target_radius", [0.1, 0.25, 0.5])
+@pytest.mark.parametrize("ball_radius", [0.1, 0.25, 0.5])
+@pytest.mark.parametrize("speed", [1.0, 2.0, 4.0, 8.0, 16.0, 32.0])
+def test_real_sphere_manifold_geometry_accepts_dynamic_peer_motion(
+    target_radius, ball_radius, speed
+):
+  config = SceneConfig(
+      objects=(
+          _object(
+              "target", shape="sphere", size=target_radius, mass=0,
+              static=True, position=(0, 0, target_radius), friction=.2,
+              restitution=.1,
+          ),
+          _object(
+              "ball", shape="sphere", size=ball_radius, mass=1,
+              position=(-2, 0, ball_radius), linear_velocity=(speed, 0, 0),
+              friction=.2, restitution=.1,
+          ),
+      ),
+      seed=1,
+      scene_bounds=((-20, -20, -20), (20, 20, 20)),
+      gravity=(0, 0, 0),
+      frame_range=(0, 24),
+      frame_rate=24,
+      step_rate=48,
+  )
+  path = np.zeros((48, 7), dtype=np.float64)
+  path[:, 2] = target_radius
+  path[:, 3] = 1.0
+  intervention = Intervention(
+      "target", "break_contact", 0, (4, 44), push_mass=1
+  )
+
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 1, factual_path=path
+  )
+  extract_pair_ground_truth(
+      config, intervention, factual, counterfactual
+  )
+
+
+def test_default_dataset_attempt_accepts_zero_force_manifold_evidence():
+  config = SceneConfig(
+      objects=(
+          _object(
+              "floor",
+              size=(4.5, 4.5, 0.25),
+              position=(0.0, 0.0, -0.25),
+              static=True,
+              mass=0.0,
+              friction=0.5,
+              restitution=0.5,
+              metadata={"qc_clip_exempt": True, "role": "environment"},
+          ),
+          _object(
+              "target",
+              size=0.2212986183957935,
+              position=(-2.0679682694215176, 0.9615286116718418,
+                        0.2212986183957935),
+              static=True,
+              mass=0.0,
+              friction=0.23795207910245214,
+              restitution=0.07332203689813932,
+          ),
+          _object(
+              "object_0",
+              shape="sphere",
+              size=0.17384362092935712,
+              position=(-1.0996979730846284, 1.2938729608736095,
+                        0.17384362092935712),
+              mass=1.6917581669400201,
+              friction=0.12153969391180407,
+              restitution=0.2919962050898075,
+          ),
+          _object(
+              "object_1",
+              size=0.14525703574434615,
+              position=(-1.3259318816106815, 1.8499073793429277,
+                        0.14525703574434615),
+              mass=1.5979715290786198,
+              friction=0.5055384893098647,
+              restitution=0.16128386211889942,
+          ),
+          _object(
+              "object_2",
+              shape="sphere",
+              size=0.22158245954759512,
+              position=(-1.2650061053717363, 2.490617048595035,
+                        0.22158245954759512),
+              mass=0.9637354274483227,
+              friction=0.3109363817298872,
+              restitution=0.3225386855044576,
+          ),
+      ),
+      seed=4378728385235666789,
+      scene_bounds=((-5.0, -5.0, -1.0), (5.0, 5.0, 5.0)),
+      gravity=(0.0, 0.0, -9.81),
+      frame_range=(0, 2),
+      frame_rate=24,
+      step_rate=240,
+  )
+  path = np.zeros((20, 7), dtype=np.float64)
+  path[:, 0] = np.linspace(-2.0679682694215176, 0.7615532530151095, 20)
+  path[:, 1] = np.linspace(0.9615286116718418, 1.0781771589411955, 20)
+  path[:, 2] = 0.2212986183957935
+  path[:, 3] = 1.0
+  intervention = Intervention(
+      "target", "break_contact", 0.2701461699055161, (6, 14),
+      push_mass=0.8064200914933248,
+  )
+  factual, counterfactual = generate_paired_instance(
+      config,
+      "target",
+      intervention,
+      6334114947475882342,
+      factual_path=path,
+  )
+  factual_target_steps = tuple(
+      record.step
+      for record in factual.contacts
+      if "target" in (record.object_a, record.object_b)
+  )
+  counterfactual_target_steps = tuple(
+      record.step
+      for record in counterfactual.contacts
+      if "target" in (record.object_a, record.object_b)
+  )
+  target_index = counterfactual.object_ids.index("target")
+  zero_force_drift = np.linalg.norm(
+      counterfactual.states[7, target_index, :3]
+      - counterfactual.commanded_path[7, :3]
+  )
+
+  assert factual_target_steps == (5, 6, 7)
+  assert counterfactual_target_steps == (5, 6)
+  counterfactual_manifolds = tuple(
+      dict(entry)
+      for entry in counterfactual.metadata["target_manifold_penetrations"]
+  )
+  assert any(entry["step"] == 7 for entry in counterfactual_manifolds)
+  assert 0.0035 < zero_force_drift < 0.0037
+  extract_pair_ground_truth(config, intervention, factual, counterfactual)
+
+
+@pytest.mark.parametrize(
+    ("mutated_step", "position_shift", "logged_velocity"),
+    [
+        (2, 0.2, 1e6),
+        (3, 0.02, 0.0),
+    ],
+)
+def test_positive_contact_does_not_authorize_unrelated_pose_steps(
+    mutated_step, position_shift, logged_velocity
+):
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(0.47, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  target_index = counterfactual.object_ids.index("target")
+  states = counterfactual.states.copy()
+  states[mutated_step, target_index, 0] += position_shift
+  states[mutated_step, target_index, 7] = logged_velocity
+  previous_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(0.235, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=-0.03,
+  )
+  tampered = _replace_log(
+      counterfactual, states=states, contacts=(previous_contact,)
+  )
+
+  with pytest.raises(
+      ValueError, match="target|position|envelope|contact|separation"
+  ):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        ({"step": True, "object_id": "ball", "depth": 0.03},),
+        ({"step": 1.0, "object_id": "ball", "depth": 0.03},),
+        ({"step": 99, "object_id": "ball", "depth": 0.03},),
+        ({"step": 1, "object_id": "ghost", "depth": 0.03},),
+        ({"step": 1, "object_id": "target", "depth": 0.03},),
+        ({"step": 1, "object_id": "ball", "depth": -0.03},),
+        ({"step": 1, "object_id": "ball", "depth": 1.0},),
+        (
+            {"step": 1, "object_id": "ball", "depth": 0.03},
+            {"step": 1, "object_id": "ball", "depth": 0.02},
+        ),
+    ],
+)
+def test_pair_validation_rejects_malformed_target_manifold_evidence(entries):
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(0.47, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  metadata = dict(counterfactual.metadata)
+  metadata["target_manifold_penetrations"] = entries
+  tampered = _replace_log(counterfactual, metadata=metadata)
+
+  with pytest.raises(
+      ValueError, match="manifold|penetration|metadata|step|object|depth"
+  ):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
+def test_pair_validation_requires_target_manifold_evidence_metadata():
+  config = _scene(_object("target", shape="sphere", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+
+  def without_evidence(log):
+    metadata = dict(log.metadata)
+    metadata.pop("target_manifold_penetrations")
+    return _replace_log(log, metadata=metadata)
+
+  with pytest.raises(ValueError, match="manifold|metadata|provenance"):
+    extract_pair_ground_truth(
+        config,
+        intervention,
+        without_evidence(factual),
+        without_evidence(counterfactual),
+    )
+
+
+def test_pair_validation_requires_raw_contact_provenance_metadata():
+  config = _scene(_object("target", shape="sphere", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  metadata = dict(counterfactual.metadata)
+  metadata.pop("raw_contact_provenance")
+
+  with pytest.raises(ValueError, match="raw contact|provenance|metadata"):
+    extract_pair_ground_truth(
+        config,
+        intervention,
+        factual,
+        _replace_log(counterfactual, metadata=metadata),
+    )
+
+
+def test_disjoint_endpoints_cannot_forge_contact_pose_allowance():
+  config = _scene(
+      _object("target", shape="sphere", size=0.25, static=True),
+      _object(
+          "ball", shape="sphere", size=0.25, position=(0.6, 0.0, 0.0)
+      ),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  target_index = counterfactual.object_ids.index("target")
+  states = counterfactual.states.copy()
+  states[2, target_index, 0] += 0.24
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(0.3, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=-0.25,
+  )
+  tampered = _replace_log(
+      counterfactual, states=states, contacts=(fake_contact,)
+  )
+
+  with pytest.raises(ValueError, match="contact|geometry|separation|center"):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
 
 
 def test_pair_artifact_roundtrip_and_canonical_provenance(tmp_path):

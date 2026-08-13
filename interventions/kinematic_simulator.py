@@ -88,6 +88,142 @@ def _commanded_velocities(path: np.ndarray, step_rate: float) -> np.ndarray:
   return velocities
 
 
+def _target_manifold_penetrations(
+    step: int,
+    raw_contacts: Iterable[Any],
+    target_body: int,
+    body_to_object_id: Dict[int, str],
+    target_id: str,
+    target_scale: float,
+) -> Tuple[Dict[str, Any], ...]:
+  """Returns canonical post-step target penetrations, including force zero."""
+  depths: Dict[str, float] = {}
+  for raw_contact in raw_contacts:
+    try:
+      fields = tuple(raw_contact)
+    except TypeError:
+      continue
+    if len(fields) != 14:
+      continue
+    body_a, body_b = fields[1], fields[2]
+    if (
+        isinstance(body_a, bool)
+        or not isinstance(body_a, numbers.Integral)
+        or isinstance(body_b, bool)
+        or not isinstance(body_b, numbers.Integral)
+    ):
+      continue
+    if int(body_a) == target_body:
+      peer_body = int(body_b)
+    elif int(body_b) == target_body:
+      peer_body = int(body_a)
+    else:
+      continue
+    peer_id = body_to_object_id.get(peer_body)
+    if peer_id is None or peer_id == target_id:
+      continue
+    distance = fields[8]
+    if isinstance(distance, bool) or not isinstance(distance, numbers.Real):
+      continue
+    try:
+      depth = max(0.0, -float(distance))
+    except (TypeError, ValueError, OverflowError):
+      continue
+    if not math.isfinite(depth) or depth <= 0.0:
+      continue
+    depth = min(depth, target_scale)
+    depths[peer_id] = max(depths.get(peer_id, 0.0), depth)
+  return tuple(
+      {"step": int(step), "object_id": peer_id, "depth": depths[peer_id]}
+      for peer_id in sorted(depths)
+  )
+
+
+def _raw_contact_provenance(
+    step: int,
+    raw_contacts: Iterable[Any],
+    body_to_object_id: Dict[int, str],
+) -> Tuple[Dict[str, Any], ...]:
+  """Preserves canonical Bullet fields for every retained positive contact."""
+  entries = []
+  for raw_contact in raw_contacts:
+    try:
+      fields = tuple(raw_contact)
+    except TypeError:
+      continue
+    if len(fields) != 14:
+      continue
+    body_a, body_b = fields[1], fields[2]
+    if (
+        isinstance(body_a, bool)
+        or not isinstance(body_a, numbers.Integral)
+        or isinstance(body_b, bool)
+        or not isinstance(body_b, numbers.Integral)
+    ):
+      continue
+    object_a = body_to_object_id.get(int(body_a))
+    object_b = body_to_object_id.get(int(body_b))
+    if object_a is None or object_b is None or object_a == object_b:
+      continue
+
+    def vector(value: Any) -> Optional[Tuple[float, float, float]]:
+      try:
+        items = tuple(value)
+      except TypeError:
+        return None
+      if len(items) != 3:
+        return None
+      result = []
+      for item in items:
+        if isinstance(item, bool) or not isinstance(item, numbers.Real):
+          return None
+        number = float(item)
+        if not math.isfinite(number):
+          return None
+        result.append(0.0 if number == 0.0 else number)
+      return tuple(result)  # type: ignore[return-value]
+
+    position_on_a = vector(fields[5])
+    position_on_b = vector(fields[6])
+    normal_on_b = vector(fields[7])
+    distance, force = fields[8], fields[9]
+    if (
+        position_on_a is None
+        or position_on_b is None
+        or normal_on_b is None
+        or isinstance(distance, bool)
+        or not isinstance(distance, numbers.Real)
+        or isinstance(force, bool)
+        or not isinstance(force, numbers.Real)
+    ):
+      continue
+    distance_value = float(distance)
+    force_value = float(force)
+    if (
+        not math.isfinite(distance_value)
+        or not math.isfinite(force_value)
+        or force_value <= 0.0
+    ):
+      continue
+    entries.append({
+        "step": int(step),
+        "bullet_object_a": object_a,
+        "bullet_object_b": object_b,
+        "position_on_a": position_on_a,
+        "position_on_b": position_on_b,
+        "normal_on_b": normal_on_b,
+        "contact_distance": (
+            0.0 if distance_value == 0.0 else distance_value
+        ),
+        "normal_force": force_value,
+    })
+  return tuple(sorted(entries, key=lambda entry: (
+      entry["step"], entry["bullet_object_a"], entry["bullet_object_b"],
+      entry["position_on_a"], entry["position_on_b"], entry["normal_on_b"],
+      entry["contact_distance"], entry["normal_force"],
+  )))
+
+
 def _change_observers(asset: core.Asset) -> Dict[str, Tuple[Any, ...]]:
   """Snapshots traitlets callbacks so the private wrapper can unlink cleanly."""
   notifiers = getattr(asset, "_trait_notifiers", {})
@@ -503,6 +639,12 @@ class KinematicSimulator(PyBullet):
         self._body(asset): object_id
         for asset, object_id in zip(assets, object_ids)
     }
+    realized_scale = np.abs(np.asarray(target.scale, dtype=np.float64))
+    target_scale = (
+        float(np.max(realized_scale))
+        if isinstance(target, core.Sphere)
+        else math.hypot(*(float(component) for component in realized_scale.flat))
+    )
 
     if contact_logger is None:
       logger = ContactLogger(body_to_object_id, step_rate)
@@ -519,6 +661,8 @@ class KinematicSimulator(PyBullet):
     steps = tuple(start_step + offset for offset in range(len(path_value)))
     cadence = int(step_rate) // self.scene.frame_rate
     keyframe_records: List[Tuple[np.ndarray, int]] = []
+    manifold_penetrations: List[Dict[str, Any]] = []
+    raw_contact_provenance: List[Dict[str, Any]] = []
 
     for offset, (absolute_step, command, commanded_velocity) in enumerate(
         zip(steps, path_value, commanded_velocities)
@@ -542,7 +686,18 @@ class KinematicSimulator(PyBullet):
           raise RuntimeError("target velocity changed before the physics step")
 
         self.bullet_client.stepSimulation()
-        raw_contacts = self.bullet_client.getContactPoints()
+        raw_contacts = tuple(self.bullet_client.getContactPoints())
+        raw_contact_provenance.extend(_raw_contact_provenance(
+            absolute_step, raw_contacts, body_to_object_id
+        ))
+        manifold_penetrations.extend(_target_manifold_penetrations(
+            absolute_step,
+            raw_contacts,
+            body,
+            body_to_object_id,
+            target_id,
+            target_scale,
+        ))
         logger.log(absolute_step, raw_contacts)
         state = self._snapshot(assets)
         states[offset] = state
@@ -573,6 +728,8 @@ class KinematicSimulator(PyBullet):
             "push_mass": push_mass_value,
             "dt": 1.0 / step_rate,
             "velocity_estimator": "backward_difference",
+            "raw_contact_provenance": tuple(raw_contact_provenance),
+            "target_manifold_penetrations": tuple(manifold_penetrations),
         },
     )
 

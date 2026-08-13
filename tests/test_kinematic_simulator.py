@@ -359,10 +359,100 @@ def test_path_is_not_mutated_and_metadata_is_deterministic(scene_and_assets):
       "push_mass": 2.5,
       "dt": 1.0 / scene.step_rate,
       "velocity_estimator": "backward_difference",
+      "raw_contact_provenance": (),
+      "target_manifold_penetrations": (),
   }
   assert target.metadata["kinematic_emulation"] is True
   assert result.branch == "counterfactual"
   assert result.steps == (7, 8, 9)
+
+
+def test_zero_force_target_manifolds_are_separate_bounded_metadata(
+    scene_and_assets, monkeypatch
+):
+  scene, target, other = scene_and_assets
+  path = _path(
+      (0, 0, 0, 1, 0, 0, 0),
+      (0.1, 0, 0, 1, 0, 0, 0),
+  )
+  with KinematicSimulator(scene) as simulator:
+    client = simulator.bullet_client
+    target_body = _body_id(simulator, target)
+    other_body = _body_id(simulator, other)
+    responses = iter((
+        (
+            (0, target_body, other_body, -1, -1,
+             (0, 0, 0), (0, 0, 0), (1, 0, 0), -0.25, 0.0,
+             0.0, (0, 0, 0), 0.0, (0, 0, 0)),
+            (0, target_body, 999999, -1, -1,
+             (0, 0, 0), (0, 0, 0), (1, 0, 0), -0.5, 0.0,
+             0.0, (0, 0, 0), 0.0, (0, 0, 0)),
+        ),
+        (
+            (0, other_body, target_body, -1, -1,
+             (0, 0, 0), (0, 0, 0), (1, 0, 0), -8.0, 0.0,
+             0.0, (0, 0, 0), 0.0, (0, 0, 0)),
+            (0, target_body, target_body, -1, -1,
+             (0, 0, 0), (0, 0, 0), (1, 0, 0), -0.5, 0.0,
+             0.0, (0, 0, 0), 0.0, (0, 0, 0)),
+        ),
+    ))
+    monkeypatch.setattr(client, "getContactPoints", lambda: next(responses))
+
+    log = simulator.run_with_intervention(
+        target, path, push_mass=1.0, start_step=4
+    )
+
+  assert log.contacts == ()
+  assert tuple(
+      dict(entry) for entry in log.metadata["target_manifold_penetrations"]
+  ) == (
+      {"depth": 0.25, "object_id": "ball", "step": 4},
+      {
+          "depth": pytest.approx(np.sqrt(3.0), abs=0.0, rel=0.0),
+          "object_id": "ball",
+          "step": 5,
+      },
+  )
+
+
+def test_positive_contacts_retain_raw_bullet_provenance(
+    scene_and_assets, monkeypatch
+):
+  scene, target, other = scene_and_assets
+  path = _path(
+      (0, 0, 0, 1, 0, 0, 0),
+      (0.1, 0, 0, 1, 0, 0, 0),
+  )
+  with KinematicSimulator(scene) as simulator:
+    target_body = _body_id(simulator, target)
+    other_body = _body_id(simulator, other)
+    raw = (
+        0, target_body, other_body, -1, -1,
+        (0.1, 0.2, 0.3), (0.4, 0.5, 0.6), (1, 0, 0),
+        -0.02, 3.5, 0.0, (0, 0, 0), 0.0, (0, 0, 0),
+    )
+    responses = iter(((raw,), ()))
+    monkeypatch.setattr(
+        simulator.bullet_client, "getContactPoints", lambda: next(responses)
+    )
+    log = simulator.run_with_intervention(
+        target, path, push_mass=1.0, start_step=4
+    )
+
+  assert len(log.contacts) == 1
+  assert tuple(dict(entry) for entry in log.metadata["raw_contact_provenance"]) == (
+      {
+          "bullet_object_a": "mover",
+          "bullet_object_b": "ball",
+          "contact_distance": -0.02,
+          "normal_force": 3.5,
+          "normal_on_b": (1.0, 0.0, 0.0),
+          "position_on_a": (0.1, 0.2, 0.3),
+          "position_on_b": (0.4, 0.5, 0.6),
+          "step": 4,
+      },
+  )
 
 
 def test_velocity_is_backward_difference_times_step_rate_and_call_order(
