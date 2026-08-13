@@ -1,5 +1,7 @@
 """Backend-independent tools for counterfactual trajectory interventions."""
 
+from importlib import import_module
+
 from interventions.schema import (
     CameraConfig,
     GraphEdgeDelta,
@@ -34,10 +36,6 @@ from interventions.logging import (
     state_index,
     write_simulation_log,
 )
-from interventions.kinematic_simulator import (
-    KinematicDragSimulator,
-    KinematicSimulator,
-)
 from interventions.tagging import derive_tags
 from interventions.trajectory import (
     RECIPE_PROFILE_SEMANTICS,
@@ -46,12 +44,50 @@ from interventions.trajectory import (
     perturb_path,
     validate_path,
 )
-from interventions.twin_runner import (
-    extract_pair_ground_truth,
-    generate_paired_instance,
-    read_paired_artifact,
-    write_paired_artifact,
-)
+
+
+_LAZY_EXPORTS = {
+    "KinematicDragSimulator": (
+        "interventions.kinematic_simulator",
+        "KinematicDragSimulator",
+    ),
+    "KinematicSimulator": (
+        "interventions.kinematic_simulator",
+        "KinematicSimulator",
+    ),
+    "extract_pair_ground_truth": (
+        "interventions.twin_runner",
+        "extract_pair_ground_truth",
+    ),
+    "generate_paired_instance": (
+        "interventions.twin_runner",
+        "generate_paired_instance",
+    ),
+    "read_paired_artifact": (
+        "interventions.twin_runner",
+        "read_paired_artifact",
+    ),
+    "write_paired_artifact": (
+        "interventions.twin_runner",
+        "write_paired_artifact",
+    ),
+}
+
+
+def __getattr__(name):
+  try:
+    module_name, attribute_name = _LAZY_EXPORTS[name]
+  except KeyError as error:
+    raise AttributeError(
+        "module {!r} has no attribute {!r}".format(__name__, name)
+    ) from error
+  value = getattr(import_module(module_name), attribute_name)
+  globals()[name] = value
+  return value
+
+
+def __dir__():
+  return sorted(set(globals()) | set(__all__))
 
 
 __all__ = [
