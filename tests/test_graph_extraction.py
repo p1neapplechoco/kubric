@@ -427,7 +427,7 @@ def test_temporal_reachability_matches_randomized_finite_state_oracle():
       for step in range(4)
   ]
 
-  for _ in range(100):
+  for _ in range(1000):
     factual_edges = []
     counterfactual_edges = []
     for left, right, step in possible:
@@ -578,6 +578,30 @@ def test_temporal_reachability_keeps_prefix_of_dominated_trigger_route():
       _edge("x", "a", 0),
       _edge("target", "a", 1),
       _edge("a", "b", 2, impulse=2, peak=2),
+  )
+
+  affected, paths = temporal_reachability(
+      factual, counterfactual, "target", intervention_start=0
+  )
+
+  assert affected == ("a", "b", "x")
+  assert paths["x"] == ("target", "x")
+  assert paths["b"] == ("target", "a", "b")
+
+
+def test_temporal_reachability_keeps_equal_arrival_dominated_prefix_route():
+  shared_prefix = (
+      _edge("target", "x", 0),
+      _edge("x", "a", 0),
+      _edge("target", "a", 0),
+  )
+  factual = _graph(
+      *shared_prefix,
+      _edge("a", "b", 1, impulse=1, peak=1),
+  )
+  counterfactual = _graph(
+      *shared_prefix,
+      _edge("a", "b", 1, impulse=2, peak=2),
   )
 
   affected, paths = temporal_reachability(

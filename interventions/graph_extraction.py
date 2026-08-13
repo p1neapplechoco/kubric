@@ -514,61 +514,73 @@ def temporal_reachability(
   for edges in adjacency.values():
     edges.sort(key=lambda edge: edge.identity)
 
-  # A later-but-shorter label can yield the best path after a future contact,
-  # so retain every nondominated (arrival, hops, path) label at each node.
-  initial_label = (start, 0, (target,))
-  labels: Dict[
-      Tuple[str, bool], set[Tuple[int, int, Tuple[str, ...]]]
-  ] = {
-      (target, False): {initial_label}
-  }
-  queue: List[Tuple[int, int, Tuple[str, ...], str, bool]] = [
-      (start, 0, (target,), target, False)
-  ]
-  path_candidates: Dict[
-      str, set[Tuple[int, int, Tuple[str, ...]]]
-  ] = defaultdict(set)
-  while queue:
-    arrival, hops, path, node, triggered = heapq.heappop(queue)
-    label = (arrival, hops, path)
-    if label not in labels.get((node, triggered), set()):
-      continue
-    for edge in adjacency.get(node, ()):
-      other = edge.object_b if node == edge.object_a else edge.object_a
-      contact_time = max(arrival, edge.start_step)
-      if contact_time >= edge.end_step:
+  # Membership in a causal prefix cannot share the ordinary reachability
+  # dominance relation.  For example, ``target -> a`` may dominate
+  # ``target -> x -> a`` before a later delta at ``a``, even though the latter
+  # proves that ``x`` belongs to a valid causal prefix.  Search each candidate
+  # with explicit ``seen_candidate`` and ``triggered`` state so no route that
+  # carries distinct causal evidence is pruned by a route that does not.
+  witnesses: Dict[str, Tuple[str, ...]] = {}
+  candidate_nodes = sorted(
+      (set(factual.nodes) | set(counterfactual.nodes)) - excluded - {target}
+  )
+  for candidate_node in candidate_nodes:
+    initial_label = (start, 0, (target,))
+    labels: Dict[
+        Tuple[str, bool, bool], set[Tuple[int, int, Tuple[str, ...]]]
+    ] = {(target, False, False): {initial_label}}
+    queue: List[
+        Tuple[int, int, Tuple[str, ...], str, bool, bool]
+    ] = [(start, 0, (target,), target, False, False)]
+    while queue:
+      arrival, hops, path, node, seen, triggered = heapq.heappop(queue)
+      label = (arrival, hops, path)
+      if label not in labels.get((node, seen, triggered), set()):
         continue
-      candidate_path = path + (other,)
-      candidate = (contact_time, hops + 1, candidate_path)
-      candidate_triggered = triggered or edge.identity in trigger_identities
-      if candidate_triggered:
-        # Capture causal prefixes before dominance pruning: another route may
-        # dominate this endpoint label while omitting a valid prefix node.
-        for path_index, path_node in enumerate(candidate_path[1:], start=1):
-          if path_node == target:
-            continue
-          path_candidates[path_node].add(
-              (contact_time, path_index, candidate_path[:path_index + 1])
-          )
-      other_labels = labels.setdefault((other, candidate_triggered), set())
-      if any(_label_dominates(existing, candidate) for existing in other_labels):
-        continue
-      dominated = {
-          existing for existing in other_labels
-          if _label_dominates(candidate, existing)
-      }
-      other_labels.difference_update(dominated)
-      other_labels.add(candidate)
-      heapq.heappush(
-          queue,
-          (contact_time, hops + 1, candidate_path, other, candidate_triggered),
-      )
+      for edge in adjacency.get(node, ()):
+        other = edge.object_b if node == edge.object_a else edge.object_a
+        contact_time = max(arrival, edge.start_step)
+        if contact_time >= edge.end_step:
+          continue
+        candidate_path = path + (other,)
+        next_label = (contact_time, hops + 1, candidate_path)
+        next_seen = seen or other == candidate_node
+        next_triggered = triggered or edge.identity in trigger_identities
+        state = (other, next_seen, next_triggered)
+        state_labels = labels.setdefault(state, set())
+        if any(
+            _label_dominates(existing, next_label)
+            for existing in state_labels
+        ):
+          continue
+        state_labels.difference_update({
+            existing for existing in state_labels
+            if _label_dominates(next_label, existing)
+        })
+        state_labels.add(next_label)
+        heapq.heappush(queue, (
+            contact_time,
+            hops + 1,
+            candidate_path,
+            other,
+            next_seen,
+            next_triggered,
+        ))
 
-  # Rank witnesses by trigger/arrival time, hops, then lexical path.
-  affected = tuple(sorted(path_candidates))
-  paths = MappingProxyType({
-      node: min(path_candidates[node])[2] for node in affected
-  })
+    proofs = [
+        label
+        for (node, seen, triggered), state_labels in labels.items()
+        if seen and triggered
+        for label in state_labels
+    ]
+    if not proofs:
+      continue
+    _, _, proof_path = min(proofs)
+    candidate_index = proof_path.index(candidate_node)
+    witnesses[candidate_node] = proof_path[:candidate_index + 1]
+
+  affected = tuple(sorted(witnesses))
+  paths = MappingProxyType({node: witnesses[node] for node in affected})
   return affected, paths
 
 
