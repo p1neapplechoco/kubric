@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import numbers
 import os
 import shutil
@@ -54,6 +55,8 @@ PathLike = Union[str, os.PathLike[str]]
 _INITIAL_TOLERANCE = 1e-9
 _FLOAT32_MAX = float(np.finfo(np.float32).max)
 _FLOAT32_GEOMETRY_FRACTION = 1e-3
+_CONTACT_MANIFOLD_DRIFT_FRACTION = 0.5
+_CONTACT_GEOMETRY_TOLERANCE_FRACTION = 1e-3
 _PERTURB_ATTEMPTS = 64
 _PAIR_MANIFEST = "manifest.json"
 _PAIR_GENERATIONS = "generations"
@@ -803,6 +806,129 @@ def _validate_log_metadata(
     raise ValueError("factual metadata must remain independent of rng_seed")
 
 
+def _circumscribed_radius(item: ObjectConfig) -> float:
+  size = np.asarray(item.size, dtype=np.float32).astype(np.float64)
+  if item.shape == "sphere":
+    return float(size[0])
+  return math.hypot(*(float(component) for component in size))
+
+
+def _stable_norm(values: Any) -> float:
+  """Computes a Euclidean norm without overflow warnings for finite inputs."""
+  array = np.asarray(values, dtype=np.float64)
+  result = math.hypot(*(float(component) for component in array.flat))
+  if not math.isfinite(result):
+    raise ValueError("vector norm must be finite")
+  return result
+
+
+def _stable_distance(left: Any, right: Any) -> float:
+  """Computes Euclidean distance without NumPy subtraction overflow."""
+  left_array = np.asarray(left, dtype=np.float64)
+  right_array = np.asarray(right, dtype=np.float64)
+  result = math.hypot(*(
+      float(left_value) - float(right_value)
+      for left_value, right_value in zip(left_array.flat, right_array.flat)
+  ))
+  if not math.isfinite(result):
+    raise ValueError("vector distance must be finite")
+  return result
+
+
+def _validate_contact_integrity(
+    log: SimulationLog, scene_config: SceneConfig
+) -> None:
+  """Validates contact identity and conservative rigid-body geometry.
+
+  ``ContactRecord.position`` stores one of Bullet's two surface points, but
+  endpoint canonicalization deliberately does not retain which one.  A sound
+  backend-neutral check therefore requires that point to lie within each
+  body's circumsphere after allowing the recorded point separation.  Bullet's
+  manifold point can lag a post-step center, so this check also allows half the
+  smaller endpoint radius.  Both separation and drift stay bounded by object
+  scale; log velocities cannot expand the geometry envelope.
+  """
+  steps = frozenset(log.steps)
+  indices = {object_id: index for index, object_id in enumerate(log.object_ids)}
+  by_id = {item.object_id: item for item in scene_config.objects}
+  radii = {
+      object_id: _circumscribed_radius(by_id[object_id])
+      for object_id in log.object_ids
+  }
+  step_offsets = {step: offset for offset, step in enumerate(log.steps)}
+
+  for record in log.contacts:
+    if (
+        isinstance(record.step, bool)
+        or not isinstance(record.step, numbers.Integral)
+        or record.step not in steps
+    ):
+      raise ValueError("contact step must be an integer present in log.steps")
+    endpoints = (record.object_a, record.object_b)
+    if not all(isinstance(endpoint, str) for endpoint in endpoints):
+      raise ValueError("contact endpoints must be object_id strings")
+    if record.object_a == record.object_b:
+      raise ValueError("contact endpoints must be distinct")
+    if any(endpoint not in indices for endpoint in endpoints):
+      raise ValueError("contact endpoint is unknown to log.object_ids")
+    if (
+        isinstance(record.normal_force, bool)
+        or not isinstance(record.normal_force, numbers.Real)
+        or not np.isfinite(float(record.normal_force))
+        or float(record.normal_force) <= 0.0
+    ):
+      raise ValueError("contact normal_force must be finite and positive")
+
+    try:
+      point = np.asarray(record.position, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as error:
+      raise ValueError("contact position must be a finite XYZ vector") from error
+    if point.shape != (3,) or not np.isfinite(point).all():
+      raise ValueError("contact position must be a finite XYZ vector")
+    if record.contact_distance is None:
+      distance = 0.0
+    elif (
+        isinstance(record.contact_distance, bool)
+        or not isinstance(record.contact_distance, numbers.Real)
+    ):
+      raise ValueError("contact distance must be finite")
+    else:
+      distance = float(record.contact_distance)
+      if not np.isfinite(distance):
+        raise ValueError("contact distance must be finite")
+
+    radius_a = radii[record.object_a]
+    radius_b = radii[record.object_b]
+    offset = step_offsets[int(record.step)]
+    center_a = log.states[offset, indices[record.object_a], :3]
+    center_b = log.states[offset, indices[record.object_b], :3]
+    manifold_drift = (
+        _CONTACT_MANIFOLD_DRIFT_FRACTION * min(radius_a, radius_b)
+    )
+    geometry_scale = max(
+        radius_a,
+        radius_b,
+        abs(distance),
+        _stable_norm(point),
+        _stable_norm(center_a),
+        _stable_norm(center_b),
+    )
+    tolerance = min(
+        64.0 * float(np.finfo(np.float32).eps) * geometry_scale,
+        _CONTACT_GEOMETRY_TOLERANCE_FRACTION * min(radius_a, radius_b),
+    )
+    separation = abs(distance)
+    if separation > radius_a + radius_b + tolerance:
+      raise ValueError("contact distance exceeds endpoint geometry")
+    if (
+        _stable_distance(point, center_a)
+        > radius_a + separation + manifold_drift + tolerance
+        or _stable_distance(point, center_b)
+        > radius_b + separation + manifold_drift + tolerance
+    ):
+      raise ValueError("contact position is inconsistent with endpoint geometry")
+
+
 def _target_contact_penetration(
     log: SimulationLog, target_id: str
 ) -> Mapping[int, float]:
@@ -829,8 +955,10 @@ def _validate_target_state_binding(
 
   Contact-free maximal-coordinate steps are pose-forced and therefore use a
   strict float32-ULP comparison.  While the target temporarily carries mass,
-  Bullet's contact solver can move it within a step; those steps additionally
-  allow one commanded step of travel or the recorded penetration depth.
+  Bullet's contact solver can move it within a step.  The allowance is the
+  larger of commanded one-step travel and recorded penetration, plus gravity
+  and float32 round-off.  Penetration is capped at one target circumscribed
+  radius; unbound logged velocities never expand either pose envelope.
   """
   target_index = log.object_ids.index(target.object_id)
   target_states = log.states[:, target_index]
@@ -842,9 +970,9 @@ def _validate_target_state_binding(
   realized_quaternions = np.asarray(path[:, 3:7], dtype=np.float32).astype(
       np.float64
   )
-  realized_quaternions /= np.linalg.norm(
-      realized_quaternions, axis=1
-  )[:, None]
+  realized_quaternions /= np.asarray([
+      _stable_norm(quaternion) for quaternion in realized_quaternions
+  ])[:, None]
   quaternion_tolerance = 8.0 * float(np.finfo(np.float32).eps)
   quaternion_norm_tolerance = 4.0 * float(np.finfo(np.float32).eps)
   commanded_velocities = np.zeros((len(path), 3), dtype=np.float64)
@@ -852,8 +980,10 @@ def _validate_target_state_binding(
       path[1:, :3] - path[:-1, :3]
   ) * float(scene_config.step_rate)
   dt = 1.0 / float(scene_config.step_rate)
-  gravity_travel = 0.5 * np.linalg.norm(scene_config.gravity) * dt * dt
+  gravity_travel = 0.5 * _stable_norm(scene_config.gravity) * dt * dt
   penetrations = _target_contact_penetration(log, target.object_id)
+  target_radius = _circumscribed_radius(target)
+  angular_cap = min(np.pi, target_radius / min(target.size))
 
   for offset, step in enumerate(log.steps):
     position_error = target_states[offset, :3] - realized_positions[offset]
@@ -880,23 +1010,22 @@ def _validate_target_state_binding(
         )
       continue
 
-    one_step_travel = dt * max(
-        np.linalg.norm(commanded_velocities[offset]),
-        np.linalg.norm(target_states[offset, 7:10]),
-    ) + gravity_travel
-    position_allowance = max(
-        penetrations[step], one_step_travel
-    ) + np.linalg.norm(position_tolerance[offset])
-    if np.linalg.norm(position_error) > position_allowance:
+    commanded_travel = dt * _stable_norm(commanded_velocities[offset])
+    bounded_penetration = min(target_radius, penetrations[step])
+    position_allowance = (
+        max(commanded_travel, bounded_penetration)
+        + gravity_travel
+        + _stable_norm(position_tolerance[offset])
+    )
+    if _stable_norm(position_error) > position_allowance:
       raise ValueError(
           "logged target position exceeds its commanded contact-step envelope"
       )
-    angular_allowance = (
-        penetrations[step] / min(target.size)
-        + np.linalg.norm(target_states[offset, 10:13]) * dt
-        + quaternion_tolerance
-    )
-    if quaternion_error > min(np.pi, angular_allowance):
+    angular_allowance = min(
+        angular_cap,
+        bounded_penetration / min(target.size),
+    ) + quaternion_tolerance
+    if quaternion_error > angular_allowance:
       raise ValueError(
           "logged target quaternion exceeds its commanded contact-step envelope"
       )
@@ -943,6 +1072,8 @@ def _validate_pair_logs(
       intervention,
       rng_seed=rng_seed,
   )
+  _validate_contact_integrity(factual_log, scene_config)
+  _validate_contact_integrity(counterfactual_log, scene_config)
   if factual_log.commanded_path is None or counterfactual_log.commanded_path is None:
     raise ValueError("paired logs require commanded_path values")
   factual_path = _explicit_path(factual_log.commanded_path, target, steps)

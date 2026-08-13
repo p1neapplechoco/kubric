@@ -17,6 +17,7 @@ import kubric as kb
 
 from interventions import (
     CameraConfig,
+    ContactRecord,
     GraphEdgeDelta,
     GroundTruth,
     Intervention,
@@ -630,6 +631,311 @@ def test_pair_validation_rejects_scaled_target_quaternion():
     )
 
 
+@pytest.mark.parametrize("operation", ["extract", "write"])
+def test_pair_validation_rejects_unknown_contact_endpoint(
+    operation, tmp_path
+):
+  config = _scene(_object("target", shape="sphere", static=True))
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  target_index = counterfactual.object_ids.index("target")
+  states = counterfactual.states.copy()
+  states[1, target_index, 0] += 7.0
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="target",
+      object_b="ghost",
+      position=(7.0, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=0.0,
+      contact_distance=-8.0,
+  )
+  tampered = _replace_log(
+      counterfactual,
+      states=states,
+      contacts=counterfactual.contacts + (fake_contact,),
+  )
+
+  with pytest.raises(ValueError, match="contact|endpoint|object_ids|unknown"):
+    if operation == "extract":
+      extract_pair_ground_truth(
+          config, intervention, factual, tampered
+      )
+    else:
+      write_paired_artifact(
+          tmp_path / "pair",
+          config,
+          intervention,
+          0,
+          factual,
+          tampered,
+      )
+  assert not (tmp_path / "pair").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "message"),
+    [
+        ("step", 1.0, "contact step"),
+        ("step", True, "contact step"),
+        ("step", 99, "contact step"),
+        ("object_b", "ball", "contact endpoints must be distinct"),
+    ],
+)
+def test_pair_validation_rechecks_forged_contact_identity(
+    field, invalid_value, message
+):
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(1.0, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(0.5, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=0.0,
+  )
+  object.__setattr__(contact, field, invalid_value)
+  tampered = _replace_log(counterfactual)
+  object.__setattr__(tampered, "contacts", (contact,))
+
+  with pytest.raises(ValueError, match=message):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
+def test_pair_validation_rejects_contact_geometry_far_from_both_bodies():
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(1.0, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(15.0, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=-0.1,
+  )
+  tampered = _replace_log(counterfactual, contacts=(fake_contact,))
+
+  with pytest.raises(ValueError, match="contact|geometry|position|distance"):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+  assert tampered.contacts == (fake_contact,)
+  assert tampered.contacts[0].contact_distance == -0.1
+
+
+@pytest.mark.parametrize("contact_x", [1e-16, 1e-7])
+def test_contact_geometry_tolerance_preserves_micro_scale(contact_x):
+  scale = 1e-16
+  config = _scene(
+      _object("target", shape="sphere", size=scale, static=True),
+      _object("ball", shape="sphere", size=scale, position=(2e-16, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(contact_x, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=0.0,
+  )
+  clean_factual = _replace_log(factual, contacts=())
+  tampered = _replace_log(counterfactual, contacts=(contact,))
+
+  if contact_x == 1e-16:
+    extract_pair_ground_truth(
+        config, intervention, clean_factual, tampered
+    )
+  else:
+    with pytest.raises(ValueError, match="contact|geometry|position"):
+      extract_pair_ground_truth(
+          config, intervention, clean_factual, tampered
+      )
+
+
+def test_pair_validation_rejects_unbounded_contact_penetration():
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(8.5, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(0.25, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=-8.0,
+  )
+  tampered = _replace_log(counterfactual, contacts=(fake_contact,))
+
+  with pytest.raises(ValueError, match="contact|distance|depth|penetration"):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
+def test_zero_force_contact_cannot_relax_target_pose_binding():
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(0.6, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  target_index = counterfactual.object_ids.index("target")
+  states = counterfactual.states.copy()
+  states[1, target_index, 0] += 0.1
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(0.35, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=0.0,
+      contact_distance=-0.1,
+  )
+  tampered = _replace_log(
+      counterfactual, states=states, contacts=(fake_contact,)
+  )
+
+  with pytest.raises(ValueError, match="contact|force|positive"):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
+@pytest.mark.parametrize("mutation", ["position", "quaternion"])
+def test_pair_validation_caps_fabricated_contact_pose_envelope(mutation):
+  ball_x = 7.4 if mutation == "position" else 0.6
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(ball_x, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  target_index = counterfactual.object_ids.index("target")
+  states = counterfactual.states.copy()
+  if mutation == "position":
+    states[1, target_index, 0] += 7.0
+    contact_position = (7.25, 0.0, 0.0)
+  else:
+    states[1, target_index, 3:7] = (0.0, 1.0, 0.0, 0.0)
+    contact_position = (0.25, 0.0, 0.0)
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=contact_position,
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=-0.1,
+  )
+  tampered = _replace_log(
+      counterfactual, states=states, contacts=(fake_contact,)
+  )
+
+  with pytest.raises(
+      ValueError, match="target|pose|position|quaternion|envelope"
+  ):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
+@pytest.mark.parametrize("mutation", ["linear", "angular"])
+def test_logged_target_velocity_cannot_expand_contact_pose_envelope(mutation):
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(0.56, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  target_index = counterfactual.object_ids.index("target")
+  states = counterfactual.states.copy()
+  if mutation == "linear":
+    states[1, target_index, 0] += 0.2
+    states[1, target_index, 7] = 0.2 * config.step_rate
+  else:
+    angle = 0.5
+    states[1, target_index, 3:7] = (
+        np.cos(angle / 2.0),
+        np.sin(angle / 2.0),
+        0.0,
+        0.0,
+    )
+    states[1, target_index, 10] = angle * config.step_rate
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(0.28, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=-0.03,
+  )
+  tampered = _replace_log(
+      counterfactual, states=states, contacts=(fake_contact,)
+  )
+
+  with pytest.raises(
+      ValueError, match="target|position|quaternion|velocity|envelope"
+  ):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
+def test_huge_finite_logged_velocity_is_rejected_without_overflow_warning():
+  config = _scene(
+      _object("target", shape="sphere", static=True),
+      _object("ball", shape="sphere", position=(0.56, 0.0, 0.0)),
+  )
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 0
+  )
+  target_index = counterfactual.object_ids.index("target")
+  states = counterfactual.states.copy()
+  states[1, target_index, 0] += 0.2
+  states[1, target_index, 7:10] = 1e308
+  fake_contact = ContactRecord(
+      step=1,
+      object_a="ball",
+      object_b="target",
+      position=(0.28, 0.0, 0.0),
+      normal=(1.0, 0.0, 0.0),
+      normal_force=1.0,
+      contact_distance=-0.03,
+  )
+  tampered = _replace_log(
+      counterfactual, states=states, contacts=(fake_contact,)
+  )
+
+  with pytest.raises(ValueError, match="target|position|envelope"):
+    extract_pair_ground_truth(config, intervention, factual, tampered)
+
+
 def test_writer_rejects_rng_seed_that_did_not_generate_counterfactual(tmp_path):
   config = _scene(_object("target", static=True))
   intervention = _intervention(magnitude=0)
@@ -1085,7 +1391,16 @@ def test_wide_margin_contact_versus_miss_extracts_removed_edge_and_path():
       factual.states[:, target_index, :3] - factual.commanded_path[:, :3],
       axis=1,
   )
-  assert contact_pose_drift.max() > 1e-3
+  assert 0.002 < contact_pose_drift.max() < 0.003
+  target_penetration = max(
+      -record.contact_distance
+      for record in factual.contacts
+      if (
+          "target" in (record.object_a, record.object_b)
+          and record.contact_distance is not None
+      )
+  )
+  assert 0.09 < target_penetration < 0.10
   truth = extract_pair_ground_truth(
       config,
       intervention,
