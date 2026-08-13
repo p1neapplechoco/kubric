@@ -14,17 +14,18 @@ objects:
   mass: [0.5, 2.0]
   friction: [0.05, 0.6]
   restitution: [0.0, 0.4]
-  x: [-3.5, 3.5]
-  y: [-3.5, 3.5]
+  # Concentrate free bodies around the target sweep while retaining lateral misses.
+  x: [-1.4, 1.2]
+  y: [-1.8, 1.8]
   floor_size: [4.5, 4.5, 0.25]
 
 # The target remains static in Kubric bookkeeping; push_mass is toggled per step.
 target:
   shape: cube
   size: [0.16, 0.26]
-  x: [-2.5, -1.5]
-  y: [-1.0, 1.0]
-  displacement_x: [1.0, 3.0]
+  x: [-2.2, -1.8]
+  y: [-0.8, 0.8]
+  displacement_x: [2.5, 3.2]
   displacement_y: [-0.5, 0.5]
   friction: [0.05, 0.4]
   restitution: [0.0, 0.2]
@@ -35,9 +36,9 @@ trajectory:
 
 intervention:
   recipes: [remove_collision, create_collision, retime, break_contact, maintain_contact]
-  magnitude: [0.05, 0.45]
-  start_step: [2, 8]
-  duration_steps: [8, 10]
+  magnitude: [0.05, 0.30]
+  start_step: [1, 4]
+  duration_steps: [12, 16]
   push_mass: [0.5, 2.0]
   expected_effects: [non_null, "null"]
 

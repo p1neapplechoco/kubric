@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from interventions import read_paired_artifact
+from interventions import read_paired_artifact, validate_path
 from interventions.dataset import (
     CandidateSummary,
     InstanceSpec,
@@ -286,6 +286,56 @@ def test_repository_ranges_preserve_null_effect_as_a_string_and_sample():
   assert loaded["intervention"]["expected_effects"] == ("non_null", "null")
   specs = tuple(sample_instance_spec(loaded, 20260811, index) for index in range(64))
   assert {spec.expected_effect for spec in specs} == {"non_null", "null"}
+
+
+def _factual_sweep_reaches_initial_dynamic_volume(spec):
+  """Approximates whether the intervention can alter an initial contact corridor."""
+  target = next(
+      item for item in spec.scene_config.objects if item.object_id == spec.target_id
+  )
+  start, end = (int(value) for value in spec.intervention.time_window)
+  window_path = spec.factual_path[start:end]
+  target_clearance = max(target.size)
+  for item in spec.scene_config.objects:
+    if item.metadata.get("role") != "dynamic":
+      continue
+    center = np.asarray(item.position)
+    extent = np.asarray(item.size)
+    dynamic_aabb = ((center - extent, center + extent),)
+    try:
+      validate_path(
+          window_path,
+          static_aabbs=dynamic_aabb,
+          clearance=target_clearance,
+      )
+    except ValueError as error:
+      if "intersects a static AABB" in str(error):
+        return True
+      raise
+  return False
+
+
+def test_repository_ranges_sample_a_diverse_interaction_corridor():
+  config = Path(__file__).resolve().parents[1] / "configs" / "scene_ranges.yaml"
+  loaded = load_ranges(config)
+
+  specs = tuple(
+      sample_instance_spec(loaded, 20260811, index) for index in range(512)
+  )
+  interaction_fraction = sum(
+      _factual_sweep_reaches_initial_dynamic_volume(spec) for spec in specs
+  ) / len(specs)
+
+  assert {spec.intervention.recipe for spec in specs} == {
+      "remove_collision",
+      "create_collision",
+      "retime",
+      "break_contact",
+      "maintain_contact",
+  }
+  assert {spec.expected_effect for spec in specs} == {"non_null", "null"}
+  assert {len(spec.scene_config.objects) - 2 for spec in specs} == {2, 3, 4, 5}
+  assert 0.45 <= interaction_fraction <= 0.75
 
 
 def test_sampled_scene_has_explicit_ids_valid_path_and_nonoverlap():
