@@ -467,8 +467,15 @@ def temporal_reachability(
     target_id: str,
     intervention_start: int,
     exclude_nodes: Iterable[str] = (),
+    edge_delta: Optional[GraphEdgeDelta] = None,
 ) -> Tuple[Tuple[str, ...], Mapping[str, Tuple[str, ...]]]:
-  """Traverses the union graph along nondecreasing contact times."""
+  """Finds time-respecting union paths triggered by a graph-delta edge.
+
+  An unchanged prefix may lead from ``target_id`` to a downstream delta, and
+  unchanged edges may propagate the effect after that trigger.  Returned
+  witnesses are deterministic time-respecting walks; they can repeat nodes
+  when an undirected delta closes a cycle.
+  """
   if not isinstance(factual, TemporalGraph):
     raise TypeError("factual must be a TemporalGraph")
   if not isinstance(counterfactual, TemporalGraph):
@@ -479,6 +486,21 @@ def temporal_reachability(
     raise ValueError("intervention_start must be nonnegative")
   excluded = set(_excluded_nodes(exclude_nodes))
   excluded.discard(target)
+  if edge_delta is None:
+    edge_delta = graph_delta(factual, counterfactual)
+  if not isinstance(edge_delta, GraphEdgeDelta):
+    raise TypeError("edge_delta must be a GraphEdgeDelta")
+
+  trigger_identities = {
+      (
+          record["object_a"],
+          record["object_b"],
+          record["start_step"],
+          record["end_step"],
+      )
+      for bucket in (edge_delta.added, edge_delta.removed, edge_delta.changed)
+      for record in bucket
+  }
 
   by_signature: Dict[Tuple[str, str, int, int], TemporalEdge] = {}
   for edge in factual.edges + counterfactual.edges:
@@ -495,16 +517,21 @@ def temporal_reachability(
   # A later-but-shorter label can yield the best path after a future contact,
   # so retain every nondominated (arrival, hops, path) label at each node.
   initial_label = (start, 0, (target,))
-  labels: Dict[str, set[Tuple[int, int, Tuple[str, ...]]]] = {
-      target: {initial_label}
+  labels: Dict[
+      Tuple[str, bool], set[Tuple[int, int, Tuple[str, ...]]]
+  ] = {
+      (target, False): {initial_label}
   }
-  queue: List[Tuple[int, int, Tuple[str, ...], str]] = [
-      (start, 0, (target,), target)
+  queue: List[Tuple[int, int, Tuple[str, ...], str, bool]] = [
+      (start, 0, (target,), target, False)
   ]
+  path_candidates: Dict[
+      str, set[Tuple[int, int, Tuple[str, ...]]]
+  ] = defaultdict(set)
   while queue:
-    arrival, hops, path, node = heapq.heappop(queue)
+    arrival, hops, path, node, triggered = heapq.heappop(queue)
     label = (arrival, hops, path)
-    if label not in labels.get(node, set()):
+    if label not in labels.get((node, triggered), set()):
       continue
     for edge in adjacency.get(node, ()):
       other = edge.object_b if node == edge.object_a else edge.object_a
@@ -513,7 +540,17 @@ def temporal_reachability(
         continue
       candidate_path = path + (other,)
       candidate = (contact_time, hops + 1, candidate_path)
-      other_labels = labels.setdefault(other, set())
+      candidate_triggered = triggered or edge.identity in trigger_identities
+      if candidate_triggered:
+        # Capture causal prefixes before dominance pruning: another route may
+        # dominate this endpoint label while omitting a valid prefix node.
+        for path_index, path_node in enumerate(candidate_path[1:], start=1):
+          if path_node == target:
+            continue
+          path_candidates[path_node].add(
+              (contact_time, path_index, candidate_path[:path_index + 1])
+          )
+      other_labels = labels.setdefault((other, candidate_triggered), set())
       if any(_label_dominates(existing, candidate) for existing in other_labels):
         continue
       dominated = {
@@ -524,12 +561,13 @@ def temporal_reachability(
       other_labels.add(candidate)
       heapq.heappush(
           queue,
-          (contact_time, hops + 1, candidate_path, other),
+          (contact_time, hops + 1, candidate_path, other, candidate_triggered),
       )
 
-  affected = tuple(sorted(node for node in labels if node != target))
+  # Rank witnesses by trigger/arrival time, hops, then lexical path.
+  affected = tuple(sorted(path_candidates))
   paths = MappingProxyType({
-      node: min(labels[node])[2] for node in affected
+      node: min(path_candidates[node])[2] for node in affected
   })
   return affected, paths
 
@@ -691,6 +729,7 @@ def extract_ground_truth(
       target_id,
       intervention_start,
       exclude_nodes=exclude_nodes,
+      edge_delta=delta,
   )
   state_ids = state_affected(
       factual_log,
