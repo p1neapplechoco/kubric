@@ -1579,24 +1579,43 @@ def _recompute_candidate_evidence(
   return qc, summary
 
 
-def _manifest(
+def _qc_from_journal(value: Any, status: str) -> QCResult:
+  if not isinstance(value, Mapping) or set(value) != {
+      "accepted", "reason_codes", "metrics"
+  }:
+    raise ValueError("{} attempt journal QC is corrupt".format(status))
+  try:
+    qc = QCResult(
+        accepted=value["accepted"],
+        reason_codes=value["reason_codes"],
+        metrics=value["metrics"],
+    )
+    if _canonical_bytes(value) != _canonical_bytes(qc.to_dict()):
+      raise ValueError("QC record is not canonical")
+  except (KeyError, TypeError, ValueError, OverflowError) as error:
+    raise ValueError(
+        "{} attempt journal QC is corrupt".format(status)
+    ) from error
+  expected_accepted = status == "accepted"
+  if qc.accepted != expected_accepted:
+    raise ValueError(
+        "{} attempt journal QC status mismatch".format(status)
+    )
+  return qc
+
+
+def _validate_attempt_record(
     root: Path,
-    config_sha256: str,
+    record: Mapping[str, Any],
     ranges: Mapping[str, Any],
     master_seed: int,
-    num_instances: int,
-    records: Sequence[Mapping[str, Any]],
-    balance_seed: int,
-    split_seed: int,
-    fractions: Mapping[str, float],
-) -> Mapping[str, Any]:
-  qc_config = dict(_section(to_jsonable(ranges), "qc"))
-  candidates = []
-  for record in records:
-    if record.get("status") != "accepted":
-      continue
-    try:
-      if set(record) != {
+) -> Tuple[str, int, Optional[InstanceSpec], Optional[CandidateSummary]]:
+  """Validates one immutable journal record before status dispatch."""
+  if not isinstance(record, Mapping):
+    raise ValueError("attempt journal is corrupt")
+  status = record.get("status")
+  field_sets = {
+      "accepted": {
           "attempt_index",
           "instance_id",
           "instance_seed",
@@ -1605,19 +1624,69 @@ def _manifest(
           "candidate",
           "artifact_manifest_sha256",
           "artifact_manifest_size",
-      }:
-        raise ValueError("unexpected accepted journal fields")
-      attempt_index = _integer(record["attempt_index"], "attempt_index")
-      spec = sample_instance_spec(ranges, master_seed, attempt_index)
+      },
+      "rejected": {
+          "attempt_index",
+          "instance_id",
+          "instance_seed",
+          "qc",
+          "status",
+          "spec",
+      },
+      "error": {
+          "attempt_index",
+          "error_type",
+          "message",
+          "traceback",
+          "status",
+      },
+  }
+  if not isinstance(status, str) or status not in field_sets:
+    raise ValueError("attempt journal status is corrupt")
+  if set(record) != field_sets[status]:
+    raise ValueError("{} attempt journal is corrupt".format(status))
+  try:
+    attempt_index = _integer(record["attempt_index"], "attempt_index")
+  except (KeyError, TypeError, ValueError) as error:
+    raise ValueError("{} attempt journal is corrupt".format(status)) from error
+
+  try:
+    spec = sample_instance_spec(ranges, master_seed, attempt_index)
+  except Exception as error:
+    if status != "error":
+      raise ValueError(
+          "{} attempt journal sampled spec is corrupt".format(status)
+      ) from error
+    spec = None
+
+  candidate = None
+  if status in {"accepted", "rejected"}:
+    try:
+      instance_id = _identifier(record["instance_id"], "instance_id")
+      instance_seed = _integer(record["instance_seed"], "instance_seed")
+      _qc_from_journal(record["qc"], status)
+    except (KeyError, TypeError, ValueError) as error:
+      raise ValueError("{} attempt journal is corrupt".format(status)) from error
+    if (
+        spec is None
+        or instance_id != spec.instance_id
+        or instance_seed != spec.instance_seed
+    ):
+      raise ValueError("{} attempt journal evidence mismatch".format(status))
+
+  if status == "accepted":
+    try:
       candidate = _summary_from_dict(record["candidate"])
+      if _canonical_bytes(record["candidate"]) != _canonical_bytes(
+          candidate.to_dict()
+      ):
+        raise ValueError("candidate record is not canonical")
       manifest_sha256 = record["artifact_manifest_sha256"]
       manifest_size = record["artifact_manifest_size"]
-    except (KeyError, TypeError, ValueError) as error:
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
       raise ValueError("accepted attempt journal is corrupt") from error
     if (
-        record["instance_id"] != spec.instance_id
-        or record["instance_seed"] != spec.instance_seed
-        or candidate.instance_id != spec.instance_id
+        candidate.instance_id != spec.instance_id
         or candidate.attempt_index != spec.attempt_index
     ):
       raise ValueError("accepted attempt journal evidence mismatch")
@@ -1633,8 +1702,54 @@ def _manifest(
         or manifest_size < 0
     ):
       raise ValueError("accepted attempt journal artifact digest is corrupt")
+  elif status == "rejected":
+    try:
+      if _canonical_bytes(record["spec"]) != _canonical_bytes(spec.to_dict()):
+        raise ValueError("sampled spec mismatch")
+    except (KeyError, TypeError, ValueError, OverflowError) as error:
+      raise ValueError("rejected attempt journal spec is corrupt") from error
+  else:
+    if (
+        not isinstance(record["error_type"], str)
+        or not record["error_type"].strip()
+        or not isinstance(record["message"], str)
+        or not isinstance(record["traceback"], str)
+    ):
+      raise ValueError("error attempt journal is corrupt")
+
+  if status != "accepted" and spec is not None:
+    artifact = root / "instances" / spec.instance_id
+    if artifact.exists() or artifact.is_symlink():
+      raise ValueError(
+          "non-accepted attempt conflicts with existing instance artifact"
+      )
+  return status, attempt_index, spec, candidate
+
+
+def _manifest(
+    root: Path,
+    config_sha256: str,
+    ranges: Mapping[str, Any],
+    master_seed: int,
+    num_instances: int,
+    records: Sequence[Mapping[str, Any]],
+    balance_seed: int,
+    split_seed: int,
+    fractions: Mapping[str, float],
+) -> Mapping[str, Any]:
+  qc_config = dict(_section(to_jsonable(ranges), "qc"))
+  candidates = []
+  for record in records:
+    status, _, spec, candidate = _validate_attempt_record(
+        root, record, ranges, master_seed
+    )
+    if status != "accepted":
+      continue
+    assert spec is not None and candidate is not None
+    manifest_sha256 = record["artifact_manifest_sha256"]
+    manifest_size = int(record["artifact_manifest_size"])
     _validate_candidate_artifact(
-        root, candidate, manifest_sha256, int(manifest_size), spec
+        root, candidate, manifest_sha256, manifest_size, spec
     )
     recomputed_qc, recomputed_candidate = _recompute_candidate_evidence(
         root, spec, qc_config

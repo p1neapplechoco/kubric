@@ -1064,6 +1064,159 @@ def test_batch_resume_recomputes_accepted_journal_evidence(
     run_batch(_ranges(), output, 41, 1, 1, resume=True)
 
 
+def test_batch_resume_rejects_accepted_status_only_downgrade(
+    monkeypatch, tmp_path
+):
+  _patch_fast_batch(monkeypatch)
+  output = tmp_path / "dataset"
+  run_batch(_ranges(), output, 47, 1, 1)
+  attempt_path = output / "attempts" / "00000000.json"
+  attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+  attempt["status"] = "rejected"
+  attempt_path.write_text(
+      json.dumps(attempt, sort_keys=True) + "\n", encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="attempt journal|rejected|corrupt"):
+    run_batch(_ranges(), output, 47, 1, 1, resume=True)
+
+
+def test_batch_resume_rejects_well_formed_rejected_downgrade_with_artifact(
+    monkeypatch, tmp_path
+):
+  _patch_fast_batch(monkeypatch)
+  ranges = _ranges()
+  output = tmp_path / "dataset"
+  run_batch(ranges, output, 53, 1, 1)
+  spec = sample_instance_spec(ranges, 53, 0)
+  rejected = {
+      "attempt_index": spec.attempt_index,
+      "instance_id": spec.instance_id,
+      "instance_seed": spec.instance_seed,
+      "qc": QCResult(
+          False, ("synthetic_rejection",), {"max_linear_velocity": 0}
+      ).to_dict(),
+      "status": "rejected",
+      "spec": spec.to_dict(),
+  }
+  attempt_path = output / "attempts" / "00000000.json"
+  attempt_path.write_text(
+      json.dumps(rejected, sort_keys=True) + "\n", encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="artifact|downgrade|orphan|conflict"):
+    run_batch(ranges, output, 53, 1, 1, resume=True)
+
+
+def test_batch_resume_rejects_well_formed_error_downgrade_with_artifact(
+    monkeypatch, tmp_path
+):
+  _patch_fast_batch(monkeypatch)
+  ranges = _ranges()
+  output = tmp_path / "dataset"
+  run_batch(ranges, output, 55, 1, 1)
+  error_record = {
+      "attempt_index": 0,
+      "error_type": "RuntimeError",
+      "message": "synthetic downgrade",
+      "traceback": "synthetic traceback",
+      "status": "error",
+  }
+  attempt_path = output / "attempts" / "00000000.json"
+  attempt_path.write_text(
+      json.dumps(error_record, sort_keys=True) + "\n", encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="artifact|downgrade|orphan|conflict"):
+    run_batch(ranges, output, 55, 1, 1, resume=True)
+
+
+def test_batch_resume_accepts_canonical_rejected_journal(monkeypatch, tmp_path):
+  import interventions.dataset as dataset
+
+  _patch_fast_batch(monkeypatch)
+  monkeypatch.setattr(
+      dataset,
+      "evaluate_qc",
+      lambda *args, **kwargs: QCResult(
+          False, ("synthetic_rejection",), {"max_linear_velocity": 0}
+      ),
+  )
+  output = tmp_path / "dataset"
+
+  initial = run_batch(_ranges(), output, 57, 1, 1)
+  resumed = run_batch(_ranges(), output, 57, 1, 1, resume=True)
+
+  assert initial == resumed
+  assert resumed["status"] == "capacity_exhausted"
+  assert resumed["selected_ids"] == ()
+
+
+@pytest.mark.parametrize(
+    ("record_kind", "mutation"),
+    [
+        ("rejected", "extra_field"),
+        ("rejected", "missing_spec"),
+        ("rejected", "accepted_qc"),
+        ("rejected", "instance_seed_type"),
+        ("rejected", "spec_mismatch"),
+        ("error", "extra_field"),
+        ("error", "missing_traceback"),
+        ("error", "error_type"),
+        ("error", "unknown_status"),
+        ("error", "attempt_index_bool"),
+    ],
+)
+def test_batch_resume_rejects_malformed_nonaccepted_journal(
+    record_kind, mutation, monkeypatch, tmp_path
+):
+  import interventions.dataset as dataset
+
+  ranges = _ranges()
+  if record_kind == "error":
+    _patch_fast_batch(monkeypatch, fail_indices=(0,))
+  else:
+    _patch_fast_batch(monkeypatch)
+    monkeypatch.setattr(
+        dataset,
+        "evaluate_qc",
+        lambda *args, **kwargs: QCResult(
+            False, ("synthetic_rejection",), {"max_linear_velocity": 0}
+        ),
+    )
+  output = tmp_path / "dataset"
+  run_batch(ranges, output, 59, 1, 1)
+  attempt_path = output / "attempts" / "00000000.json"
+  attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+
+  if mutation == "extra_field":
+    attempt["unexpected"] = True
+  elif mutation == "missing_spec":
+    del attempt["spec"]
+  elif mutation == "accepted_qc":
+    attempt["qc"] = QCResult(
+        True, (), {"max_linear_velocity": 0}
+    ).to_dict()
+  elif mutation == "instance_seed_type":
+    attempt["instance_seed"] = str(attempt["instance_seed"])
+  elif mutation == "spec_mismatch":
+    attempt["spec"]["instance_id"] = "instance_tampered"
+  elif mutation == "missing_traceback":
+    del attempt["traceback"]
+  elif mutation == "error_type":
+    attempt["error_type"] = 7
+  elif mutation == "unknown_status":
+    attempt["status"] = "ignored"
+  else:
+    attempt["attempt_index"] = False
+  attempt_path.write_text(
+      json.dumps(attempt, sort_keys=True) + "\n", encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="attempt journal|corrupt|status"):
+    run_batch(ranges, output, 59, 1, 1, resume=True)
+
+
 def test_batch_journals_errors_and_continues(monkeypatch, tmp_path):
   _patch_fast_batch(monkeypatch, fail_indices=(0,))
   output = tmp_path / "dataset"
@@ -1265,11 +1418,10 @@ def test_batch_rejects_divergent_complete_orphan_rerun(monkeypatch, tmp_path):
     run_batch(_ranges(), output, 29, 1, 1)
 
   monkeypatch.setattr(dataset, "_write_once", real_write_once)
-  resumed = run_batch(_ranges(), output, 29, 1, 1, resume=True)
+  with pytest.raises(ValueError, match="artifact|orphan|conflict"):
+    run_batch(_ranges(), output, 29, 1, 1, resume=True)
 
   assert generated == 2
-  assert resumed["status"] == "capacity_exhausted"
-  assert resumed["selected_ids"] == ()
   attempt = json.loads((output / "attempts" / "00000000.json").read_text())
   assert attempt["status"] == "error"
   assert "orphan" in attempt["message"].lower() or "mismatch" in attempt[
