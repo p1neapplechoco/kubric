@@ -1042,6 +1042,49 @@ def test_batch_rejects_divergent_complete_orphan_rerun(monkeypatch, tmp_path):
   ].lower()
 
 
+def test_instance_publisher_rejects_orphan_with_nondefault_thresholds(tmp_path):
+  import interventions.dataset as dataset
+
+  spec = sample_instance_spec(_ranges(), 43, 0)
+  factual, counterfactual, truth = generate_candidate(spec)
+  root = tmp_path / "dataset"
+  artifact = root / "instances" / spec.instance_id
+  artifact.parent.mkdir(parents=True)
+  persisted_truth = dataset.write_paired_artifact(
+      artifact,
+      spec.scene_config,
+      spec.intervention,
+      spec.instance_seed,
+      factual,
+      counterfactual,
+      position_epsilon=0.5,
+  )
+  assert persisted_truth == truth
+  dataset._write_once(
+      artifact / "spec.json", dataset._canonical_bytes(spec.to_dict())
+  )
+  instance_manifest = {
+      "instance_id": spec.instance_id,
+      "files": dataset._file_manifest(artifact),
+  }
+  dataset._write_once(
+      artifact / "instance_manifest.json",
+      dataset._canonical_bytes(instance_manifest),
+  )
+  persisted_factual, persisted_counterfactual, persisted_truth, provenance = (
+      read_paired_artifact(artifact)
+  )
+  assert persisted_factual == factual
+  assert persisted_counterfactual == counterfactual
+  assert persisted_truth == truth
+  assert provenance["extraction_thresholds"]["position_epsilon"] == 0.5
+
+  with pytest.raises(ValueError, match="orphan|provenance|threshold|mismatch"):
+    dataset._publish_instance(
+        root, spec, factual, counterfactual, truth
+    )
+
+
 def test_batch_recovers_error_record_after_attempt_journal_crash(
     monkeypatch, tmp_path
 ):

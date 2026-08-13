@@ -1342,23 +1342,27 @@ def _publish_instance(
     persisted_factual, persisted_counterfactual, persisted_truth, provenance = (
         read_paired_artifact(destination)
     )
-    expected_provenance = {
-        "schema_version": spec.scene_config.schema_version,
-        "target_id": spec.target_id,
-        "rng_seed": spec.instance_seed,
-        "scene_config": spec.scene_config.to_dict(),
-        "intervention": spec.intervention.to_dict(),
-        "factual": "factual",
-        "counterfactual": "counterfactual",
-    }
+    with tempfile.TemporaryDirectory(
+        prefix="kubric-orphan-provenance-"
+    ) as scratch:
+      reference = Path(scratch) / "pair"
+      write_paired_artifact(
+          reference,
+          spec.scene_config,
+          spec.intervention,
+          spec.instance_seed,
+          factual,
+          counterfactual,
+      )
+      _, _, expected_truth, expected_provenance = read_paired_artifact(
+          reference
+      )
     if (
         persisted_factual != factual
         or persisted_counterfactual != counterfactual
         or persisted_truth != ground_truth
-        or any(
-            to_jsonable(provenance.get(key)) != to_jsonable(value)
-            for key, value in expected_provenance.items()
-        )
+        or expected_truth != ground_truth
+        or to_jsonable(provenance) != to_jsonable(expected_provenance)
     ):
       raise ValueError(
           "complete orphan artifact does not match regenerated candidate"
