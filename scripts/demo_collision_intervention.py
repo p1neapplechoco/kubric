@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import imageio
@@ -15,15 +17,18 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from interventions import (
+    ContactLogger,
     ContactRecord,
     GroundTruth,
     Intervention,
+    KinematicSimulator,
     ObjectConfig,
     SceneConfig,
     SimulationLog,
     extract_pair_ground_truth,
     generate_paired_instance,
 )
+from interventions.twin_runner import _build_scene, _configure_physics
 
 
 _OUTPUT_DIR = Path("output/demo_collision_intervention")
@@ -40,14 +45,119 @@ class BranchResult:
   contact_records: Sequence[Mapping[str, object] | ContactRecord]
 
 
+def _freeze_demo_metadata(value: Mapping[str, object]) -> Mapping[str, object]:
+  """Copies the small demo metadata tree into immutable containers."""
+  if not isinstance(value, Mapping):
+    raise TypeError("metadata must be a mapping")
+
+  def freeze(item):
+    if isinstance(item, Mapping):
+      if not all(isinstance(key, str) for key in item):
+        raise TypeError("metadata keys must be strings")
+      return MappingProxyType({key: freeze(item[key]) for key in sorted(item)})
+    if isinstance(item, (tuple, list)):
+      return tuple(freeze(child) for child in item)
+    return item
+
+  return freeze(value)
+
+
+@dataclass(frozen=True, eq=False)
+class RemovedBranch:
+  """Fixed-shape demo replay for a physically removed target.
+
+  ``states`` stores XYZ + WXYZ quaternion + linear/angular velocity rows. A
+  false ``presence`` entry means the corresponding finite row is only a replay
+  placeholder and no longer represents a body in the physics world.
+  """
+
+  branch: str
+  object_ids: tuple[str, ...]
+  steps: tuple[int, ...]
+  states: np.ndarray
+  presence: np.ndarray
+  contacts: tuple[ContactRecord, ...]
+  metadata: Mapping[str, object] = field(default_factory=dict)
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.branch, str) or not self.branch.strip():
+      raise ValueError("branch must be a non-empty string")
+    if isinstance(self.object_ids, (str, bytes, set, frozenset)):
+      raise TypeError("object_ids must be an ordered iterable")
+    object_ids = tuple(self.object_ids)
+    if not all(isinstance(item, str) and item.strip() for item in object_ids):
+      raise ValueError("object_ids must contain non-empty strings")
+    if len(set(object_ids)) != len(object_ids):
+      raise ValueError("object_ids must be unique")
+
+    if isinstance(self.steps, (str, bytes, set, frozenset)):
+      raise TypeError("steps must be an ordered iterable")
+    steps = tuple(self.steps)
+    if not all(isinstance(step, int) and not isinstance(step, bool) for step in steps):
+      raise TypeError("steps must contain integers")
+    if any(step < 0 for step in steps) or any(
+        right <= left for left, right in zip(steps, steps[1:])
+    ):
+      raise ValueError("steps must be nonnegative and strictly increasing")
+
+    try:
+      states = np.array(self.states, dtype=np.float64, order="C", copy=True)
+    except (TypeError, ValueError, OverflowError) as error:
+      raise ValueError("states must be a numeric array") from error
+    expected_states = (len(steps), len(object_ids), 13)
+    if states.shape != expected_states:
+      raise ValueError("states must have shape {!r}".format(expected_states))
+    if not np.isfinite(states).all():
+      raise ValueError("states must contain only finite values")
+
+    untyped_presence = np.asarray(self.presence)
+    if untyped_presence.dtype.kind != "b":
+      raise TypeError("presence must contain Boolean values")
+    presence = np.array(
+        untyped_presence, dtype=np.bool_, order="C", copy=True
+    )
+    expected_presence = (len(steps), len(object_ids))
+    if presence.shape != expected_presence:
+      raise ValueError(
+          "presence must have shape {!r}".format(expected_presence)
+      )
+
+    if isinstance(self.contacts, (str, bytes)):
+      raise TypeError("contacts must be an iterable of ContactRecord values")
+    contacts = tuple(self.contacts)
+    if not all(isinstance(record, ContactRecord) for record in contacts):
+      raise TypeError("contacts must contain only ContactRecord values")
+    known_ids = set(object_ids)
+    if any(
+        record.object_a not in known_ids or record.object_b not in known_ids
+        for record in contacts
+    ):
+      raise ValueError("contact endpoints must use known object_ids")
+    if contacts and (
+        not steps
+        or any(record.step < steps[0] or record.step > steps[-1]
+               for record in contacts)
+    ):
+      raise ValueError("contact steps must lie within the logged step range")
+
+    states.setflags(write=False)
+    presence.setflags(write=False)
+    object.__setattr__(self, "object_ids", object_ids)
+    object.__setattr__(self, "steps", steps)
+    object.__setattr__(self, "states", states)
+    object.__setattr__(self, "presence", presence)
+    object.__setattr__(self, "contacts", contacts)
+    object.__setattr__(self, "metadata", _freeze_demo_metadata(self.metadata))
+
+
 @dataclass(frozen=True)
 class DemoResult:
   scene_config: SceneConfig
   intervention: Intervention
   normal: SimulationLog
   changed: SimulationLog
+  removed: RemovedBranch
   ground_truth: GroundTruth
-  removed: object | None = None
 
   @property
   def intervention_window(self) -> tuple[int, int]:
@@ -162,6 +272,154 @@ def _validate_demo_outcomes(
     raise RuntimeError("changed branch did not hard-affect only upper_ball")
 
 
+def _run_removed_branch(
+    scene_config: SceneConfig,
+    intervention: Intervention,
+    factual_path: np.ndarray,
+    provenance: Mapping[str, object],
+) -> RemovedBranch:
+  """Runs the demo-only physical deletion branch in a fresh Bullet world.
+
+  This deliberately reuses ``twin_runner``'s private scene/config mapping and
+  the simulator's private snapshot helper so the presentation branch matches
+  the public pair without adding deletion semantics to the dataset schema.
+  """
+  removed_step = int(intervention.time_window[0])
+  target_id = intervention.target_id
+  scene, assets = _build_scene(scene_config)
+  with tempfile.TemporaryDirectory(prefix="kubric-demo-removal-") as scratch:
+    with KinematicSimulator(scene, scratch_dir=Path(scratch)) as simulator:
+      _configure_physics(simulator, scene_config, assets)
+      prefix = simulator.run_with_intervention(
+          assets[target_id],
+          factual_path[:removed_step],
+          push_mass=intervention.push_mass,
+          branch="target_removed",
+          start_step=0,
+          write_keyframes=False,
+      )
+      object_ids = prefix.object_ids
+      target_index = object_ids.index(target_id)
+      states = np.empty(
+          (len(factual_path), len(object_ids), 13), dtype=np.float64
+      )
+      states[:removed_step] = prefix.states
+      states[removed_step:, target_index] = prefix.states[-1, target_index]
+      presence = np.ones(
+          (len(factual_path), len(object_ids)), dtype=np.bool_
+      )
+      presence[removed_step:, target_index] = False
+
+      scene.remove(assets[target_id])
+      live_ids = tuple(
+          object_id for object_id in object_ids if object_id != target_id
+      )
+      live_assets = tuple(assets[object_id] for object_id in live_ids)
+      live_indices = tuple(object_ids.index(object_id) for object_id in live_ids)
+      body_to_object_id = {
+          int(asset.linked_objects[simulator]): object_id
+          for object_id, asset in zip(live_ids, live_assets)
+      }
+      contact_logger = ContactLogger(
+          body_to_object_id, scene_config.step_rate
+      )
+
+      for step in range(removed_step, len(factual_path)):
+        simulator.step_passive()
+        contact_logger.log(step, simulator.bullet_client.getContactPoints())
+        states[step, live_indices] = simulator._snapshot(live_assets)
+
+  metadata = {
+      "trust_model": "demo_only_removal_v1",
+      "target_id": target_id,
+      "removed_step": removed_step,
+      "scene_seed": scene_config.seed,
+      "intervention_recipe": intervention.recipe,
+      "push_mass": intervention.push_mass,
+  }
+  metadata.update(provenance)
+  return RemovedBranch(
+      branch="target_removed",
+      object_ids=object_ids,
+      steps=tuple(range(len(factual_path))),
+      states=states,
+      presence=presence,
+      contacts=tuple(prefix.contacts) + tuple(contact_logger.records),
+      metadata=metadata,
+  )
+
+
+def _validate_removed_branch(
+    removed: RemovedBranch,
+    normal: SimulationLog,
+    intervention: Intervention,
+) -> None:
+  """Rejects replay corruption before exposing the demo result."""
+  if not isinstance(removed, RemovedBranch):
+    raise RuntimeError("removed branch has the wrong container type")
+  removed_step = int(intervention.time_window[0])
+  target_id = intervention.target_id
+  if removed.object_ids != normal.object_ids:
+    raise RuntimeError("removed branch object IDs differ from normal")
+  if removed.steps != normal.steps:
+    raise RuntimeError("removed branch steps differ from normal")
+  if removed.states.shape != normal.states.shape:
+    raise RuntimeError("removed branch state shape differs from normal")
+  if removed.presence.shape != removed.states.shape[:2]:
+    raise RuntimeError("removed branch presence shape differs from states")
+  if not np.isfinite(removed.states).all():
+    raise RuntimeError("removed branch states must be finite")
+
+  target_index = normal.object_ids.index(target_id)
+  non_target_indices = tuple(
+      index
+      for index, object_id in enumerate(normal.object_ids)
+      if object_id != target_id
+  )
+  if not np.array_equal(
+      removed.states[:removed_step, non_target_indices],
+      normal.states[:removed_step, non_target_indices],
+  ):
+    raise RuntimeError("removed branch non-target prefix differs from normal")
+  if not np.array_equal(
+      removed.states[:removed_step, target_index],
+      normal.states[:removed_step, target_index],
+  ):
+    raise RuntimeError("removed branch target prefix differs from normal")
+
+  expected_presence = np.ones_like(removed.presence, dtype=np.bool_)
+  expected_presence[removed_step:, target_index] = False
+  if not np.array_equal(removed.presence, expected_presence):
+    raise RuntimeError("removed branch presence does not match removal timing")
+  expected_target = np.broadcast_to(
+      removed.states[removed_step - 1, target_index],
+      removed.states[removed_step:, target_index].shape,
+  )
+  if not np.array_equal(removed.states[removed_step:, target_index], expected_target):
+    raise RuntimeError("removed branch did not retain the target's last state")
+
+  normal_prefix_contacts = tuple(
+      record for record in normal.contacts if record.step < removed_step
+  )
+  removed_prefix_contacts = tuple(
+      record for record in removed.contacts if record.step < removed_step
+  )
+  if removed_prefix_contacts != normal_prefix_contacts:
+    raise RuntimeError("removed branch contact prefix differs from normal")
+  if any(
+      record.step >= removed_step
+      and target_id in (record.object_a, record.object_b)
+      for record in removed.contacts
+  ):
+    raise RuntimeError("removed target appears in a post-removal contact")
+  if (
+      removed.metadata.get("trust_model") != "demo_only_removal_v1"
+      or removed.metadata.get("target_id") != target_id
+      or removed.metadata.get("removed_step") != removed_step
+  ):
+    raise RuntimeError("removed branch metadata is inconsistent")
+
+
 def generate_demo(seed: int = _DEMO_SEED) -> DemoResult:
   """Generates factual and changed branches through the public pair runner."""
   if seed != _DEMO_SEED:
@@ -177,13 +435,22 @@ def generate_demo(seed: int = _DEMO_SEED) -> DemoResult:
   ground_truth = extract_pair_ground_truth(
       scene, intervention, normal, changed
   )
+  provenance = {
+      key: normal.metadata[key]
+      for key in ("scene_config_sha256", "intervention_sha256")
+      if key in normal.metadata
+  }
+  removed = _run_removed_branch(
+      scene, intervention, factual_path, provenance
+  )
   _validate_demo_outcomes(normal, changed, ground_truth)
+  _validate_removed_branch(removed, normal, intervention)
   return DemoResult(
       scene_config=scene,
       intervention=intervention,
       normal=normal,
       changed=changed,
-      removed=None,
+      removed=removed,
       ground_truth=ground_truth,
   )
 

@@ -1,5 +1,6 @@
-"""Tests for the collision demo's contact filters and branch video rendering."""
+"""Tests for the collision demo's physics branches and video rendering."""
 
+import dataclasses
 import importlib.util
 import sys
 from dataclasses import FrozenInstanceError
@@ -83,6 +84,8 @@ def test_generate_demo_uses_public_pair_and_expected_ground_truth(generated_demo
 
   assert result.normal.branch == "factual"
   assert result.changed.branch == "counterfactual"
+  assert isinstance(result.removed, demo.RemovedBranch)
+  assert result.removed.branch == "target_removed"
   assert result.ground_truth.hard_affected == ("upper_ball",)
   assert result.ground_truth.soft_affected == ()
   assert not demo.dynamic_contacts(result.normal.contacts)
@@ -144,14 +147,116 @@ def test_fixed_seed_demo_is_exactly_repeatable(generated_demo):
         first_branch.commanded_path, repeated_branch.commanded_path
     )
     assert first_branch.contacts == repeated_branch.contacts
+  np.testing.assert_array_equal(
+      generated_demo.removed.states, repeated.removed.states
+  )
+  np.testing.assert_array_equal(
+      generated_demo.removed.presence, repeated.removed.presence
+  )
+  assert generated_demo.removed.contacts == repeated.removed.contacts
+  assert generated_demo.removed.metadata == repeated.removed.metadata
   assert generated_demo.ground_truth == repeated.ground_truth
 
 
-def test_demo_result_type_hints_do_not_depend_on_future_task_types():
+def test_demo_result_requires_a_frozen_removed_branch(generated_demo):
   hints = get_type_hints(demo.DemoResult)
 
-  assert hints["removed"] == object | None
-  assert demo.DemoResult.__dataclass_fields__["removed"].default is None
+  assert hints["removed"] is demo.RemovedBranch
+  assert (
+      demo.DemoResult.__dataclass_fields__["removed"].default
+      is dataclasses.MISSING
+  )
+  with pytest.raises(FrozenInstanceError):
+    generated_demo.removed.branch = "corrupted"
+  with pytest.raises(ValueError, match="read-only"):
+    generated_demo.removed.states[0, 0, 0] = 1.0
+  with pytest.raises(TypeError):
+    generated_demo.removed.metadata["trust_model"] = "corrupted"
+
+
+def test_removed_branch_has_exact_prefix_and_presence_mask(generated_demo):
+  result = generated_demo
+  removed = result.removed
+  start, _ = result.intervention_window
+  target = result.normal.object_ids.index("target")
+  non_target = tuple(
+      index
+      for index, object_id in enumerate(result.normal.object_ids)
+      if object_id != "target"
+  )
+
+  assert removed.object_ids == result.normal.object_ids
+  assert removed.steps == result.normal.steps == tuple(range(120))
+  assert removed.states.shape == result.normal.states.shape == (120, 4, 13)
+  assert removed.presence.shape == (120, 4)
+  assert removed.presence.dtype == np.bool_
+  assert np.isfinite(removed.states).all()
+  np.testing.assert_array_equal(
+      removed.states[:start], result.normal.states[:start]
+  )
+  np.testing.assert_array_equal(
+      removed.states[:start, non_target], result.normal.states[:start, non_target]
+  )
+  assert removed.presence[:start, target].all()
+  assert not removed.presence[start:, target].any()
+  assert removed.presence[:, non_target].all()
+  np.testing.assert_array_equal(
+      removed.states[start:, target],
+      np.broadcast_to(
+          removed.states[start - 1, target],
+          removed.states[start:, target].shape,
+      ),
+  )
+  assert removed.metadata["trust_model"] == "demo_only_removal_v1"
+  assert removed.metadata["target_id"] == "target"
+  assert removed.metadata["removed_step"] == start
+
+
+def test_removed_target_has_no_post_removal_contacts(generated_demo):
+  removed = generated_demo.removed
+  start, _ = generated_demo.intervention_window
+  known_ids = set(removed.object_ids)
+
+  assert isinstance(removed.contacts, tuple)
+  assert all(
+      {record.object_a, record.object_b} <= known_ids
+      for record in removed.contacts
+  )
+  assert all(
+      record.step < start
+      for record in removed.contacts
+      if "target" in (record.object_a, record.object_b)
+  )
+
+
+def test_generate_demo_rejects_a_corrupted_removed_prefix(
+    generated_demo, monkeypatch
+):
+  states = np.array(generated_demo.removed.states, copy=True)
+  non_target = next(
+      index
+      for index, object_id in enumerate(generated_demo.removed.object_ids)
+      if object_id != "target"
+  )
+  states[0, non_target, 0] += 0.01
+  corrupted = dataclasses.replace(generated_demo.removed, states=states)
+
+  monkeypatch.setattr(
+      demo,
+      "generate_paired_instance",
+      lambda *args, **kwargs: (generated_demo.normal, generated_demo.changed),
+  )
+  monkeypatch.setattr(
+      demo,
+      "extract_pair_ground_truth",
+      lambda *args, **kwargs: generated_demo.ground_truth,
+  )
+  monkeypatch.setattr(
+      demo, "_run_removed_branch", lambda *args, **kwargs: corrupted
+  )
+
+  with pytest.raises(RuntimeError, match="prefix"):
+    demo.generate_demo(seed=0)
 
 
 def _contact(step, object_a, object_b):
