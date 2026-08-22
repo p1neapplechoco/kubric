@@ -174,6 +174,24 @@ def test_demo_result_requires_a_frozen_removed_branch(generated_demo):
     generated_demo.removed.metadata["trust_model"] = "corrupted"
 
 
+@pytest.mark.parametrize("field", ("states", "presence"))
+def test_removed_branch_arrays_cannot_be_unfrozen_or_alias_inputs(
+    generated_demo, field
+):
+  states_input = np.array(generated_demo.removed.states, copy=True)
+  presence_input = np.array(generated_demo.removed.presence, copy=True)
+  branch = dataclasses.replace(
+      generated_demo.removed,
+      states=states_input,
+      presence=presence_input,
+  )
+
+  assert not np.shares_memory(branch.states, states_input)
+  assert not np.shares_memory(branch.presence, presence_input)
+  with pytest.raises(ValueError):
+    getattr(branch, field).setflags(write=True)
+
+
 def test_removed_branch_has_exact_prefix_and_presence_mask(generated_demo):
   result = generated_demo
   removed = result.removed

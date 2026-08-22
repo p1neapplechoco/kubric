@@ -140,8 +140,12 @@ class RemovedBranch:
     ):
       raise ValueError("contact steps must lie within the logged step range")
 
-    states.setflags(write=False)
-    presence.setflags(write=False)
+    states = np.frombuffer(
+        states.tobytes(order="C"), dtype=states.dtype
+    ).reshape(states.shape)
+    presence = np.frombuffer(
+        presence.tobytes(order="C"), dtype=presence.dtype
+    ).reshape(presence.shape)
     object.__setattr__(self, "object_ids", object_ids)
     object.__setattr__(self, "steps", steps)
     object.__setattr__(self, "states", states)
