@@ -532,6 +532,14 @@ def _validate_demo_bundle(result: DemoResult) -> None:
   ):
     raise ValueError("branch step_rate differs from scene step_rate")
 
+  recomputed_ground_truth = extract_pair_ground_truth(
+      result.scene_config,
+      result.intervention,
+      result.normal,
+      result.changed,
+  )
+  if recomputed_ground_truth != result.ground_truth:
+    raise ValueError("ground_truth does not match the validated public pair")
   _validate_demo_outcomes(result.normal, result.changed, result.ground_truth)
   _validate_removed_branch(result.removed, result.normal, result.intervention)
 

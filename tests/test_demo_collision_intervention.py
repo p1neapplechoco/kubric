@@ -468,6 +468,65 @@ def test_write_demo_bundle_rejects_jointly_permuted_object_order(
   assert not output.exists()
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ("preintervention_state", "commanded_path", "prefix_contacts"),
+)
+def test_write_demo_bundle_revalidates_the_public_pair_before_writing(
+    generated_demo, tmp_path, mutation
+):
+  changed = generated_demo.changed
+  start, _ = generated_demo.intervention_window
+
+  if mutation == "preintervention_state":
+    states = np.array(changed.states, copy=True)
+    non_target = next(
+        index
+        for index, object_id in enumerate(changed.object_ids)
+        if object_id != generated_demo.intervention.target_id
+    )
+    states[0, non_target, 0] += 0.01
+    changed = dataclasses.replace(changed, states=states)
+  elif mutation == "commanded_path":
+    commanded_path = np.array(changed.commanded_path, copy=True)
+    commanded_path[start + 1, 1] += 0.01
+    changed = dataclasses.replace(changed, commanded_path=commanded_path)
+  else:
+    prefix_index = next(
+        index
+        for index, record in enumerate(changed.contacts)
+        if record.step < start
+    )
+    contacts = tuple(
+        record
+        for index, record in enumerate(changed.contacts)
+        if index != prefix_index
+    )
+    changed = dataclasses.replace(changed, contacts=contacts)
+
+  corrupted = dataclasses.replace(generated_demo, changed=changed)
+  output = tmp_path / mutation
+  with pytest.raises(ValueError):
+    demo.write_demo_bundle(output, corrupted)
+  assert not output.exists()
+
+
+def test_write_demo_bundle_rejects_stale_ground_truth(generated_demo, tmp_path):
+  stale_ground_truth = dataclasses.replace(
+      generated_demo.ground_truth,
+      propagation_path={},
+  )
+  corrupted = dataclasses.replace(
+      generated_demo,
+      ground_truth=stale_ground_truth,
+  )
+  output = tmp_path / "bundle"
+
+  with pytest.raises(ValueError, match="ground_truth"):
+    demo.write_demo_bundle(output, corrupted)
+  assert not output.exists()
+
+
 def test_main_generates_then_writes_the_replay_bundle(
     generated_demo, tmp_path, monkeypatch, capsys
 ):
