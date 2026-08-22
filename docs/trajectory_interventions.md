@@ -74,6 +74,94 @@ codes and metrics. Both accepted and rejected candidates return exit code 0
 because the requested simulation completed and remains useful for inspection;
 an exception returns machine-readable `status: error` and exit code 1.
 
+## Run the three-branch collision demo
+
+The inspectable demo compares three synchronized outcomes from one fixed scene:
+
+- `normal`: the factual target follows its straight path between the balls and
+  makes no dynamic-object contact;
+- `trajectory_changed`: the public `create_collision` intervention changes the
+  target path only inside steps `[24, 96)` and makes it strike `upper_ball`;
+- `target_removed`: a fresh matching physics world replays the exact common
+  prefix, then physically removes the target before step 24 physics. Its last
+  finite target pose stays in the replay array while its presence mask is false.
+
+The fixture always uses seed `0`, 120 Bullet steps at 240 Hz, and 24 rendered
+frames per second. The normal/changed pair comes from the public paired runner
+and ground-truth extractor; this is not a second implementation of those APIs.
+
+Run the complete workflow from the repository root:
+
+```bash
+./run_demo.sh intervention
+```
+
+The command requires the Conda `thesis` environment, a running Docker daemon,
+and the cached `kubricdockerhub/kubruntudev` image containing Blender. It runs
+the generator and compositor with module invocations in `thesis`, renders all
+three branch replays through Blender/Cycles, and fails nonzero if Docker or the
+Blender render is unavailable. For physics logs and replay arrays without any
+Docker or composition requirement, use:
+
+```bash
+./run_demo.sh intervention-physics-only
+```
+
+`imageio-ffmpeg` is a direct dependency in `requirements_full.txt`. The Docker
+workflow first checks whether it is already importable and installs it inside
+the ephemeral container only when the cached image lacks it.
+
+### Procedural realistic scene
+
+The renderer uses the logged collider poses exactly; appearance is added only
+as collider-parented decoration. The target has rounded, noise-textured wood,
+the two balls use glossy billiard lacquer with bands and number decals, and the
+table has procedural dark-green felt plus wooden rails outside the simulated
+contact area. A shared studio-light rig, neutral world, camera, depth of field,
+Cycles adaptive sampling, and denoising are identical across all branches.
+
+The complete output tree is:
+
+```text
+output/demo_collision_intervention/
+  normal_states.npy
+  normal_presence.npy
+  trajectory_changed_states.npy
+  trajectory_changed_presence.npy
+  target_removed_states.npy
+  target_removed_presence.npy
+  contacts.json
+  summary.json
+  normal_blender.mp4
+  trajectory_changed_blender.mp4
+  target_removed_blender.mp4
+  trajectory_intervention_demo.mp4
+```
+
+The final `trajectory_intervention_demo.mp4` is a synchronized, labelled
+three-panel H.264/yuv420p video at 1920x720 and 24 fps. Inspect its media contract
+with:
+
+```bash
+ffprobe -v error -select_streams v:0 \
+  -show_entries stream=codec_name,pix_fmt,width,height,r_frame_rate,nb_frames \
+  -show_entries format=duration,size \
+  -of json output/demo_collision_intervention/trajectory_intervention_demo.mp4
+```
+
+### Demo-only removal trust boundary
+
+Only `normal` and `trajectory_changed` are canonical public paired rollouts.
+`target_removed` is narrowly scoped visualization data marked
+`demo_only_removal_v1`: it uses real removal from a fresh Bullet world, but is
+not a public dataset recipe, not covered by the paired-artifact attestation
+model, and must not be presented as training data. The presence mask, rather
+than the retained finite pose row, is authoritative after the removal step.
+
+This three-branch artifact completes Milestone E visual validation. It does not
+complete Milestone F: no large-scale generation, baseline training, or training
+handoff claim follows from this demo.
+
 ## Generate or resume a batch
 
 ```bash

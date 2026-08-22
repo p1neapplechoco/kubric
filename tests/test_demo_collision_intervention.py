@@ -3,6 +3,9 @@
 import dataclasses
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -27,11 +30,210 @@ sys.modules[_SCRIPT_NAME] = demo
 _SPEC.loader.exec_module(demo)
 
 _NUM_STEPS = 6
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_RUN_DEMO = _PROJECT_ROOT / "run_demo.sh"
+_DEMO_DOCS = _PROJECT_ROOT / "docs" / "trajectory_interventions.md"
+_FULL_REQUIREMENTS = _PROJECT_ROOT / "requirements_full.txt"
 
 
 @pytest.fixture(scope="module")
 def generated_demo():
   return demo.generate_demo(seed=0)
+
+
+def _write_executable(path: Path, contents: str) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(contents, encoding="utf-8")
+  path.chmod(0o755)
+
+
+def _workflow_sandbox(tmp_path: Path, *, docker: bool = True):
+  root = tmp_path / "repo"
+  root.mkdir()
+  script = root / "run_demo.sh"
+  script.write_bytes(_RUN_DEMO.read_bytes())
+  script.chmod(0o755)
+
+  fake_bin = tmp_path / "bin"
+  fake_bin.mkdir()
+  for command in ("bash", "dirname", "id", "ls", "mkdir"):
+    executable = shutil.which(command)
+    assert executable is not None
+    (fake_bin / command).symlink_to(executable)
+
+  conda_base = tmp_path / "conda"
+  thesis_python = conda_base / "envs" / "thesis" / "bin" / "python"
+  call_log = tmp_path / "calls.log"
+  _write_executable(
+      fake_bin / "conda",
+      """#!/bin/sh
+if [ "$1" = "info" ] && [ "$2" = "--base" ]; then
+  printf '%s\n' "$FAKE_CONDA_BASE"
+  exit 0
+fi
+exit 1
+""",
+  )
+  _write_executable(
+      thesis_python,
+      """#!/bin/sh
+printf 'python %s\n' "$*" >> "$CALL_LOG"
+output="$FAKE_REPO_ROOT/output/demo_collision_intervention"
+case " $* " in
+  *" -m scripts.demo_collision_intervention "*)
+    mkdir -p "$output"
+    for name in normal trajectory_changed target_removed; do
+      printf x > "$output/${name}_states.npy"
+      printf x > "$output/${name}_presence.npy"
+    done
+    printf '{}\n' > "$output/contacts.json"
+    printf '{}\n' > "$output/summary.json"
+    ;;
+  *" -m scripts.compose_intervention_demo "*)
+    printf x > "$output/trajectory_intervention_demo.mp4"
+    ;;
+esac
+""",
+  )
+  if docker:
+    _write_executable(
+        fake_bin / "docker",
+        """#!/bin/sh
+printf 'docker %s\n' "$*" >> "$CALL_LOG"
+if [ "$1" = "info" ]; then
+  exit "${FAKE_DOCKER_INFO_STATUS:-0}"
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
+  exit "${FAKE_DOCKER_IMAGE_STATUS:-0}"
+fi
+if [ "$1" = "run" ]; then
+  if [ "${FAKE_DOCKER_RUN_STATUS:-0}" -ne 0 ]; then
+    exit "$FAKE_DOCKER_RUN_STATUS"
+  fi
+  output="$FAKE_REPO_ROOT/output/demo_collision_intervention"
+  mkdir -p "$output"
+  for name in normal trajectory_changed target_removed; do
+    printf x > "$output/${name}_blender.mp4"
+  done
+fi
+""",
+    )
+
+  environment = os.environ.copy()
+  environment.update({
+      "CALL_LOG": str(call_log),
+      "FAKE_CONDA_BASE": str(conda_base),
+      "FAKE_REPO_ROOT": str(root),
+      "PATH": str(fake_bin),
+  })
+  return script, root, call_log, environment
+
+
+def _run_workflow(script: Path, root: Path, environment, mode: str):
+  return subprocess.run(
+      [str(script), mode],
+      cwd=root,
+      env=environment,
+      check=False,
+      capture_output=True,
+      text=True,
+  )
+
+
+def test_run_demo_intervention_orders_generate_render_and_compose(tmp_path):
+  script, root, call_log, environment = _workflow_sandbox(tmp_path)
+
+  completed = _run_workflow(script, root, environment, "intervention")
+
+  assert completed.returncode == 0, completed.stderr
+  calls = call_log.read_text("utf-8").splitlines()
+  generate = next(
+      index
+      for index, call in enumerate(calls)
+      if call.startswith("python -m scripts.demo_collision_intervention ")
+  )
+  render = next(
+      index for index, call in enumerate(calls) if call.startswith("docker run ")
+  )
+  compose = next(
+      index
+      for index, call in enumerate(calls)
+      if call.startswith("python -m scripts.compose_intervention_demo ")
+  )
+  assert generate < render < compose
+  assert "--branches normal trajectory_changed target_removed" in calls[render]
+  assert 'python3 -c "import imageio_ffmpeg"' in calls[render]
+  assert "--target /tmp/kubric-demo-imageio" in calls[render]
+  assert "export HOME=" not in calls[render]
+  assert (
+      str(root / "output/demo_collision_intervention/trajectory_intervention_demo.mp4")
+      in completed.stdout
+  )
+
+
+def test_run_demo_intervention_fails_explicitly_without_docker(tmp_path):
+  script, root, call_log, environment = _workflow_sandbox(
+      tmp_path, docker=False
+  )
+
+  completed = _run_workflow(script, root, environment, "intervention")
+
+  assert completed.returncode != 0
+  assert "Docker" in completed.stderr
+  calls = call_log.read_text("utf-8")
+  assert "scripts.demo_collision_intervention" in calls
+  assert "scripts.compose_intervention_demo" not in calls
+
+
+def test_run_demo_intervention_fails_explicitly_when_blender_render_fails(
+    tmp_path,
+):
+  script, root, call_log, environment = _workflow_sandbox(tmp_path)
+  environment["FAKE_DOCKER_RUN_STATUS"] = "17"
+
+  completed = _run_workflow(script, root, environment, "intervention")
+
+  assert completed.returncode != 0
+  assert "Blender" in completed.stderr
+  assert "scripts.compose_intervention_demo" not in call_log.read_text("utf-8")
+
+
+def test_run_demo_physics_only_does_not_require_docker_or_compose(tmp_path):
+  script, root, call_log, environment = _workflow_sandbox(
+      tmp_path, docker=False
+  )
+
+  completed = _run_workflow(
+      script, root, environment, "intervention-physics-only"
+  )
+
+  assert completed.returncode == 0, completed.stderr
+  calls = call_log.read_text("utf-8").splitlines()
+  assert len(calls) == 1
+  assert calls[0].startswith("python -m scripts.demo_collision_intervention ")
+
+
+def test_demo_documentation_describes_three_branch_video_contract():
+  documentation = _DEMO_DOCS.read_text("utf-8")
+
+  for branch in ("normal", "trajectory_changed", "target_removed"):
+    assert branch in documentation
+  assert "trajectory_intervention_demo.mp4" in documentation
+  assert "demo_only_removal_v1" in documentation
+  assert "procedural" in documentation.lower()
+  assert "ffprobe" in documentation
+  assert "Milestone E" in documentation
+  assert "Milestone F" in documentation
+
+
+def test_full_requirements_declares_direct_video_encoder_dependency():
+  requirements = {
+      line.strip()
+      for line in _FULL_REQUIREMENTS.read_text("utf-8").splitlines()
+      if line.strip() and not line.lstrip().startswith("#")
+  }
+
+  assert "imageio-ffmpeg" in requirements
 
 
 def test_build_demo_inputs_matches_verified_public_pair_fixture():
