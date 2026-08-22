@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Demo a velocity-based trajectory intervention that changes collision outcome."""
+"""Generate deterministic replay data for three collision-demo branches."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, BinaryIO
 
 import imageio
 import numpy as np
@@ -34,6 +35,7 @@ from interventions.twin_runner import _build_scene, _configure_physics
 _OUTPUT_DIR = Path("output/demo_collision_intervention")
 _DEMO_SEED = 0
 _NUM_STEPS = 120
+_BUNDLE_BRANCHES = ("normal", "trajectory_changed", "target_removed")
 _CANVAS_SIZE = (960, 544)
 _WORLD_BOUNDS = (-4.5, 4.5, -4.5, 4.5)
 
@@ -472,25 +474,186 @@ def _contact_pairs(
   return counts
 
 
-def _contact_steps(
-    contact_records: Sequence[Mapping[str, object] | ContactRecord],
-    object_id: str,
-) -> tuple[int, ...]:
-  steps = sorted(
-      {
-          int(_record_value(record, "step"))
-          for record in contact_records
-          if object_id in (
-              _record_value(record, "object_a"),
-              _record_value(record, "object_b"),
-          )
-      }
+def _validate_demo_bundle(result: DemoResult) -> None:
+  """Validates the fixed three-branch replay contract before any writes."""
+  if not isinstance(result, DemoResult):
+    raise TypeError("result must be a DemoResult")
+  expected_source_branches = {
+      "normal": "factual",
+      "trajectory_changed": "counterfactual",
+      "target_removed": "target_removed",
+  }
+  source_branches = {
+      "normal": result.normal,
+      "trajectory_changed": result.changed,
+      "target_removed": result.removed,
+  }
+  for role, expected_branch in expected_source_branches.items():
+    if source_branches[role].branch != expected_branch:
+      raise ValueError(
+          f"{role} branch must be {expected_branch!r}, got "
+          f"{source_branches[role].branch!r}"
+      )
+
+  scene_object_ids = tuple(
+      item.object_id for item in result.scene_config.objects
   )
-  return tuple(steps)
+  object_ids = result.normal.object_ids
+  expected_shape = (_NUM_STEPS, len(object_ids), 13)
+  expected_presence_shape = expected_shape[:2]
+  if (
+      expected_shape != (_NUM_STEPS, 4, 13)
+      or set(object_ids) != set(scene_object_ids)
+  ):
+    raise ValueError("normal object_ids must match the four demo scene objects")
+  if result.scene_config.seed != _DEMO_SEED:
+    raise ValueError("demo scene seed must be 0")
+  if result.intervention_window != (24, 96):
+    raise ValueError("demo intervention window must be (24, 96)")
+
+  for role, branch in source_branches.items():
+    if branch.object_ids != object_ids:
+      raise ValueError(f"{role} object_ids differ from scene object order")
+    if branch.steps != tuple(range(_NUM_STEPS)):
+      raise ValueError(f"{role} steps must be exactly range(120)")
+    if branch.states.shape != expected_shape:
+      raise ValueError(
+          f"{role} states must have shape {expected_shape!r}"
+      )
+  if result.removed.presence.shape != expected_presence_shape:
+    raise ValueError(
+        "target_removed presence must have shape "
+        f"{expected_presence_shape!r}"
+    )
+  if (
+      result.normal.step_rate != result.scene_config.step_rate
+      or result.changed.step_rate != result.scene_config.step_rate
+  ):
+    raise ValueError("branch step_rate differs from scene step_rate")
+
+  _validate_demo_outcomes(result.normal, result.changed, result.ground_truth)
+  _validate_removed_branch(result.removed, result.normal, result.intervention)
 
 
-def _final_position(states: np.ndarray, object_index: int) -> tuple[float, float, float]:
-  return tuple(float(value) for value in states[-1, object_index, 0:3])
+def _canonical_json_bytes(value: object) -> bytes:
+  return (
+      json.dumps(
+          value,
+          ensure_ascii=False,
+          allow_nan=False,
+          sort_keys=True,
+          separators=(",", ":"),
+      )
+      + "\n"
+  ).encode("utf-8")
+
+
+def _atomic_write(path: Path, write_payload: Callable[[BinaryIO], None]) -> None:
+  descriptor, temporary_name = tempfile.mkstemp(
+      dir=path.parent,
+      prefix=f".{path.name}.",
+      suffix=".tmp",
+  )
+  try:
+    with os.fdopen(descriptor, "wb") as handle:
+      write_payload(handle)
+      handle.flush()
+      os.fsync(handle.fileno())
+    os.replace(temporary_name, path)
+  except BaseException:
+    try:
+      os.unlink(temporary_name)
+    except FileNotFoundError:
+      pass
+    raise
+
+
+def _atomic_save_array(path: Path, value: np.ndarray) -> None:
+  def save(handle: BinaryIO) -> None:
+    np.save(handle, value, allow_pickle=False)
+
+  _atomic_write(path, save)
+
+
+def _atomic_save_json(path: Path, payload: bytes) -> None:
+  def save(handle: BinaryIO) -> None:
+    handle.write(payload)
+
+  _atomic_write(path, save)
+
+
+def _branch_contact_summary(
+    records: Sequence[Mapping[str, object] | ContactRecord],
+) -> dict[str, object]:
+  contacts = dynamic_contacts(records)
+  return {
+      "contact_pairs": _contact_pairs(contacts),
+      "contact_steps": sorted({
+          int(_record_value(record, "step")) for record in contacts
+      }),
+  }
+
+
+def write_demo_bundle(
+    output_dir: str | Path, result: DemoResult
+) -> dict[str, object]:
+  """Atomically writes the canonical three-branch replay bundle."""
+  _validate_demo_bundle(result)
+  output = Path(output_dir)
+  branches = {
+      "normal": (
+          result.normal.states,
+          np.ones(result.normal.states.shape[:2], dtype=np.bool_),
+          result.normal.contacts,
+      ),
+      "trajectory_changed": (
+          result.changed.states,
+          np.ones(result.changed.states.shape[:2], dtype=np.bool_),
+          result.changed.contacts,
+      ),
+      "target_removed": (
+          result.removed.states,
+          result.removed.presence,
+          result.removed.contacts,
+      ),
+  }
+  if tuple(branches) != _BUNDLE_BRANCHES:  # Defensive against accidental drift.
+    raise RuntimeError("canonical demo branch order changed")
+
+  contact_payload = {
+      branch_name: [record.to_dict() for record in records]
+      for branch_name, (_, _, records) in branches.items()
+  }
+  start, end = result.intervention_window
+  branch_summaries = {
+      branch_name: _branch_contact_summary(records)
+      for branch_name, (_, _, records) in branches.items()
+  }
+  branch_summaries["target_removed"].update({
+      "removed_step": int(result.removed.metadata["removed_step"]),
+      "target_id": str(result.removed.metadata["target_id"]),
+      "trust_model": str(result.removed.metadata["trust_model"]),
+  })
+  summary = {
+      "branches": branch_summaries,
+      "ground_truth": result.ground_truth.to_dict(),
+      "intervention_end": end,
+      "intervention_start": start,
+      "intervention_window": [start, end],
+      "object_ids": list(result.normal.object_ids),
+      "seed": int(result.scene_config.seed),
+      "step_rate": float(result.scene_config.step_rate),
+  }
+  contacts_bytes = _canonical_json_bytes(contact_payload)
+  summary_bytes = _canonical_json_bytes(summary)
+
+  output.mkdir(parents=True, exist_ok=True)
+  for branch_name, (states, presence, _) in branches.items():
+    _atomic_save_array(output / f"{branch_name}_states.npy", states)
+    _atomic_save_array(output / f"{branch_name}_presence.npy", presence)
+  _atomic_save_json(output / "contacts.json", contacts_bytes)
+  _atomic_save_json(output / "summary.json", summary_bytes)
+  return summary
 
 
 def _world_to_canvas(x: float, y: float) -> tuple[float, float]:
@@ -599,73 +762,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
   args = _parser().parse_args(argv)
   output = Path(args.output)
-  output.mkdir(parents=True, exist_ok=True)
-
   result = generate_demo()
-  factual = result.normal
-  counterfactual = result.changed
-  factual_contacts = dynamic_contacts(factual.contacts)
-  counterfactual_contacts = dynamic_contacts(counterfactual.contacts)
-  upper_ball = factual.object_ids.index("upper_ball")
-  lower_ball = factual.object_ids.index("lower_ball")
-
-  summary = {
-      "output": str(output),
-      "seed": _DEMO_SEED,
-      "branches": {
-          "factual": {
-              "contact_pairs": _contact_pairs(factual_contacts),
-              "contact_steps_upper_ball": _contact_steps(factual_contacts, "upper_ball"),
-              "contact_steps_lower_ball": _contact_steps(factual_contacts, "lower_ball"),
-              "final_position_upper_ball": _final_position(factual.states, upper_ball),
-              "final_position_lower_ball": _final_position(factual.states, lower_ball),
-          },
-          "counterfactual": {
-              "contact_pairs": _contact_pairs(counterfactual_contacts),
-              "contact_steps_upper_ball": _contact_steps(counterfactual_contacts, "upper_ball"),
-              "contact_steps_lower_ball": _contact_steps(counterfactual_contacts, "lower_ball"),
-              "final_position_upper_ball": _final_position(counterfactual.states, upper_ball),
-              "final_position_lower_ball": _final_position(counterfactual.states, lower_ball),
-          },
-      },
-      "comparison": {
-          "upper_ball_final_displacement": float(np.linalg.norm(
-              np.asarray(_final_position(counterfactual.states, upper_ball))
-              - np.asarray(_final_position(factual.states, upper_ball))
-          )),
-          "lower_ball_final_displacement": float(np.linalg.norm(
-              np.asarray(_final_position(counterfactual.states, lower_ball))
-              - np.asarray(_final_position(factual.states, lower_ball))
-          )),
-      },
-      "object_ids": list(factual.object_ids),
-  }
-
-  np.save(output / "factual_states.npy", factual.states)
-  np.save(output / "counterfactual_states.npy", counterfactual.states)
-  (output / "factual_contacts.jsonl").write_text(
-      "\n".join(
-          json.dumps(record.to_dict(), sort_keys=True) for record in factual.contacts
-      )
-      + "\n",
-      encoding="utf-8",
-  )
-  (output / "counterfactual_contacts.jsonl").write_text(
-      "\n".join(
-          json.dumps(record.to_dict(), sort_keys=True)
-          for record in counterfactual.contacts
-      )
-      + "\n",
-      encoding="utf-8",
-  )
-  _render_branch_video(output / "factual.mp4", factual)
-  _render_branch_video(output / "counterfactual.mp4", counterfactual)
-  (output / "summary.json").write_text(
-      json.dumps(summary, sort_keys=True, indent=2) + "\n",
-      encoding="utf-8",
-  )
-
-  print(json.dumps(summary, sort_keys=True))
+  summary = write_demo_bundle(output, result)
+  print(_canonical_json_bytes(summary).decode("utf-8"), end="")
   return 0
 
 

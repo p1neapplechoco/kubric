@@ -2,6 +2,7 @@
 
 import dataclasses
 import importlib.util
+import json
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -13,7 +14,7 @@ pytest.importorskip("pybullet")
 pytest.importorskip("imageio")
 pytest.importorskip("imageio_ffmpeg")
 
-import imageio.v3 as iio  # noqa: E402  (guarded above)
+import imageio.v2 as imageio  # noqa: E402  (guarded above)
 import numpy as np  # noqa: E402
 
 _SCRIPT_NAME = "demo_collision_intervention"
@@ -277,6 +278,182 @@ def test_generate_demo_rejects_a_corrupted_removed_prefix(
     demo.generate_demo(seed=0)
 
 
+def test_write_demo_bundle_roundtrips_all_branches(generated_demo, tmp_path):
+  demo.write_demo_bundle(tmp_path, generated_demo)
+
+  expected = {
+      "normal": (
+          generated_demo.normal.states,
+          np.ones(generated_demo.normal.states.shape[:2], dtype=np.bool_),
+          generated_demo.normal.contacts,
+      ),
+      "trajectory_changed": (
+          generated_demo.changed.states,
+          np.ones(generated_demo.changed.states.shape[:2], dtype=np.bool_),
+          generated_demo.changed.contacts,
+      ),
+      "target_removed": (
+          generated_demo.removed.states,
+          generated_demo.removed.presence,
+          generated_demo.removed.contacts,
+      ),
+  }
+  for branch_name, (expected_states, expected_presence, _) in expected.items():
+    states = np.load(
+        tmp_path / f"{branch_name}_states.npy", allow_pickle=False
+    )
+    presence = np.load(
+        tmp_path / f"{branch_name}_presence.npy", allow_pickle=False
+    )
+    assert states.shape == (120, 4, 13)
+    assert presence.shape == (120, 4)
+    assert presence.dtype == np.bool_
+    np.testing.assert_array_equal(states, expected_states)
+    np.testing.assert_array_equal(presence, expected_presence)
+
+  contacts = json.loads((tmp_path / "contacts.json").read_text("utf-8"))
+  assert contacts == {
+      branch_name: [record.to_dict() for record in records]
+      for branch_name, (_, _, records) in expected.items()
+  }
+
+
+def test_write_demo_bundle_summary_has_exact_event_metadata(
+    generated_demo, tmp_path
+):
+  demo.write_demo_bundle(tmp_path, generated_demo)
+  summary = json.loads((tmp_path / "summary.json").read_text("utf-8"))
+
+  assert set(summary) == {
+      "branches",
+      "ground_truth",
+      "intervention_end",
+      "intervention_start",
+      "intervention_window",
+      "object_ids",
+      "seed",
+      "step_rate",
+  }
+  assert summary["object_ids"] == list(generated_demo.normal.object_ids)
+  assert summary["step_rate"] == generated_demo.scene_config.step_rate == 240
+  assert summary["seed"] == 0
+  assert summary["intervention_start"] == 24
+  assert summary["intervention_end"] == 96
+  assert summary["intervention_window"] == [24, 96]
+  assert summary["ground_truth"] == generated_demo.ground_truth.to_dict()
+  assert summary["ground_truth"]["hard_affected"] == ["upper_ball"]
+  assert summary["ground_truth"]["soft_affected"] == []
+  assert set(summary["ground_truth"]) == {
+      "graph_delta",
+      "hard_affected",
+      "propagation_path",
+      "schema_version",
+      "soft_affected",
+  }
+
+  sources = {
+      "normal": generated_demo.normal.contacts,
+      "trajectory_changed": generated_demo.changed.contacts,
+      "target_removed": generated_demo.removed.contacts,
+  }
+  assert set(summary["branches"]) == set(sources)
+  for branch_name, records in sources.items():
+    dynamic = demo.dynamic_contacts(records)
+    expected_fields = {"contact_pairs", "contact_steps"}
+    if branch_name == "target_removed":
+      expected_fields.update(("removed_step", "target_id", "trust_model"))
+    assert set(summary["branches"][branch_name]) == expected_fields
+    assert summary["branches"][branch_name]["contact_steps"] == sorted(
+        {record.step for record in dynamic}
+    )
+    assert summary["branches"][branch_name]["contact_pairs"] == (
+        demo._contact_pairs(dynamic)
+    )
+
+  removal = summary["branches"]["target_removed"]
+  assert removal["removed_step"] == 24
+  assert removal["target_id"] == "target"
+  assert removal["trust_model"] == "demo_only_removal_v1"
+
+
+def test_write_demo_bundle_is_byte_identical_and_canonical(
+    generated_demo, tmp_path
+):
+  demo.write_demo_bundle(tmp_path, generated_demo)
+  first = {
+      path.name: path.read_bytes()
+      for path in sorted(tmp_path.iterdir())
+  }
+
+  assert set(first) == {
+      "contacts.json",
+      "normal_presence.npy",
+      "normal_states.npy",
+      "summary.json",
+      "target_removed_presence.npy",
+      "target_removed_states.npy",
+      "trajectory_changed_presence.npy",
+      "trajectory_changed_states.npy",
+  }
+  for filename in ("contacts.json", "summary.json"):
+    decoded = json.loads(first[filename])
+    expected = (
+        json.dumps(
+            decoded,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    assert first[filename] == expected
+
+  demo.write_demo_bundle(tmp_path, generated_demo)
+  second = {
+      path.name: path.read_bytes()
+      for path in sorted(tmp_path.iterdir())
+  }
+  assert second == first
+
+
+def test_write_demo_bundle_rejects_wrong_source_branch_before_writing(
+    generated_demo, tmp_path
+):
+  wrong_normal = dataclasses.replace(generated_demo.normal, branch="normal")
+  corrupted = dataclasses.replace(generated_demo, normal=wrong_normal)
+  output = tmp_path / "bundle"
+
+  with pytest.raises(ValueError, match="normal branch.*factual"):
+    demo.write_demo_bundle(output, corrupted)
+  assert not output.exists()
+
+
+def test_main_generates_then_writes_the_replay_bundle(
+    generated_demo, tmp_path, monkeypatch, capsys
+):
+  calls = []
+  expected_summary = {"seed": 0, "branches": {}}
+
+  def fake_generate_demo():
+    calls.append(("generate",))
+    return generated_demo
+
+  def fake_write_demo_bundle(output_dir, result):
+    calls.append(("write", output_dir, result))
+    return expected_summary
+
+  monkeypatch.setattr(demo, "generate_demo", fake_generate_demo)
+  monkeypatch.setattr(demo, "write_demo_bundle", fake_write_demo_bundle)
+
+  assert demo.main(["--output", str(tmp_path)]) == 0
+  assert calls == [
+      ("generate",),
+      ("write", tmp_path, generated_demo),
+  ]
+  assert json.loads(capsys.readouterr().out) == expected_summary
+
+
 def _contact(step, object_a, object_b):
   return {
       "step": step,
@@ -336,12 +513,18 @@ def test_render_branch_video_writes_readable_mp4(tmp_path):
 
   assert output.exists()
   assert output.stat().st_size > 0
-  metadata = iio.immeta(output)
+  reader = imageio.get_reader(output)
+  try:
+    metadata = reader.get_meta_data()
+    frame_count = reader.count_frames()
+    frames = [reader.get_data(index) for index in range(min(frame_count, 2))]
+  finally:
+    reader.close()
   assert tuple(metadata["size"]) == demo._CANVAS_SIZE
   assert metadata["fps"] == 24.0
-  frames = list(iio.imiter(output))
-  assert len(frames) == _NUM_STEPS
+  assert frame_count == _NUM_STEPS
   expected_shape = (demo._CANVAS_SIZE[1], demo._CANVAS_SIZE[0], 3)
+  assert len(frames) == 2
   assert all(frame.shape == expected_shape for frame in frames)
 
 
@@ -349,7 +532,13 @@ def test_render_branch_video_draws_impact_ring_only_on_contact_frames(tmp_path):
   output = tmp_path / "counterfactual.mp4"
   demo._render_branch_video(output, _synthetic_branch())
 
-  impact_red = int(_strong_red_mask(iio.imread(output, index=2)).sum())
-  idle_red = int(_strong_red_mask(iio.imread(output, index=0)).sum())
+  reader = imageio.get_reader(output)
+  try:
+    impact_frame = reader.get_data(2)
+    idle_frame = reader.get_data(0)
+  finally:
+    reader.close()
+  impact_red = int(_strong_red_mask(impact_frame).sum())
+  idle_red = int(_strong_red_mask(idle_frame).sum())
   assert impact_red > 100
   assert idle_red == 0
