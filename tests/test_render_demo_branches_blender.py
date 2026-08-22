@@ -280,6 +280,35 @@ def test_scene_specs_preserve_colliders_and_define_three_area_lights():
   }
 
 
+def test_create_replay_scene_aligns_step_rate_with_nondivisor_fps():
+  captured = {}
+  sentinel = object()
+
+  class FakeScene:
+    def __new__(cls, **kwargs):
+      captured.update(kwargs)
+      return sentinel
+
+  class FakeKb:
+    Scene = FakeScene
+
+  scene = render_script._create_replay_scene(
+      FakeKb,
+      resolution=(320, 180),
+      num_frames=1,
+      frame_rate=25,
+  )
+
+  assert scene is sentinel
+  assert captured == {
+      "resolution": (320, 180),
+      "frame_start": 1,
+      "frame_end": 1,
+      "frame_rate": 25,
+      "step_rate": 25,
+  }
+
+
 def test_scene_specs_define_deterministic_camera_depth_of_field():
   first = render_script._scene_specs()["camera"]
   second = render_script._scene_specs()["camera"]

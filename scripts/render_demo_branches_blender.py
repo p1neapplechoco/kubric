@@ -770,6 +770,22 @@ def _run_with_temporary_scratch(
     return operation(Path(scratch_name))
 
 
+def _create_replay_scene(
+    kb,
+    resolution: Tuple[int, int],
+    num_frames: int,
+    frame_rate: int,
+):
+  """Creates a render-only timeline with no hidden physics substeps."""
+  return kb.Scene(
+      resolution=resolution,
+      frame_start=1,
+      frame_end=num_frames,
+      frame_rate=frame_rate,
+      step_rate=frame_rate,
+  )
+
+
 def _render_animation_mp4(
     bpy,
     renderer,
@@ -855,11 +871,11 @@ def _build_and_render_branch_in_scratch(
   num_frames = len(replay.states)
   scene_specs = _scene_specs()
   material_specs = _material_specs()
-  scene = kb.Scene(
-      resolution=resolution,
-      frame_start=1,
-      frame_end=num_frames,
-      frame_rate=frame_rate,
+  scene = _create_replay_scene(
+      kb,
+      resolution,
+      num_frames,
+      frame_rate,
   )
   renderer = blender_factory(
       scene,
