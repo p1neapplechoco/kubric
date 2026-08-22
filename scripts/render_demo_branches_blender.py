@@ -11,9 +11,14 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
+import os
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
@@ -69,6 +74,15 @@ class Replay:
   states: np.ndarray
   presence: np.ndarray
   summary: Mapping[str, Any]
+
+
+def _camera_dof_spec() -> Dict[str, Any]:
+  """Returns the deterministic focus settings for the shared camera."""
+  return {
+      "use_dof": True,
+      "focus_distance": math.dist(_CAMERA_POSITION, _CAMERA_LOOK_AT),
+      "aperture_fstop": 4.0,
+  }
 
 
 def _material_specs() -> Dict[str, Dict[str, Any]]:
@@ -137,6 +151,7 @@ def _scene_specs() -> Dict[str, Any]:
           "position": _CAMERA_POSITION,
           "look_at": _CAMERA_LOOK_AT,
           "focal_length": _CAMERA_FOCAL_LENGTH,
+          "dof": _camera_dof_spec(),
       },
       "lights": (
           {
@@ -185,6 +200,14 @@ def _load_summary(states_dir: Path) -> Mapping[str, Any]:
     raise ValueError(f"{summary_path} is not valid JSON") from error
   if not isinstance(summary, dict):
     raise ValueError(f"{summary_path} must contain a JSON object")
+  expected_keys = set(_SYNCHRONIZED_SUMMARY_KEYS)
+  if set(summary) != expected_keys:
+    missing = sorted(expected_keys - set(summary))
+    unexpected = sorted(set(summary) - expected_keys)
+    raise ValueError(
+        f"{summary_path} summary keys are invalid; missing={missing!r}, "
+        f"unexpected={unexpected!r}"
+    )
   object_ids = summary.get("object_ids")
   if object_ids != list(_CANONICAL_OBJECT_IDS):
     raise ValueError(
@@ -195,6 +218,42 @@ def _load_summary(states_dir: Path) -> Mapping[str, Any]:
   if not isinstance(branches, dict) or set(branches) != set(_ALLOWED_BRANCHES):
     raise ValueError(
         f"{summary_path} branches must be exactly {list(_ALLOWED_BRANCHES)!r}"
+    )
+  if not all(isinstance(value, dict) for value in branches.values()):
+    raise TypeError(f"{summary_path} branches values must be JSON objects")
+
+  ground_truth = summary["ground_truth"]
+  if not isinstance(ground_truth, dict):
+    raise TypeError(f"{summary_path} ground_truth must be a JSON object")
+
+  seed = summary["seed"]
+  if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+    raise ValueError(f"{summary_path} seed must be a nonnegative integer")
+
+  step_rate = summary["step_rate"]
+  if (
+      isinstance(step_rate, bool)
+      or not isinstance(step_rate, (int, float))
+      or not math.isfinite(step_rate)
+      or step_rate <= 0
+  ):
+    raise ValueError(f"{summary_path} step_rate must be a positive number")
+
+  start = summary["intervention_start"]
+  end = summary["intervention_end"]
+  if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+    raise ValueError(
+        f"{summary_path} intervention_start must be a nonnegative integer"
+    )
+  if isinstance(end, bool) or not isinstance(end, int) or end <= start:
+    raise ValueError(
+        f"{summary_path} intervention_end must be an integer greater than "
+        "intervention_start"
+    )
+  window = summary["intervention_window"]
+  if window != [start, end]:
+    raise ValueError(
+        f"{summary_path} intervention_window must equal {[start, end]!r}"
     )
   return summary
 
@@ -222,6 +281,16 @@ def _load_replay(states_dir: Path, branch: str) -> Replay:
     )
   if states.shape[0] < 1:
     raise ValueError(f"{states_path} must contain at least one frame")
+  intervention_start = summary["intervention_start"]
+  intervention_end = summary["intervention_end"]
+  if (
+      intervention_start >= states.shape[0]
+      or intervention_end > states.shape[0]
+  ):
+    raise ValueError(
+        f"{states_path} intervention window must lie within its "
+        f"{states.shape[0]} replay frames"
+    )
   if states.dtype.kind not in "fiu":
     raise TypeError(f"{states_path} states must be numeric")
   if not np.isfinite(states).all():
@@ -281,6 +350,13 @@ def _validate_synchronized_replays(replays: Sequence[Replay]) -> None:
     )
   reference_metadata = _synchronized_metadata(reference)
 
+  for replay in replays:
+    intervention_start = replay.summary["intervention_start"]
+    if not replay.presence[:intervention_start].all():
+      raise ValueError(
+          f"replay {replay.branch!r} has false pre-intervention presence"
+      )
+
   for replay in replays[1:]:
     if replay.object_ids != reference.object_ids:
       raise ValueError(
@@ -302,6 +378,18 @@ def _validate_synchronized_replays(replays: Sequence[Replay]) -> None:
       raise ValueError(
           "requested branch replays are not synchronized: metadata differs "
           f"between {reference.branch!r} and {replay.branch!r}"
+      )
+    intervention_start = reference.summary["intervention_start"]
+    if not np.array_equal(
+        replay.states[:intervention_start],
+        reference.states[:intervention_start],
+    ) or not np.array_equal(
+        replay.presence[:intervention_start],
+        reference.presence[:intervention_start],
+    ):
+      raise ValueError(
+          "requested branch replays are not synchronized: common prefix "
+          f"differs between {reference.branch!r} and {replay.branch!r}"
       )
 
 
@@ -473,6 +561,16 @@ def _smooth_mesh(blender_object) -> None:
     polygon.use_smooth = True
 
 
+def _configure_camera_dof(
+    blender_camera,
+    spec: Mapping[str, Any],
+) -> None:
+  """Applies an offline-testable DOF specification to a Blender camera."""
+  blender_camera.data.dof.use_dof = spec["use_dof"]
+  blender_camera.data.dof.focus_distance = spec["focus_distance"]
+  blender_camera.data.dof.aperture_fstop = spec["aperture_fstop"]
+
+
 def _round_target(blender_object) -> None:
   if hasattr(blender_object.data, "use_auto_smooth"):
     blender_object.data.use_auto_smooth = True
@@ -588,6 +686,90 @@ def _encoder_backend(available_formats: Sequence[str]) -> str:
   return "blender" if "FFMPEG" in available_formats else "imageio"
 
 
+def _require_imageio_ffmpeg():
+  """Imports the fallback encoder before any expensive Blender work."""
+  try:
+    import imageio_ffmpeg
+  except ImportError as error:
+    raise ImportError(
+        "imageio-ffmpeg is required before rendering Blender branch videos"
+    ) from error
+  return imageio_ffmpeg
+
+
+def _verify_rendered_mp4(output: Path) -> None:
+  """Rejects missing, empty, or unreadable staged video output."""
+  output = Path(output)
+  if not output.is_file() or output.stat().st_size < 1:
+    raise RuntimeError(
+        f"newly rendered MP4 is missing or not nonempty: {output}"
+    )
+
+  ffprobe = shutil.which("ffprobe")
+  if ffprobe is not None:
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        str(output),
+    ]
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or "video" not in result.stdout.split():
+      raise RuntimeError(
+          f"ffprobe could not read a video stream from {output}: "
+          f"{result.stderr.strip()}"
+      )
+    return
+
+  imageio_ffmpeg = _require_imageio_ffmpeg()
+  command = [
+      imageio_ffmpeg.get_ffmpeg_exe(),
+      "-v",
+      "error",
+      "-i",
+      str(output),
+      "-map",
+      "0:v:0",
+      "-frames:v",
+      "1",
+      "-f",
+      "null",
+      "-",
+  ]
+  result = subprocess.run(
+      command,
+      check=False,
+      capture_output=True,
+      text=True,
+  )
+  if result.returncode != 0:
+    raise RuntimeError(
+        f"FFmpeg could not decode a video frame from {output}: "
+        f"{result.stderr.strip()}"
+    )
+
+
+def _run_with_temporary_scratch(
+    operation: Callable[[Path], Any],
+) -> Any:
+  """Runs a Blender operation with scratch storage that is always removed."""
+  with tempfile.TemporaryDirectory(
+      prefix="kubric-blender-scratch-"
+  ) as scratch_name:
+    return operation(Path(scratch_name))
+
+
 def _render_animation_mp4(
     bpy,
     renderer,
@@ -633,6 +815,38 @@ def _build_and_render_branch(
   from kubric.renderer.blender import Blender
   from kubric.safeimport.bpy import bpy
 
+  return _run_with_temporary_scratch(
+      lambda scratch_dir: _build_and_render_branch_in_scratch(
+          branch,
+          replay,
+          output,
+          resolution,
+          samples_per_pixel,
+          frame_rate,
+          save_blend,
+          scratch_dir,
+          kb,
+          Blender,
+          bpy,
+      )
+  )
+
+
+def _build_and_render_branch_in_scratch(
+    branch: str,
+    replay: Replay,
+    output: Path,
+    resolution: Tuple[int, int],
+    samples_per_pixel: int,
+    frame_rate: int,
+    save_blend: bool,
+    scratch_dir: Path,
+    kb,
+    blender_factory,
+    bpy,
+) -> Dict[str, object]:
+  """Builds one branch using explicitly scoped Blender scratch storage."""
+
   if replay.branch != branch:
     raise ValueError(
         f"branch {branch!r} does not match replay branch {replay.branch!r}"
@@ -647,8 +861,9 @@ def _build_and_render_branch(
       frame_end=num_frames,
       frame_rate=frame_rate,
   )
-  renderer = Blender(
+  renderer = blender_factory(
       scene,
+      scratch_dir=scratch_dir,
       adaptive_sampling=True,
       use_denoising=True,
       samples_per_pixel=samples_per_pixel,
@@ -747,6 +962,10 @@ def _build_and_render_branch(
       focal_length=_CAMERA_FOCAL_LENGTH,
       sensor_width=36.0,
   )
+  _configure_camera_dof(
+      scene.camera.linked_objects[renderer],
+      scene_specs["camera"]["dof"],
+  )
 
   blender_assets = {
       name: asset.linked_objects[renderer] for name, asset in assets.items()
@@ -823,6 +1042,78 @@ def _build_and_render_branch(
   }
 
 
+def _render_replays_atomically(
+    replays: Sequence[Replay],
+    states_dir: Path,
+    resolution: Tuple[int, int],
+    samples_per_pixel: int,
+    frame_rate: int,
+    save_blend: bool,
+) -> List[Dict[str, object]]:
+  """Stages every requested render before publishing any final output."""
+  states_dir = Path(states_dir)
+  results: List[Dict[str, object]] = []
+  publications: List[Tuple[Path, Path]] = []
+  with tempfile.TemporaryDirectory(
+      prefix=".blender-replays-",
+      dir=states_dir,
+  ) as staging_name:
+    staging_dir = Path(staging_name)
+    for replay in replays:
+      final_output = states_dir / _BRANCH_FILENAMES[replay.branch]
+      staged_output = staging_dir / _BRANCH_FILENAMES[replay.branch]
+      result = _build_and_render_branch(
+          replay.branch,
+          replay,
+          staged_output,
+          resolution,
+          samples_per_pixel,
+          frame_rate,
+          save_blend,
+      )
+      _verify_rendered_mp4(staged_output)
+      published_result = dict(result)
+      published_result["output"] = str(final_output)
+      results.append(published_result)
+      publications.append((staged_output, final_output))
+
+      if save_blend:
+        staged_blend = staged_output.with_suffix(".blend")
+        if not staged_blend.is_file() or staged_blend.stat().st_size < 1:
+          raise RuntimeError(
+              f"newly saved Blender scene is missing or empty: {staged_blend}"
+          )
+        publications.append(
+            (staged_blend, final_output.with_suffix(".blend"))
+        )
+
+    for staged_output, final_output in publications:
+      os.replace(staged_output, final_output)
+
+  return results
+
+
+def _positive_int(value: str) -> int:
+  try:
+    parsed = int(value)
+  except ValueError as error:
+    raise argparse.ArgumentTypeError(
+        f"expected a positive integer, got {value!r}"
+    ) from error
+  if parsed < 1:
+    raise argparse.ArgumentTypeError(
+        f"expected a positive integer, got {value!r}"
+    )
+  return parsed
+
+
+class _UniqueBranchesAction(argparse.Action):
+  def __call__(self, parser, namespace, values, option_string=None):
+    if len(values) != len(set(values)):
+      parser.error("--branches must not contain duplicates")
+    setattr(namespace, self.dest, values)
+
+
 def _parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(allow_abbrev=False)
   parser.add_argument("--states-dir", default=str(_DEFAULT_STATES_DIR))
@@ -831,13 +1122,16 @@ def _parser() -> argparse.ArgumentParser:
       nargs="+",
       choices=_ALLOWED_BRANCHES,
       default=list(_ALLOWED_BRANCHES),
+      action=_UniqueBranchesAction,
   )
-  parser.add_argument("--resolution", nargs=2, type=int, default=[640, 540])
-  parser.add_argument("--fps", type=int, default=_FRAME_RATE)
-  parser.add_argument("--samples", type=int, default=64)
+  parser.add_argument(
+      "--resolution", nargs=2, type=_positive_int, default=[640, 540]
+  )
+  parser.add_argument("--fps", type=_positive_int, default=_FRAME_RATE)
+  parser.add_argument("--samples", type=_positive_int, default=64)
   parser.add_argument(
       "--max-frames",
-      type=int,
+      type=_positive_int,
       default=None,
       help="render only the first N steps (smoke tests)",
   )
@@ -861,20 +1155,16 @@ def main(argv: Sequence[str] | None = None) -> int:
       args.branches,
       args.max_frames,
   )
-  results: List[Dict[str, object]] = []
-  for replay in replays:
-    branch = replay.branch
-    output = states_dir / _BRANCH_FILENAMES[branch]
-    result = _build_and_render_branch(
-        branch,
-        replay,
-        output,
-        resolution,
-        args.samples,
-        args.fps,
-        args.save_blend,
-    )
-    results.append(result)
+  _require_imageio_ffmpeg()
+  results = _render_replays_atomically(
+      replays,
+      states_dir,
+      resolution,
+      args.samples,
+      args.fps,
+      args.save_blend,
+  )
+  for result in results:
     print(json.dumps(result, sort_keys=True), flush=True)
 
   print(json.dumps({"renders": results}, sort_keys=True))
