@@ -310,13 +310,16 @@ def _preflight_replays(
     branches: Sequence[str],
     max_frames: int | None,
 ) -> Tuple[Replay, ...]:
-  """Loads and prepares every requested replay before any rendering begins."""
-  replays = tuple(
-      _prepare_replay(_load_replay(states_dir, branch), max_frames)
-      for branch in branches
+  """Validates full source timelines before consistently limiting them."""
+  source_replays = tuple(
+      _load_replay(states_dir, branch) for branch in branches
   )
-  _validate_synchronized_replays(replays)
-  return replays
+  _validate_synchronized_replays(source_replays)
+  prepared_replays = tuple(
+      _prepare_replay(replay, max_frames) for replay in source_replays
+  )
+  _validate_synchronized_replays(prepared_replays)
+  return prepared_replays
 
 
 def _visibility_transitions(

@@ -307,7 +307,9 @@ def test_main_preflights_synchronized_frame_counts_before_rendering(
   assert not (tmp_path / "trajectory_changed_blender.mp4").exists()
 
 
-def test_main_applies_max_frames_before_synchronization(tmp_path, monkeypatch):
+def test_main_rejects_source_length_mismatch_before_max_frames(
+    tmp_path, monkeypatch
+):
   _write_bundle(
       tmp_path,
       branch="normal",
@@ -322,6 +324,38 @@ def test_main_applies_max_frames_before_synchronization(tmp_path, monkeypatch):
 
   def fake_render(branch, replay, output, *args):
     rendered.append((branch, len(replay.states)))
+    output.write_text("rendered too early", encoding="utf-8")
+    return {"branch": branch, "output": str(output)}
+
+  monkeypatch.setattr(render_script, "_build_and_render_branch", fake_render)
+
+  with pytest.raises(ValueError, match="synchronized|frame count"):
+    render_script.main([
+        "--states-dir",
+        str(tmp_path),
+        "--branches",
+        "normal",
+        "trajectory_changed",
+        "--max-frames",
+        "4",
+    ])
+
+  assert rendered == []
+  assert not (tmp_path / "normal_blender.mp4").exists()
+  assert not (tmp_path / "trajectory_changed_blender.mp4").exists()
+
+
+def test_main_slices_synchronized_sources_after_preflight(tmp_path, monkeypatch):
+  for branch in ("normal", "trajectory_changed"):
+    _write_bundle(
+        tmp_path,
+        branch=branch,
+        states=_synthetic_states(num_steps=5),
+    )
+  rendered = []
+
+  def fake_render(branch, replay, output, *args):
+    rendered.append((branch, len(replay.states), replay.steps))
     return {"branch": branch, "output": str(output)}
 
   monkeypatch.setattr(render_script, "_build_and_render_branch", fake_render)
@@ -335,7 +369,10 @@ def test_main_applies_max_frames_before_synchronization(tmp_path, monkeypatch):
       "--max-frames",
       "4",
   ]) == 0
-  assert rendered == [("normal", 4), ("trajectory_changed", 4)]
+  assert rendered == [
+      ("normal", 4, tuple(range(4))),
+      ("trajectory_changed", 4, tuple(range(4))),
+  ]
 
 
 def test_main_allows_a_single_requested_branch(tmp_path, monkeypatch):
