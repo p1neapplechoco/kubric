@@ -1,5 +1,6 @@
 """Tests for the ffmpeg-only intervention comparison compositor."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -92,6 +93,9 @@ def _write_summary(directory, *, frame_count=120):
   if frame_count < 50:
     payload["branches"]["trajectory_changed"]["contact_steps"] = [2, 3]
     payload["branches"]["target_removed"]["removed_step"] = 1
+    graph_event = payload["ground_truth"]["graph_delta"]["added"][0]
+    graph_event["start_step"] = 2
+    graph_event["end_step"] = 4
   (directory / "summary.json").write_text(
       json.dumps(payload), encoding="utf-8"
   )
@@ -107,6 +111,13 @@ def _font(tmp_path):
   path = tmp_path / "Test Font.ttf"
   path.write_bytes(b"font")
   return path
+
+
+def _cfr_frames(frame_count, *, ticks_per_frame=512):
+  return [
+      {"best_effort_timestamp": index * ticks_per_frame}
+      for index in range(frame_count)
+  ]
 
 
 def test_compositor_script_exists():
@@ -217,6 +228,69 @@ def test_contact_cue_prefers_changed_contact_peer_among_hard_affected(
   )
 
 
+def _summary_with_earlier_unrelated_contact():
+  summary = _summary()
+  summary["branches"]["trajectory_changed"]["contact_pairs"] = {
+      "lower_ball|upper_ball": 1,
+      "target|upper_ball": 2,
+  }
+  summary["branches"]["trajectory_changed"]["contact_steps"] = [12, 48, 49]
+  summary["ground_truth"]["graph_delta"]["added"].insert(0, {
+      "object_a": "lower_ball",
+      "object_b": "upper_ball",
+      "start_step": 12,
+      "end_step": 13,
+  })
+  return summary
+
+
+def test_contact_cue_time_and_peer_come_from_same_graph_event(
+    compositor, tmp_path
+):
+  summary = _summary_with_earlier_unrelated_contact()
+  overlay_files = compositor._write_overlay_textfiles(
+      tmp_path,
+      summary,
+      source_duration=5.0,
+      source_fps=24.0,
+  )
+  filter_graph = compositor._build_filter(
+      summary,
+      _font(tmp_path),
+      source_duration=5.0,
+      source_fps=24.0,
+      overlay_files=overlay_files,
+  )
+
+  assert overlay_files["contact"].read_text("utf-8") == (
+      "CONTACT → UPPER BALL 3.000s"
+  )
+  assert "enable='between(t,3.000000,3.750000)'" in filter_graph
+  assert "enable='between(t,1.500000,2.250000)'" not in filter_graph
+
+
+def test_event_bounds_validate_the_selected_graph_contact(compositor):
+  summary = _summary_with_earlier_unrelated_contact()
+  summary["intervention_end"] = 30
+  summary["intervention_window"] = [24, 30]
+
+  with pytest.raises(ValueError, match="contact|graph"):
+    compositor._validate_event_steps(summary, frame_count=40)
+
+
+def test_load_summary_rejects_graph_contact_step_mismatch(
+    compositor, tmp_path
+):
+  summary = _summary_with_earlier_unrelated_contact()
+  summary["ground_truth"]["graph_delta"]["added"][1]["start_step"] = 47
+  (tmp_path / "summary.json").write_text(
+      json.dumps(summary), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="graph|contact|step"):
+    compositor._load_summary(tmp_path)
+
+
 def _render_textfile_frame(compositor, ffmpeg, font, textfile):
   drawtext = compositor._drawtext(
       font,
@@ -302,8 +376,9 @@ def test_full_filter_escapes_summary_metacharacters(compositor, tmp_path):
     pytest.skip("ffmpeg is required for filter parser coverage")
   summary = _summary()
   affected = "target's 100% [path]: a,b\\c"
-  summary["ground_truth"]["hard_affected"] = [affected]
+  summary["ground_truth"]["hard_affected"] = ["upper_ball", affected]
   summary["ground_truth"]["propagation_path"] = {
+      "upper_ball": ["target", "upper_ball"],
       affected: ["target", affected]
   }
   overlay_dir = tmp_path / "special-overlays"
@@ -357,6 +432,7 @@ def test_probe_video_parses_positive_stream_metadata(
   video = tmp_path / "input.mp4"
   video.write_bytes(b"video")
   payload = {
+      "frames": _cfr_frames(120),
       "streams": [{
           "codec_name": "h264",
           "width": 640,
@@ -364,6 +440,7 @@ def test_probe_video_parses_positive_stream_metadata(
           "pix_fmt": "yuv420p",
           "avg_frame_rate": "24/1",
           "r_frame_rate": "24/1",
+          "time_base": "1/12288",
           "nb_frames": "120",
           "duration": "5.000000",
       }],
@@ -390,6 +467,7 @@ def test_probe_video_parses_positive_stream_metadata(
   assert info.codec_name == "h264"
   assert info.pix_fmt == "yuv420p"
   assert calls[0][0][0] == "/tools/ffprobe"
+  assert "-show_frames" in calls[0][0]
   assert calls[0][1]["check"] is True
 
 
@@ -399,6 +477,7 @@ def test_probe_video_prefers_counted_frames_over_declared_frames(
   video = tmp_path / "input.mp4"
   video.write_bytes(b"video")
   payload = {
+      "frames": _cfr_frames(119),
       "streams": [{
           "codec_name": "h264",
           "width": 640,
@@ -406,6 +485,7 @@ def test_probe_video_prefers_counted_frames_over_declared_frames(
           "pix_fmt": "yuv420p",
           "avg_frame_rate": "24/1",
           "r_frame_rate": "24/1",
+          "time_base": "1/12288",
           "nb_frames": "120",
           "nb_read_frames": "119",
           "duration": "5.0",
@@ -423,6 +503,107 @@ def test_probe_video_prefers_counted_frames_over_declared_frames(
   info = compositor._probe_video(video, ffprobe="/tools/ffprobe")
 
   assert info.frame_count == 119
+
+
+def test_probe_video_rejects_vfr_like_rate_metadata(
+    compositor, tmp_path, monkeypatch
+):
+  video = tmp_path / "input.mp4"
+  video.write_bytes(b"video")
+  payload = {
+      "streams": [{
+          "codec_name": "h264",
+          "width": 640,
+          "height": 540,
+          "pix_fmt": "yuv420p",
+          "avg_frame_rate": "24/1",
+          "r_frame_rate": "30/1",
+          "nb_frames": "120",
+          "duration": "5.0",
+      }],
+      "format": {"duration": "5.0"},
+  }
+  monkeypatch.setattr(
+      subprocess,
+      "run",
+      lambda command, **kwargs: subprocess.CompletedProcess(
+          command, 0, stdout=json.dumps(payload), stderr=""
+      ),
+  )
+
+  with pytest.raises(ValueError, match="CFR|frame rate|r_frame_rate|VFR"):
+    compositor._probe_video(video, ffprobe="/tools/ffprobe")
+
+
+def test_probe_video_rejects_irregular_pts_when_aggregate_rates_equal(
+    compositor, tmp_path, monkeypatch
+):
+  video = tmp_path / "input.mp4"
+  video.write_bytes(b"video")
+  frames = _cfr_frames(6)
+  frames[3]["best_effort_timestamp"] += 128
+  payload = {
+      "frames": frames,
+      "streams": [{
+          "codec_name": "h264",
+          "width": 640,
+          "height": 540,
+          "pix_fmt": "yuv420p",
+          "avg_frame_rate": "24/1",
+          "r_frame_rate": "24/1",
+          "time_base": "1/12288",
+          "nb_frames": "6",
+          "nb_read_frames": "6",
+          "duration": "0.25",
+      }],
+      "format": {"duration": "0.25"},
+  }
+  monkeypatch.setattr(
+      subprocess,
+      "run",
+      lambda command, **kwargs: subprocess.CompletedProcess(
+          command, 0, stdout=json.dumps(payload), stderr=""
+      ),
+  )
+
+  with pytest.raises(ValueError, match="CFR|timestamp|PTS|lattice"):
+    compositor._probe_video(video, ffprobe="/tools/ffprobe")
+
+
+def test_probe_video_rejects_time_base_too_coarse_for_24fps_lattice(
+    compositor, tmp_path, monkeypatch
+):
+  video = tmp_path / "input.mp4"
+  video.write_bytes(b"video")
+  payload = {
+      "frames": [
+          {"best_effort_timestamp": timestamp}
+          for timestamp in (0, 0, 1, 1)
+      ],
+      "streams": [{
+          "codec_name": "h264",
+          "width": 640,
+          "height": 540,
+          "pix_fmt": "yuv420p",
+          "avg_frame_rate": "24/1",
+          "r_frame_rate": "24/1",
+          "time_base": "1/12",
+          "nb_frames": "4",
+          "nb_read_frames": "4",
+          "duration": "0.166667",
+      }],
+      "format": {"duration": "0.166667"},
+  }
+  monkeypatch.setattr(
+      subprocess,
+      "run",
+      lambda command, **kwargs: subprocess.CompletedProcess(
+          command, 0, stdout=json.dumps(payload), stderr=""
+      ),
+  )
+
+  with pytest.raises(ValueError, match="time base|CFR|timestamp|lattice"):
+    compositor._probe_video(video, ffprobe="/tools/ffprobe")
 
 
 @pytest.mark.parametrize(
@@ -447,11 +628,16 @@ def test_probe_video_rejects_nonpositive_or_nonfinite_metadata(
       "pix_fmt": "yuv420p",
       "avg_frame_rate": "24/1",
       "r_frame_rate": "24/1",
+      "time_base": "1/12288",
       "nb_frames": "120",
       "duration": "5.0",
   }
   stream[field] = value
-  payload = {"streams": [stream], "format": {"duration": "5.0"}}
+  payload = {
+      "frames": _cfr_frames(120),
+      "streams": [stream],
+      "format": {"duration": "5.0"},
+  }
   monkeypatch.setattr(
       subprocess,
       "run",
@@ -601,6 +787,43 @@ def test_source_fps_compares_normalized_fractions_exactly(
     _validate_fake_infos(compositor, monkeypatch, mismatched)
 
 
+def test_sources_must_match_renderer_contract_of_exactly_24_fps(
+    compositor, monkeypatch
+):
+  infos = _synchronized_infos(
+      compositor,
+      rates=(Fraction(23, 1),) * 3,
+  )
+
+  with pytest.raises(ValueError, match="24|renderer|frame rate|fps"):
+    _validate_fake_infos(compositor, monkeypatch, infos)
+
+
+def test_composed_timing_uses_source_frame_count_not_float_duration(
+    compositor
+):
+  source = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=120,
+      duration=5.021,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+  composed = compositor.VideoInfo(
+      width=1920,
+      height=720,
+      fps=Fraction(24, 1),
+      frame_count=192,
+      duration=8.0,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+
+  compositor._validate_composed_video(composed, source)
+
+
 def test_source_duration_rejects_difference_above_one_microsecond(
     compositor, monkeypatch
 ):
@@ -681,6 +904,57 @@ def test_load_summary_reports_missing_and_invalid_json(compositor, tmp_path):
     compositor._load_summary(tmp_path)
 
 
+def test_compose_quantizes_overlay_duration_from_source_frame_count(
+    compositor, tmp_path, monkeypatch
+):
+  _write_summary(tmp_path)
+  _touch_sources(tmp_path)
+  font = _font(tmp_path)
+  output = tmp_path / "comparison.mp4"
+  source_info = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=120,
+      duration=5.021,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+  composed_info = compositor.VideoInfo(
+      width=1920,
+      height=720,
+      fps=Fraction(24, 1),
+      frame_count=192,
+      duration=8.0,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+
+  def fake_probe(path, ffprobe=None):
+    return composed_info if Path(path).name.endswith(".tmp.mp4") else source_info
+
+  def inspect_encode(command):
+    filter_graph = command[command.index("-filter_complex") + 1]
+    textfiles = [Path(value) for value in re.findall(
+        r"textfile=([^:]+):reload=0", filter_graph
+    )]
+    assert any(path.read_text("utf-8") == "8.000s" for path in textfiles)
+    Path(command[-1]).write_bytes(b"encoded")
+
+  monkeypatch.setattr(compositor, "_probe_video", fake_probe)
+  monkeypatch.setattr(
+      compositor.shutil,
+      "which",
+      lambda name: f"/tools/{name}",
+  )
+  monkeypatch.setattr(compositor, "_run_ffmpeg", inspect_encode)
+
+  metadata = compositor.compose_intervention_demo(tmp_path, output, font)
+
+  assert metadata["frame_count"] == 192
+  assert output.read_bytes() == b"encoded"
+
+
 def test_failed_encode_preserves_existing_output_and_removes_staging(
     compositor, tmp_path, monkeypatch
 ):
@@ -741,6 +1015,28 @@ def test_failed_encode_preserves_existing_output_and_removes_staging(
   ]
 
 
+def test_ffmpeg_has_bounded_timeout_and_reports_timeout_cleanly(
+    compositor, monkeypatch
+):
+  observed = {}
+
+  def time_out(command, **kwargs):
+    observed.update(kwargs)
+    raise subprocess.TimeoutExpired(
+        command, kwargs.get("timeout"), stderr="synthetic hang"
+    )
+
+  monkeypatch.setattr(subprocess, "run", time_out)
+
+  with pytest.raises(RuntimeError, match="ffmpeg.*timed out|timed out.*ffmpeg"):
+    compositor._run_ffmpeg(["/tools/ffmpeg", "-version"])
+
+  assert 0 < observed["timeout"] <= 3600
+  assert observed["check"] is True
+  assert observed["capture_output"] is True
+  assert observed["text"] is True
+
+
 def test_input_and_output_symlinks_are_rejected(
     compositor, tmp_path, monkeypatch
 ):
@@ -770,6 +1066,185 @@ def test_input_and_output_symlinks_are_rejected(
   with pytest.raises(ValueError, match="symlink"):
     compositor.compose_intervention_demo(tmp_path, output, font)
   assert target.read_bytes() == b"old"
+
+
+def test_states_dir_rejects_symlink_ancestor_before_ffmpeg(
+    compositor, tmp_path, monkeypatch
+):
+  if not hasattr(os, "symlink"):
+    pytest.skip("symlinks are unavailable")
+  real_root = tmp_path / "real"
+  states = real_root / "states"
+  states.mkdir(parents=True)
+  _write_summary(states)
+  _touch_sources(states)
+  font = _font(tmp_path)
+  alias = tmp_path / "alias"
+  alias.symlink_to(real_root, target_is_directory=True)
+  info = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=120,
+      duration=5.0,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+  monkeypatch.setattr(compositor, "_probe_video", lambda *args, **kwargs: info)
+  monkeypatch.setattr(
+      compositor.shutil,
+      "which",
+      lambda name: f"/tools/{name}",
+  )
+  monkeypatch.setattr(
+      compositor,
+      "_run_ffmpeg",
+      lambda command: pytest.fail("ffmpeg ran through a symlink ancestor"),
+  )
+
+  with pytest.raises(ValueError, match="symlink"):
+    compositor.compose_intervention_demo(alias / "states", font=font)
+
+
+def test_output_rejects_symlink_ancestor_canonical_source_alias_before_ffmpeg(
+    compositor, tmp_path, monkeypatch
+):
+  if not hasattr(os, "symlink"):
+    pytest.skip("symlinks are unavailable")
+  _write_summary(tmp_path)
+  _touch_sources(tmp_path)
+  (tmp_path / "nested").mkdir()
+  font = _font(tmp_path)
+  alias = tmp_path.parent / f"{tmp_path.name}-alias"
+  alias.symlink_to(tmp_path, target_is_directory=True)
+  output = alias / "nested" / ".." / "normal_blender.mp4"
+  source = tmp_path / "normal_blender.mp4"
+  source_bytes = source.read_bytes()
+  info = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=120,
+      duration=5.0,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+  monkeypatch.setattr(compositor, "_probe_video", lambda *args, **kwargs: info)
+  monkeypatch.setattr(
+      compositor.shutil,
+      "which",
+      lambda name: f"/tools/{name}",
+  )
+  monkeypatch.setattr(
+      compositor,
+      "_run_ffmpeg",
+      lambda command: pytest.fail("ffmpeg ran for a canonical source alias"),
+  )
+
+  try:
+    with pytest.raises(ValueError, match="symlink|source|overwrite|alias"):
+      compositor.compose_intervention_demo(tmp_path, output, font)
+  finally:
+    alias.unlink(missing_ok=True)
+
+  assert source.read_bytes() == source_bytes
+
+
+def test_output_rejects_source_hardlink_before_ffmpeg(
+    compositor, tmp_path, monkeypatch
+):
+  if not hasattr(os, "link"):
+    pytest.skip("hard links are unavailable")
+  _write_summary(tmp_path)
+  _touch_sources(tmp_path)
+  font = _font(tmp_path)
+  source = tmp_path / "normal_blender.mp4"
+  source_bytes = source.read_bytes()
+  output = tmp_path / "hardlink-output.mp4"
+  os.link(source, output)
+  info = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=120,
+      duration=5.0,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+  monkeypatch.setattr(compositor, "_probe_video", lambda *args, **kwargs: info)
+  monkeypatch.setattr(
+      compositor.shutil,
+      "which",
+      lambda name: f"/tools/{name}",
+  )
+  monkeypatch.setattr(
+      compositor,
+      "_run_ffmpeg",
+      lambda command: pytest.fail("ffmpeg ran for a source hardlink"),
+  )
+
+  with pytest.raises(ValueError, match="source|overwrite|same file|hardlink"):
+    compositor.compose_intervention_demo(tmp_path, output, font)
+
+  assert source.read_bytes() == source_bytes
+
+
+def test_output_is_revalidated_before_publish_and_preserves_source_hash(
+    compositor, tmp_path, monkeypatch
+):
+  if not hasattr(os, "link"):
+    pytest.skip("hard links are unavailable")
+  _write_summary(tmp_path)
+  _touch_sources(tmp_path)
+  font = _font(tmp_path)
+  source = tmp_path / "normal_blender.mp4"
+  source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+  output = tmp_path / "late-hardlink-output.mp4"
+  info = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=120,
+      duration=5.0,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+  composed_info = compositor.VideoInfo(
+      width=1920,
+      height=720,
+      fps=Fraction(24, 1),
+      frame_count=192,
+      duration=8.0,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+
+  def fake_probe(path, ffprobe=None):
+    if Path(path).name in {
+        "normal_blender.mp4",
+        "trajectory_changed_blender.mp4",
+        "target_removed_blender.mp4",
+    }:
+      return info
+    return composed_info
+
+  monkeypatch.setattr(compositor, "_probe_video", fake_probe)
+  monkeypatch.setattr(
+      compositor.shutil,
+      "which",
+      lambda name: f"/tools/{name}",
+  )
+
+  def create_late_alias(command):
+    Path(command[-1]).write_bytes(b"encoded staging video")
+    os.link(source, output)
+
+  monkeypatch.setattr(compositor, "_run_ffmpeg", create_late_alias)
+
+  with pytest.raises(ValueError, match="source|overwrite|same file|hardlink"):
+    compositor.compose_intervention_demo(tmp_path, output, font)
+
+  assert hashlib.sha256(source.read_bytes()).hexdigest() == source_hash
 
 
 def _make_synthetic_video(ffmpeg, path, color):

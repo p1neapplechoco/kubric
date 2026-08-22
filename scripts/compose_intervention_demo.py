@@ -7,6 +7,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -65,6 +66,7 @@ _OUTPUT_FPS = Fraction(24, 1)
 _START_HOLD = 1.0
 _END_HOLD = 2.0
 _SOURCE_DURATION_TOLERANCE = 1e-6
+_FFMPEG_TIMEOUT_SECONDS = 600
 _SCHEMA_VERSION = "1.0"
 _REMOVAL_TRUST_MODEL = "demo_only_removal_v1"
 
@@ -240,12 +242,32 @@ def _validate_ground_truth(value: Any) -> dict[str, Any]:
 
 
 def _require_regular_input(path: Path, name: str) -> None:
-  if path.is_symlink():
-    raise ValueError(f"{name} must not be a symlink: {path}")
+  _reject_symlink_components(path, name)
   if not path.exists():
     raise FileNotFoundError(f"missing {name}: {path}")
   if not path.is_file():
     raise ValueError(f"{name} must be a regular file: {path}")
+
+
+def _reject_symlink_components(path: str | Path, name: str) -> None:
+  """Reject every existing symlink traversed by a lexical path."""
+  candidate = Path(path)
+  if not candidate.is_absolute():
+    candidate = Path.cwd() / candidate
+  current = Path(candidate.anchor)
+  for component in candidate.parts[1:]:
+    if component in ("", "."):
+      continue
+    if component == "..":
+      current = current.parent
+      continue
+    current = current / component
+    try:
+      mode = current.lstat().st_mode
+    except FileNotFoundError:
+      continue
+    if stat.S_ISLNK(mode):
+      raise ValueError(f"{name} must not traverse a symlink: {current}")
 
 
 def _load_summary(states_dir: str | Path) -> dict[str, Any]:
@@ -299,6 +321,7 @@ def _load_summary(states_dir: str | Path) -> dict[str, Any]:
   if removed["target_id"] not in object_ids:
     raise ValueError("branches.target_removed.target_id must name an object_id")
   _validate_ground_truth(summary["ground_truth"])
+  _contact_cue_event(summary)
   return summary
 
 
@@ -350,10 +373,12 @@ def _probe_video(path: str | Path, ffprobe: str | None = None) -> VideoInfo:
       "-count_frames",
       "-select_streams",
       "v:0",
+      "-show_frames",
       "-show_entries",
       (
           "stream=codec_name,width,height,pix_fmt,avg_frame_rate,"
-          "r_frame_rate,nb_frames,nb_read_frames,duration:format=duration"
+          "r_frame_rate,time_base,nb_frames,nb_read_frames,duration:"
+          "frame=best_effort_timestamp:format=duration"
       ),
       "-of",
       "json",
@@ -386,10 +411,44 @@ def _probe_video(path: str | Path, ffprobe: str | None = None) -> VideoInfo:
   width = _positive_int(stream.get("width"), "width")
   height = _positive_int(stream.get("height"), "height")
   fps = _positive_fps(stream.get("avg_frame_rate"))
+  nominal_fps = _positive_fps(stream.get("r_frame_rate"))
+  if nominal_fps != fps:
+    raise ValueError(
+        f"video must be CFR; avg_frame_rate={fps}, "
+        f"r_frame_rate={nominal_fps}"
+    )
   frame_value = stream.get("nb_read_frames")
   if frame_value in (None, "N/A"):
     frame_value = stream.get("nb_frames")
   frame_count = _positive_int(frame_value, "frame count")
+  time_base = _positive_fps(stream.get("time_base"))
+  frame_period = Fraction(1, 1) / fps
+  if time_base > frame_period:
+    raise ValueError(
+        f"video time base {time_base} is too coarse for CFR {fps}"
+    )
+  frames = payload.get("frames")
+  if not isinstance(frames, list) or len(frames) != frame_count:
+    raise ValueError(
+        f"video frame timestamps must contain {frame_count} entries"
+    )
+  # An integer PTS can round a desired presentation time by at most half of
+  # one stream time-base tick.  Rational arithmetic avoids float drift here.
+  timestamp_tolerance = time_base / 2
+  for index, frame in enumerate(frames):
+    if not isinstance(frame, dict):
+      raise ValueError(f"video frame timestamp {index} is malformed")
+    timestamp = _require_integer(
+        frame.get("best_effort_timestamp"),
+        f"video frame timestamp {index}",
+    )
+    actual_time = timestamp * time_base
+    expected_time = index * frame_period
+    if abs(actual_time - expected_time) > timestamp_tolerance:
+      raise ValueError(
+          "video must be CFR on a contiguous timestamp lattice; "
+          f"frame {index} has PTS {actual_time}, expected {expected_time}"
+      )
   duration_value = stream.get("duration")
   if duration_value in (None, "N/A"):
     format_info = payload.get("format")
@@ -511,25 +570,37 @@ def _summary_overlay_lines(summary: Mapping[str, Any]) -> tuple[str, str, str]:
   return graph_line, affected_line, f"PROPAGATION {propagation}"
 
 
-def _contact_cue_object(summary: Mapping[str, Any]) -> str:
+def _contact_cue_event(summary: Mapping[str, Any]) -> tuple[str, int]:
+  """Return one peer and step bound by the same validated graph event."""
   hard_affected = set(summary["ground_truth"]["hard_affected"])
   changed_pairs = summary["branches"]["trajectory_changed"]["contact_pairs"]
+  changed_steps = set(
+      summary["branches"]["trajectory_changed"]["contact_steps"]
+  )
   target = summary["branches"]["target_removed"]["target_id"]
-  contact_peers = []
-  for pair in sorted(changed_pairs):
-    endpoints = pair.split("|")
-    if len(endpoints) == 2 and target in endpoints:
-      contact_peers.append(
-          endpoints[1] if endpoints[0] == target else endpoints[0]
-      )
-  affected_peers = sorted(hard_affected.intersection(contact_peers))
-  if affected_peers:
-    return affected_peers[0]
-  if hard_affected:
-    return min(hard_affected)
-  if contact_peers:
-    return min(contact_peers)
-  raise ValueError("summary cannot identify the changed contact peer")
+  candidates = []
+  graph_delta = summary["ground_truth"]["graph_delta"]
+  for bucket in ("added", "changed"):
+    for record in graph_delta[bucket]:
+      endpoints = (record["object_a"], record["object_b"])
+      if target not in endpoints:
+        continue
+      peer = endpoints[1] if endpoints[0] == target else endpoints[0]
+      pair_key = "|".join(sorted(endpoints))
+      step = record["start_step"]
+      if (
+          peer in hard_affected
+          and pair_key in changed_pairs
+          and step in changed_steps
+      ):
+        candidates.append((step, peer))
+  if not candidates:
+    raise ValueError(
+        "summary graph_delta must identify a target-to-hard-affected "
+        "contact pair at one trajectory_changed contact step"
+    )
+  step, peer = min(candidates)
+  return peer, step
 
 
 def _overlay_texts(
@@ -540,13 +611,11 @@ def _overlay_texts(
 ) -> dict[str, str]:
   total_duration = source_duration + _START_HOLD + _END_HOLD
   intervention_time = _event_time(summary["intervention_start"], source_fps)
-  contact_step = summary["branches"]["trajectory_changed"][
-      "contact_steps"
-  ][0]
+  contact_object, contact_step = _contact_cue_event(summary)
   contact_time = _event_time(contact_step, source_fps)
   removal_step = summary["branches"]["target_removed"]["removed_step"]
   removal_time = _event_time(removal_step, source_fps)
-  contact_object = _contact_cue_object(summary).replace("_", " ").upper()
+  contact_object = contact_object.replace("_", " ").upper()
   graph_line, affected_line, propagation_line = _summary_overlay_lines(summary)
   return {
       "intervention": f"INTERVENTION {intervention_time:.3f}s",
@@ -612,9 +681,7 @@ def _build_filter(
   intervention_time = _event_time(
       summary["intervention_start"], source_fps
   )
-  contact_step = summary["branches"]["trajectory_changed"][
-      "contact_steps"
-  ][0]
+  _, contact_step = _contact_cue_event(summary)
   contact_time = _event_time(contact_step, source_fps)
   removal_step = summary["branches"]["target_removed"]["removed_step"]
   removal_time = _event_time(removal_step, source_fps)
@@ -717,8 +784,7 @@ def _find_tool(name: str) -> str:
 
 
 def _source_paths(states_dir: Path) -> dict[str, Path]:
-  if states_dir.is_symlink():
-    raise ValueError(f"states directory must not be a symlink: {states_dir}")
+  _reject_symlink_components(states_dir, "states directory")
   if not states_dir.is_dir():
     raise FileNotFoundError(f"states directory does not exist: {states_dir}")
   result = {
@@ -755,6 +821,11 @@ def _validate_synchronized_sources(
       raise ValueError(
           f"source video {branch} codec must be H264; got {info.codec_name!r}"
       )
+    if _normalized_fps(info.fps) != _OUTPUT_FPS:
+      raise ValueError(
+          f"source video {branch} must match the renderer frame rate of "
+          f"24 fps; got {info.fps!r}"
+      )
   for branch, info in infos.items():
     if branch == reference_name:
       continue
@@ -785,12 +856,11 @@ def _validate_synchronized_sources(
 
 
 def _validate_event_steps(summary: Mapping[str, Any], frame_count: int) -> None:
+  _, contact_step = _contact_cue_event(summary)
   named_steps = {
       "intervention_start": summary["intervention_start"],
       "intervention_end": summary["intervention_end"],
-      "first changed contact": summary["branches"]["trajectory_changed"][
-          "contact_steps"
-      ][0],
+      "selected graph contact": contact_step,
       "removed_step": summary["branches"]["target_removed"]["removed_step"],
   }
   for name, step in named_steps.items():
@@ -808,17 +878,33 @@ def _run_ffmpeg(command: Sequence[str]) -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=_FFMPEG_TIMEOUT_SECONDS,
     )
+  except subprocess.TimeoutExpired as error:
+    detail = error.stderr or ""
+    if isinstance(detail, bytes):
+      detail = detail.decode("utf-8", errors="replace")
+    suffix = f": {detail.strip()}" if detail.strip() else ""
+    raise RuntimeError(
+        "ffmpeg composition timed out after "
+        f"{_FFMPEG_TIMEOUT_SECONDS} seconds{suffix}"
+    ) from error
   except (OSError, subprocess.CalledProcessError) as error:
     detail = getattr(error, "stderr", "") or str(error)
+    if isinstance(detail, bytes):
+      detail = detail.decode("utf-8", errors="replace")
     raise RuntimeError(f"ffmpeg composition failed: {detail.strip()}") from error
 
 
 def _validate_composed_video(
     info: VideoInfo, source: VideoInfo
 ) -> None:
-  expected_duration = source.duration + _START_HOLD + _END_HOLD
-  expected_frames = round(expected_duration * _OUTPUT_FPS)
+  hold_frames = int(
+      (Fraction(str(_START_HOLD)) + Fraction(str(_END_HOLD)))
+      * _OUTPUT_FPS
+  )
+  expected_frames = source.frame_count + hold_frames
+  expected_duration = expected_frames / float(_OUTPUT_FPS)
   if (info.width, info.height) != (_OUTPUT_WIDTH, _OUTPUT_HEIGHT):
     raise ValueError(
         "composed video size must be 1920x720; "
@@ -847,16 +933,16 @@ def _validate_composed_video(
 
 
 def _validate_output_path(output: Path, sources: Mapping[str, Path]) -> None:
-  if output.is_symlink():
-    raise ValueError(f"output must not be a symlink: {output}")
+  _reject_symlink_components(output, "output")
   if output.exists() and not output.is_file():
     raise ValueError(f"output must be a regular file path: {output}")
-  absolute_output = Path(os.path.abspath(output))
-  if any(absolute_output == Path(os.path.abspath(path)) for path in sources.values()):
-    raise ValueError("output must not overwrite a source video")
-  parent = output.parent
-  if parent.is_symlink():
-    raise ValueError(f"output parent must not be a symlink: {parent}")
+  canonical_output = output.resolve(strict=False)
+  for source in sources.values():
+    _require_regular_input(source, "source video")
+    if canonical_output == source.resolve(strict=True):
+      raise ValueError("output must not overwrite a source video")
+    if output.exists() and os.path.samefile(output, source):
+      raise ValueError("output must not be the same file as a source video")
 
 
 def compose_intervention_demo(
@@ -879,6 +965,7 @@ def compose_intervention_demo(
   ffprobe = _find_tool("ffprobe")
   source_info, _ = _validate_synchronized_sources(sources, ffprobe)
   _validate_event_steps(summary, source_info.frame_count)
+  source_duration = source_info.frame_count / float(_OUTPUT_FPS)
 
   output_path.parent.mkdir(parents=True, exist_ok=True)
   temporary = tempfile.NamedTemporaryFile(
@@ -897,13 +984,13 @@ def compose_intervention_demo(
       overlay_files = _write_overlay_textfiles(
           overlay_name,
           summary,
-          source_duration=source_info.duration,
+          source_duration=source_duration,
           source_fps=source_info.fps,
       )
       filter_graph = _build_filter(
           summary,
           font_path,
-          source_duration=source_info.duration,
+          source_duration=source_duration,
           source_fps=source_info.fps,
           overlay_files=overlay_files,
       )
@@ -929,6 +1016,7 @@ def compose_intervention_demo(
       _run_ffmpeg(command)
       composed_info = _probe_video(staging, ffprobe=ffprobe)
       _validate_composed_video(composed_info, source_info)
+      _validate_output_path(output_path, sources)
       os.replace(staging, output_path)
   except BaseException:
     staging.unlink(missing_ok=True)
