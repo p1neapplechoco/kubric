@@ -4,6 +4,7 @@ import importlib.util
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -118,6 +119,39 @@ def test_changed_branch_diverges_only_inside_intervention_window(generated_demo)
   np.testing.assert_array_equal(
       result.normal.states[0, target_index, 3:7], (1.0, 0.0, 0.0, 0.0)
   )
+
+
+@pytest.mark.parametrize("seed", (6, 7))
+def test_generate_demo_rejects_nonzero_seed(seed):
+  with pytest.raises(ValueError, match="fixed deterministic demo seed is 0"):
+    demo.generate_demo(seed=seed)
+
+
+@pytest.mark.parametrize("seed", (6, 7))
+def test_cli_rejects_nonzero_seed(seed):
+  with pytest.raises(SystemExit):
+    demo._parser().parse_args(["--seed", str(seed)])
+
+
+def test_fixed_seed_demo_is_exactly_repeatable(generated_demo):
+  repeated = demo.generate_demo(seed=0)
+
+  for branch_name in ("normal", "changed"):
+    first_branch = getattr(generated_demo, branch_name)
+    repeated_branch = getattr(repeated, branch_name)
+    np.testing.assert_array_equal(first_branch.states, repeated_branch.states)
+    np.testing.assert_array_equal(
+        first_branch.commanded_path, repeated_branch.commanded_path
+    )
+    assert first_branch.contacts == repeated_branch.contacts
+  assert generated_demo.ground_truth == repeated.ground_truth
+
+
+def test_demo_result_type_hints_do_not_depend_on_future_task_types():
+  hints = get_type_hints(demo.DemoResult)
+
+  assert hints["removed"] == object | None
+  assert demo.DemoResult.__dataclass_fields__["removed"].default is None
 
 
 def _contact(step, object_a, object_b):

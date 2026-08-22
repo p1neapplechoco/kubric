@@ -27,6 +27,7 @@ from interventions import (
 
 
 _OUTPUT_DIR = Path("output/demo_collision_intervention")
+_DEMO_SEED = 0
 _NUM_STEPS = 120
 _CANVAS_SIZE = (960, 544)
 _WORLD_BOUNDS = (-4.5, 4.5, -4.5, 4.5)
@@ -45,8 +46,8 @@ class DemoResult:
   intervention: Intervention
   normal: SimulationLog
   changed: SimulationLog
-  removed: "RemovedBranch | None"
   ground_truth: GroundTruth
+  removed: object | None = None
 
   @property
   def intervention_window(self) -> tuple[int, int]:
@@ -161,8 +162,10 @@ def _validate_demo_outcomes(
     raise RuntimeError("changed branch did not hard-affect only upper_ball")
 
 
-def generate_demo(seed: int = 0) -> DemoResult:
+def generate_demo(seed: int = _DEMO_SEED) -> DemoResult:
   """Generates factual and changed branches through the public pair runner."""
+  if seed != _DEMO_SEED:
+    raise ValueError("fixed deterministic demo seed is 0")
   scene, intervention, factual_path = build_demo_inputs()
   normal, changed = generate_paired_instance(
       scene,
@@ -319,7 +322,6 @@ def _render_branch_video(
 def _parser() -> argparse.ArgumentParser:
   parser = argparse.ArgumentParser(allow_abbrev=False)
   parser.add_argument("--output", default=str(_OUTPUT_DIR))
-  parser.add_argument("--seed", type=int, default=0)
   return parser
 
 
@@ -328,7 +330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
   output = Path(args.output)
   output.mkdir(parents=True, exist_ok=True)
 
-  result = generate_demo(args.seed)
+  result = generate_demo()
   factual = result.normal
   counterfactual = result.changed
   factual_contacts = dynamic_contacts(factual.contacts)
@@ -338,7 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
   summary = {
       "output": str(output),
-      "seed": args.seed,
+      "seed": _DEMO_SEED,
       "branches": {
           "factual": {
               "contact_pairs": _contact_pairs(factual_contacts),
