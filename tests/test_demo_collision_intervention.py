@@ -429,6 +429,45 @@ def test_write_demo_bundle_rejects_wrong_source_branch_before_writing(
   assert not output.exists()
 
 
+def test_write_demo_bundle_rejects_jointly_permuted_object_order(
+    generated_demo, tmp_path
+):
+  canonical_ids = generated_demo.normal.object_ids
+  permuted_ids = tuple(
+      item.object_id for item in generated_demo.scene_config.objects
+  )
+  permutation = tuple(canonical_ids.index(item) for item in permuted_ids)
+  assert permuted_ids != tuple(sorted(permuted_ids))
+
+  normal = dataclasses.replace(
+      generated_demo.normal,
+      object_ids=permuted_ids,
+      states=np.take(generated_demo.normal.states, permutation, axis=1),
+  )
+  changed = dataclasses.replace(
+      generated_demo.changed,
+      object_ids=permuted_ids,
+      states=np.take(generated_demo.changed.states, permutation, axis=1),
+  )
+  removed = dataclasses.replace(
+      generated_demo.removed,
+      object_ids=permuted_ids,
+      states=np.take(generated_demo.removed.states, permutation, axis=1),
+      presence=np.take(generated_demo.removed.presence, permutation, axis=1),
+  )
+  corrupted = dataclasses.replace(
+      generated_demo,
+      normal=normal,
+      changed=changed,
+      removed=removed,
+  )
+  output = tmp_path / "bundle"
+
+  with pytest.raises(ValueError, match="object order"):
+    demo.write_demo_bundle(output, corrupted)
+  assert not output.exists()
+
+
 def test_main_generates_then_writes_the_replay_bundle(
     generated_demo, tmp_path, monkeypatch, capsys
 ):

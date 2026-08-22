@@ -495,17 +495,18 @@ def _validate_demo_bundle(result: DemoResult) -> None:
           f"{source_branches[role].branch!r}"
       )
 
-  scene_object_ids = tuple(
+  canonical_object_ids = tuple(sorted(
       item.object_id for item in result.scene_config.objects
-  )
+  ))
   object_ids = result.normal.object_ids
   expected_shape = (_NUM_STEPS, len(object_ids), 13)
   expected_presence_shape = expected_shape[:2]
-  if (
-      expected_shape != (_NUM_STEPS, 4, 13)
-      or set(object_ids) != set(scene_object_ids)
-  ):
-    raise ValueError("normal object_ids must match the four demo scene objects")
+  if object_ids != canonical_object_ids:
+    raise ValueError(
+        "normal object order must match the sorted demo scene object IDs"
+    )
+  if expected_shape != (_NUM_STEPS, 4, 13):
+    raise ValueError("normal states must have shape (120, 4, 13)")
   if result.scene_config.seed != _DEMO_SEED:
     raise ValueError("demo scene seed must be 0")
   if result.intervention_window != (24, 96):
@@ -513,7 +514,7 @@ def _validate_demo_bundle(result: DemoResult) -> None:
 
   for role, branch in source_branches.items():
     if branch.object_ids != object_ids:
-      raise ValueError(f"{role} object_ids differ from scene object order")
+      raise ValueError(f"{role} object order differs from normal")
     if branch.steps != tuple(range(_NUM_STEPS)):
       raise ValueError(f"{role} steps must be exactly range(120)")
     if branch.states.shape != expected_shape:
