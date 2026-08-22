@@ -1,5 +1,6 @@
 """Offline tests for the procedural Blender branch-replay renderer."""
 
+import dataclasses
 import importlib.util
 import json
 import subprocess
@@ -268,6 +269,122 @@ def test_branch_output_names_are_canonical():
       "trajectory_changed": "trajectory_changed_blender.mp4",
       "target_removed": "target_removed_blender.mp4",
   }
+
+
+def test_main_preflights_synchronized_frame_counts_before_rendering(
+    tmp_path, monkeypatch
+):
+  _write_bundle(
+      tmp_path,
+      branch="normal",
+      states=_synthetic_states(num_steps=5),
+  )
+  _write_bundle(
+      tmp_path,
+      branch="trajectory_changed",
+      states=_synthetic_states(num_steps=4),
+  )
+  rendered = []
+
+  def fake_render(branch, replay, output, *args):
+    rendered.append((branch, len(replay.states)))
+    output.write_text("rendered too early", encoding="utf-8")
+    return {"branch": branch, "output": str(output)}
+
+  monkeypatch.setattr(render_script, "_build_and_render_branch", fake_render)
+
+  with pytest.raises(ValueError, match="synchronized|frame count"):
+    render_script.main([
+        "--states-dir",
+        str(tmp_path),
+        "--branches",
+        "normal",
+        "trajectory_changed",
+    ])
+
+  assert rendered == []
+  assert not (tmp_path / "normal_blender.mp4").exists()
+  assert not (tmp_path / "trajectory_changed_blender.mp4").exists()
+
+
+def test_main_applies_max_frames_before_synchronization(tmp_path, monkeypatch):
+  _write_bundle(
+      tmp_path,
+      branch="normal",
+      states=_synthetic_states(num_steps=5),
+  )
+  _write_bundle(
+      tmp_path,
+      branch="trajectory_changed",
+      states=_synthetic_states(num_steps=4),
+  )
+  rendered = []
+
+  def fake_render(branch, replay, output, *args):
+    rendered.append((branch, len(replay.states)))
+    return {"branch": branch, "output": str(output)}
+
+  monkeypatch.setattr(render_script, "_build_and_render_branch", fake_render)
+
+  assert render_script.main([
+      "--states-dir",
+      str(tmp_path),
+      "--branches",
+      "normal",
+      "trajectory_changed",
+      "--max-frames",
+      "4",
+  ]) == 0
+  assert rendered == [("normal", 4), ("trajectory_changed", 4)]
+
+
+def test_main_allows_a_single_requested_branch(tmp_path, monkeypatch):
+  _write_bundle(tmp_path, branch="normal")
+  rendered = []
+
+  def fake_render(branch, replay, output, *args):
+    rendered.append((branch, replay.object_ids, replay.steps))
+    return {"branch": branch, "output": str(output)}
+
+  monkeypatch.setattr(render_script, "_build_and_render_branch", fake_render)
+
+  assert render_script.main([
+      "--states-dir",
+      str(tmp_path),
+      "--branches",
+      "normal",
+  ]) == 0
+  assert rendered == [(
+      "normal",
+      _OBJECT_IDS,
+      tuple(range(5)),
+  )]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        (
+            "object_ids",
+            ("floor", "target", "lower_ball", "upper_ball"),
+            "object_ids",
+        ),
+        ("steps", (0, 1, 2, 4, 5), "step arrays"),
+        ("summary", {"step_rate": 120}, "metadata"),
+    ),
+)
+def test_synchronization_rejects_cross_branch_contract_drift(
+    tmp_path, field, value, message
+):
+  _write_bundle(tmp_path)
+  baseline = render_script._load_replay(tmp_path, "normal")
+  peer = dataclasses.replace(baseline, branch="trajectory_changed")
+  if field == "summary":
+    value = {**baseline.summary, **value}
+  peer = dataclasses.replace(peer, **{field: value})
+
+  with pytest.raises(ValueError, match=f"synchronized.*{message}"):
+    render_script._validate_synchronized_replays((baseline, peer))
 
 
 def test_module_imports_when_optional_backends_are_blocked():

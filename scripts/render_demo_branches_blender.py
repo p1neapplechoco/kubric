@@ -33,6 +33,16 @@ _CANONICAL_OBJECT_IDS = ("floor", "lower_ball", "target", "upper_ball")
 _STATE_STRIDE = 13
 _POSITION_SLICE = slice(0, 3)
 _QUATERNION_WXYZ_SLICE = slice(3, 7)
+_SYNCHRONIZED_SUMMARY_KEYS = (
+    "branches",
+    "ground_truth",
+    "intervention_end",
+    "intervention_start",
+    "intervention_window",
+    "object_ids",
+    "seed",
+    "step_rate",
+)
 
 # Visual counterparts of the physics demo's scene. Sizes mirror the PyBullet
 # collision shapes: cube half-extents and sphere radii in metres.
@@ -55,6 +65,7 @@ class Replay:
 
   branch: str
   object_ids: Tuple[str, ...]
+  steps: Tuple[int, ...]
   states: np.ndarray
   presence: np.ndarray
   summary: Mapping[str, Any]
@@ -226,6 +237,7 @@ def _load_replay(states_dir: Path, branch: str) -> Replay:
   return Replay(
       branch=branch,
       object_ids=_CANONICAL_OBJECT_IDS,
+      steps=tuple(range(states.shape[0])),
       states=states,
       presence=presence,
       summary=summary,
@@ -243,9 +255,68 @@ def _prepare_replay(replay: Replay, max_frames: int | None) -> Replay:
   limit = min(max_frames, len(replay.states))
   return replace(
       replay,
+      steps=replay.steps[:limit],
       states=replay.states[:limit],
       presence=replay.presence[:limit],
   )
+
+
+def _synchronized_metadata(replay: Replay) -> Dict[str, Any]:
+  """Projects summary metadata that must agree across render branches."""
+  return {
+      key: replay.summary.get(key) for key in _SYNCHRONIZED_SUMMARY_KEYS
+  }
+
+
+def _validate_synchronized_replays(replays: Sequence[Replay]) -> None:
+  """Rejects requested branches that cannot share one synchronized timeline."""
+  if not replays:
+    raise ValueError("at least one replay is required for synchronization")
+
+  reference = replays[0]
+  reference_frames = len(reference.states)
+  if len(reference.steps) != reference_frames:
+    raise ValueError(
+        f"replay {reference.branch!r} is not synchronized with its step array"
+    )
+  reference_metadata = _synchronized_metadata(reference)
+
+  for replay in replays[1:]:
+    if replay.object_ids != reference.object_ids:
+      raise ValueError(
+          "requested branch replays are not synchronized: object_ids differ "
+          f"between {reference.branch!r} and {replay.branch!r}"
+      )
+    if len(replay.states) != reference_frames:
+      raise ValueError(
+          "requested branch replays are not synchronized: frame count "
+          f"differs between {reference.branch!r} ({reference_frames}) and "
+          f"{replay.branch!r} ({len(replay.states)})"
+      )
+    if replay.steps != reference.steps:
+      raise ValueError(
+          "requested branch replays are not synchronized: step arrays differ "
+          f"between {reference.branch!r} and {replay.branch!r}"
+      )
+    if _synchronized_metadata(replay) != reference_metadata:
+      raise ValueError(
+          "requested branch replays are not synchronized: metadata differs "
+          f"between {reference.branch!r} and {replay.branch!r}"
+      )
+
+
+def _preflight_replays(
+    states_dir: Path,
+    branches: Sequence[str],
+    max_frames: int | None,
+) -> Tuple[Replay, ...]:
+  """Loads and prepares every requested replay before any rendering begins."""
+  replays = tuple(
+      _prepare_replay(_load_replay(states_dir, branch), max_frames)
+      for branch in branches
+  )
+  _validate_synchronized_replays(replays)
+  return replays
 
 
 def _visibility_transitions(
@@ -782,11 +853,14 @@ def main(argv: Sequence[str] | None = None) -> int:
   if args.fps < 1:
     raise ValueError("--fps must be >= 1")
 
+  replays = _preflight_replays(
+      states_dir,
+      args.branches,
+      args.max_frames,
+  )
   results: List[Dict[str, object]] = []
-  for branch in args.branches:
-    replay = _prepare_replay(
-        _load_replay(states_dir, branch), args.max_frames
-    )
+  for replay in replays:
+    branch = replay.branch
     output = states_dir / _BRANCH_FILENAMES[branch]
     result = _build_and_render_branch(
         branch,
