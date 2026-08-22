@@ -61,10 +61,10 @@ _OUTPUT_WIDTH = 1920
 _OUTPUT_HEIGHT = 720
 _PANEL_WIDTH = 640
 _PANEL_HEIGHT = 540
-_OUTPUT_FPS = 24.0
+_OUTPUT_FPS = Fraction(24, 1)
 _START_HOLD = 1.0
 _END_HOLD = 2.0
-_FLOAT_TOLERANCE = 1e-3
+_SOURCE_DURATION_TOLERANCE = 1e-6
 _SCHEMA_VERSION = "1.0"
 _REMOVAL_TRUST_MODEL = "demo_only_removal_v1"
 
@@ -75,7 +75,7 @@ class VideoInfo:
 
   width: int
   height: int
-  fps: float
+  fps: Fraction
   frame_count: int
   duration: float
   codec_name: str
@@ -324,14 +324,14 @@ def _positive_float(value: Any, name: str) -> float:
   return result
 
 
-def _positive_fps(value: Any) -> float:
+def _positive_fps(value: Any) -> Fraction:
   if not isinstance(value, str):
     raise ValueError("video fps must be a positive rational number")
   try:
-    result = float(Fraction(value))
+    result = Fraction(value)
   except (ValueError, ZeroDivisionError) as error:
     raise ValueError("video fps must be a positive rational number") from error
-  if not math.isfinite(result) or result <= 0:
+  if result <= 0:
     raise ValueError("video fps must be a positive rational number")
   return result
 
@@ -444,10 +444,19 @@ def _escape_drawtext(text: str) -> str:
   return escaped
 
 
+def _escape_filter_path(path: str | Path) -> str:
+  """Escape a path through both filtergraph and drawtext option parsers."""
+  escaped = str(path).replace("\\", "\\\\\\\\")
+  for character in ("'", ":", ",", ";", "[", "]", "%"):
+    escaped = escaped.replace(character, "\\\\\\" + character)
+  return escaped
+
+
 def _drawtext(
     font: Path,
-    text: str,
+    text: str | None = None,
     *,
+    textfile: str | Path | None = None,
     x: str,
     y: str,
     size: int,
@@ -455,15 +464,23 @@ def _drawtext(
     enable: str | None = None,
     box: bool = False,
 ) -> str:
-  options = [
-      f"fontfile='{_escape_drawtext(str(font))}'",
-      f"text='{_escape_drawtext(text)}'",
+  if (text is None) == (textfile is None):
+    raise ValueError("drawtext requires exactly one of text or textfile")
+  options = [f"fontfile={_escape_filter_path(font)}"]
+  if textfile is not None:
+    options.extend((
+        f"textfile={_escape_filter_path(textfile)}",
+        "reload=0",
+    ))
+  else:
+    options.append(f"text='{_escape_drawtext(text)}'")
+  options.extend([
       "expansion=none",
       f"x={x}",
       f"y={y}",
       f"fontsize={size}",
       f"fontcolor={color}",
-  ]
+  ])
   if box:
     options.extend(("box=1", "boxcolor=black@0.72", "boxborderw=10"))
   if enable is not None:
@@ -494,12 +511,84 @@ def _summary_overlay_lines(summary: Mapping[str, Any]) -> tuple[str, str, str]:
   return graph_line, affected_line, f"PROPAGATION {propagation}"
 
 
+def _contact_cue_object(summary: Mapping[str, Any]) -> str:
+  hard_affected = set(summary["ground_truth"]["hard_affected"])
+  changed_pairs = summary["branches"]["trajectory_changed"]["contact_pairs"]
+  target = summary["branches"]["target_removed"]["target_id"]
+  contact_peers = []
+  for pair in sorted(changed_pairs):
+    endpoints = pair.split("|")
+    if len(endpoints) == 2 and target in endpoints:
+      contact_peers.append(
+          endpoints[1] if endpoints[0] == target else endpoints[0]
+      )
+  affected_peers = sorted(hard_affected.intersection(contact_peers))
+  if affected_peers:
+    return affected_peers[0]
+  if hard_affected:
+    return min(hard_affected)
+  if contact_peers:
+    return min(contact_peers)
+  raise ValueError("summary cannot identify the changed contact peer")
+
+
+def _overlay_texts(
+    summary: Mapping[str, Any],
+    *,
+    source_duration: float,
+    source_fps: float,
+) -> dict[str, str]:
+  total_duration = source_duration + _START_HOLD + _END_HOLD
+  intervention_time = _event_time(summary["intervention_start"], source_fps)
+  contact_step = summary["branches"]["trajectory_changed"][
+      "contact_steps"
+  ][0]
+  contact_time = _event_time(contact_step, source_fps)
+  removal_step = summary["branches"]["target_removed"]["removed_step"]
+  removal_time = _event_time(removal_step, source_fps)
+  contact_object = _contact_cue_object(summary).replace("_", " ").upper()
+  graph_line, affected_line, propagation_line = _summary_overlay_lines(summary)
+  return {
+      "intervention": f"INTERVENTION {intervention_time:.3f}s",
+      "duration": f"{total_duration:.3f}s",
+      "contact": f"CONTACT → {contact_object} {contact_time:.3f}s",
+      "removal": f"TARGET REMOVED {removal_time:.3f}s",
+      "graph": graph_line,
+      "affected": affected_line,
+      "propagation": propagation_line,
+  }
+
+
+def _write_overlay_textfiles(
+    directory: str | Path,
+    summary: Mapping[str, Any],
+    *,
+    source_duration: float,
+    source_fps: float,
+) -> dict[str, Path]:
+  overlay_dir = Path(directory)
+  if overlay_dir.is_symlink() or not overlay_dir.is_dir():
+    raise ValueError(f"overlay directory must be a real directory: {overlay_dir}")
+  texts = _overlay_texts(
+      summary,
+      source_duration=source_duration,
+      source_fps=source_fps,
+  )
+  result = {}
+  for name, value in texts.items():
+    path = overlay_dir / f"{name}.txt"
+    path.write_text(value, encoding="utf-8")
+    result[name] = path
+  return result
+
+
 def _build_filter(
     summary: Mapping[str, Any],
     font: str | Path,
     *,
     source_duration: float = 5.0,
     source_fps: float = 24.0,
+    overlay_files: Mapping[str, Path],
 ) -> str:
   """Build the deterministic layout and annotation filter graph."""
   if not math.isfinite(source_duration) or source_duration <= 0:
@@ -507,6 +596,18 @@ def _build_filter(
   if not math.isfinite(source_fps) or source_fps <= 0:
     raise ValueError("source_fps must be positive and finite")
   font_path = Path(font)
+  expected_overlays = frozenset(_overlay_texts(
+      summary,
+      source_duration=source_duration,
+      source_fps=source_fps,
+  ))
+  if set(overlay_files) != expected_overlays:
+    raise ValueError(
+        "overlay_files must contain exactly "
+        f"{sorted(expected_overlays)!r}"
+    )
+  if not all(Path(path).is_file() for path in overlay_files.values()):
+    raise FileNotFoundError("every overlay text file must exist")
   total_duration = source_duration + _START_HOLD + _END_HOLD
   intervention_time = _event_time(
       summary["intervention_start"], source_fps
@@ -559,7 +660,7 @@ def _build_filter(
       ),
       _drawtext(
           font_path,
-          f"INTERVENTION {intervention_time:.3f}s",
+          textfile=overlay_files["intervention"],
           x=str(max(8, marker_x - 110)), y="627", size=18,
           color="0xed8796",
       ),
@@ -567,32 +668,34 @@ def _build_filter(
           font_path, "0s", x="80", y="687", size=16, color="0xa5adcb"
       ),
       _drawtext(
-          font_path, f"{total_duration:.3f}s", x="1810", y="687",
+          font_path, textfile=overlay_files["duration"], x="1810", y="687",
           size=16, color="0xa5adcb"
       ),
       _drawtext(
-          font_path, f"CONTACT {contact_time:.3f}s",
+          font_path, textfile=overlay_files["contact"],
           x="640+(640-text_w)/2", y="120", size=26,
           color="0xffd166", enable=contact_enable, box=True,
       ),
       _drawtext(
-          font_path, f"TARGET REMOVED {removal_time:.3f}s",
+          font_path, textfile=overlay_files["removal"],
           x="1280+(640-text_w)/2", y="120", size=26,
           color="0xff8fab", enable=removal_enable, box=True,
       ),
   ]
-  graph_line, affected_line, propagation_line = _summary_overlay_lines(summary)
   overlays.extend((
       _drawtext(
-          font_path, graph_line, x="(w-text_w)/2", y="530", size=22,
+          font_path, textfile=overlay_files["graph"],
+          x="(w-text_w)/2", y="530", size=22,
           color="white", enable=final_enable, box=True,
       ),
       _drawtext(
-          font_path, affected_line, x="(w-text_w)/2", y="566", size=20,
+          font_path, textfile=overlay_files["affected"],
+          x="(w-text_w)/2", y="566", size=20,
           color="white", enable=final_enable, box=True,
       ),
       _drawtext(
-          font_path, propagation_line, x="(w-text_w)/2", y="602", size=18,
+          font_path, textfile=overlay_files["propagation"],
+          x="(w-text_w)/2", y="602", size=18,
           color="white", enable=final_enable, box=True,
       ),
   ))
@@ -626,6 +729,18 @@ def _source_paths(states_dir: Path) -> dict[str, Path]:
   return result
 
 
+def _normalized_fps(value: Any) -> Fraction:
+  if isinstance(value, bool):
+    raise ValueError("video fps must be a positive rational number")
+  try:
+    result = value if isinstance(value, Fraction) else Fraction(str(value))
+  except (TypeError, ValueError, ZeroDivisionError) as error:
+    raise ValueError("video fps must be a positive rational number") from error
+  if result <= 0:
+    raise ValueError("video fps must be a positive rational number")
+  return result
+
+
 def _validate_synchronized_sources(
     sources: Mapping[str, Path], ffprobe: str
 ) -> tuple[VideoInfo, dict[str, VideoInfo]]:
@@ -636,6 +751,11 @@ def _validate_synchronized_sources(
   reference_name = _BRANCH_FILES[0][0]
   reference = infos[reference_name]
   for branch, info in infos.items():
+    if info.codec_name.lower() != "h264":
+      raise ValueError(
+          f"source video {branch} codec must be H264; got {info.codec_name!r}"
+      )
+  for branch, info in infos.items():
     if branch == reference_name:
       continue
     for field in ("width", "height", "frame_count"):
@@ -645,9 +765,7 @@ def _validate_synchronized_sources(
             f"{reference_name}={getattr(reference, field)!r}, "
             f"{branch}={getattr(info, field)!r}"
         )
-    if not math.isclose(
-        info.fps, reference.fps, rel_tol=0.0, abs_tol=1e-6
-    ):
+    if _normalized_fps(info.fps) != _normalized_fps(reference.fps):
       raise ValueError(
           "source videos must have synchronized fps; "
           f"{reference_name}={reference.fps!r}, {branch}={info.fps!r}"
@@ -656,7 +774,7 @@ def _validate_synchronized_sources(
         info.duration,
         reference.duration,
         rel_tol=0.0,
-        abs_tol=_FLOAT_TOLERANCE,
+        abs_tol=_SOURCE_DURATION_TOLERANCE,
     ):
       raise ValueError(
           "source videos must have synchronized duration; "
@@ -712,7 +830,7 @@ def _validate_composed_video(
     raise ValueError(
         f"composed video pixel format must be yuv420p; got {info.pix_fmt!r}"
     )
-  if not math.isclose(info.fps, _OUTPUT_FPS, rel_tol=0.0, abs_tol=1e-6):
+  if _normalized_fps(info.fps) != _OUTPUT_FPS:
     raise ValueError(f"composed video frame rate must be 24; got {info.fps!r}")
   if info.frame_count != expected_frames:
     raise ValueError(
@@ -761,12 +879,6 @@ def compose_intervention_demo(
   ffprobe = _find_tool("ffprobe")
   source_info, _ = _validate_synchronized_sources(sources, ffprobe)
   _validate_event_steps(summary, source_info.frame_count)
-  filter_graph = _build_filter(
-      summary,
-      font_path,
-      source_duration=source_info.duration,
-      source_fps=source_info.fps,
-  )
 
   output_path.parent.mkdir(parents=True, exist_ok=True)
   temporary = tempfile.NamedTemporaryFile(
@@ -777,30 +889,47 @@ def compose_intervention_demo(
   )
   staging = Path(temporary.name)
   temporary.close()
-  command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
-  for _, path in _BRANCH_FILES:
-    command.extend(("-i", str(directory / path)))
-  command.extend((
-      "-filter_complex",
-      filter_graph,
-      "-map",
-      "[outv]",
-      "-an",
-      "-c:v",
-      "libx264",
-      "-pix_fmt",
-      "yuv420p",
-      "-r",
-      str(int(_OUTPUT_FPS)),
-      "-movflags",
-      "+faststart",
-      str(staging),
-  ))
   try:
-    _run_ffmpeg(command)
-    composed_info = _probe_video(staging, ffprobe=ffprobe)
-    _validate_composed_video(composed_info, source_info)
-    os.replace(staging, output_path)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{output_path.stem}.overlays.",
+        dir=output_path.parent,
+    ) as overlay_name:
+      overlay_files = _write_overlay_textfiles(
+          overlay_name,
+          summary,
+          source_duration=source_info.duration,
+          source_fps=source_info.fps,
+      )
+      filter_graph = _build_filter(
+          summary,
+          font_path,
+          source_duration=source_info.duration,
+          source_fps=source_info.fps,
+          overlay_files=overlay_files,
+      )
+      command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
+      for _, path in _BRANCH_FILES:
+        command.extend(("-i", str(directory / path)))
+      command.extend((
+          "-filter_complex",
+          filter_graph,
+          "-map",
+          "[outv]",
+          "-an",
+          "-c:v",
+          "libx264",
+          "-pix_fmt",
+          "yuv420p",
+          "-r",
+          str(int(_OUTPUT_FPS)),
+          "-movflags",
+          "+faststart",
+          str(staging),
+      ))
+      _run_ffmpeg(command)
+      composed_info = _probe_video(staging, ffprobe=ffprobe)
+      _validate_composed_video(composed_info, source_info)
+      os.replace(staging, output_path)
   except BaseException:
     staging.unlink(missing_ok=True)
     raise

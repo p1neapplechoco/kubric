@@ -3,9 +3,11 @@
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -154,47 +156,76 @@ assert not any(
 def test_filter_has_layout_labels_timeline_cues_and_summary(
     compositor, tmp_path
 ):
+  overlay_dir = tmp_path / "overlays"
+  overlay_dir.mkdir()
+  overlay_files = compositor._write_overlay_textfiles(
+      overlay_dir,
+      _summary(),
+      source_duration=5.0,
+      source_fps=24.0,
+  )
   filter_graph = compositor._build_filter(
       _summary(),
       _font(tmp_path),
       source_duration=5.0,
       source_fps=24.0,
+      overlay_files=overlay_files,
   )
 
   assert "hstack=inputs=3" in filter_graph
   assert "pad=1920:720:0:90" in filter_graph
   for label in ("NORMAL", "TRAJECTORY CHANGED", "TARGET REMOVED"):
     assert f"text='{label}'" in filter_graph
-  assert "INTERVENTION" in filter_graph
-  assert "2.000s" in filter_graph  # one-second hold + step 24 / 24 fps
-  assert "CONTACT" in filter_graph
-  assert "3.000s" in filter_graph  # one-second hold + step 48 / 24 fps
-  assert "REMOVED" in filter_graph
-  assert "GRAPH DELTA added=1 removed=0 changed=0" in filter_graph
-  assert "HARD upper_ball" in filter_graph
-  assert "SOFT none" in filter_graph
-  assert "target > upper_ball" in filter_graph
-
-
-def test_drawtext_escaping_handles_filter_metacharacters(compositor):
-  escaped = compositor._escape_drawtext("a:b,c%'d\\e[ok]")
-
-  assert escaped == r"a\:b\,c\%'\''d\\e\[ok\]"
-
-
-def test_drawtext_disables_percent_expansion_in_ffmpeg(compositor):
-  ffmpeg = shutil.which("ffmpeg")
-  if ffmpeg is None:
-    pytest.skip("ffmpeg is required for drawtext parser coverage")
-  drawtext = compositor._drawtext(
-      compositor._resolve_font(None),
-      "100%: target path",
-      x="0",
-      y="0",
-      size=12,
+  assert filter_graph.count("textfile=") == len(overlay_files)
+  assert filter_graph.count("reload=0") == len(overlay_files)
+  assert "text='CONTACT" not in filter_graph
+  assert "text='GRAPH DELTA" not in filter_graph
+  assert overlay_files["intervention"].read_text("utf-8") == (
+      "INTERVENTION 2.000s"
+  )
+  assert overlay_files["contact"].read_text("utf-8") == (
+      "CONTACT → UPPER BALL 3.000s"
+  )
+  assert overlay_files["removal"].read_text("utf-8") == (
+      "TARGET REMOVED 2.000s"
+  )
+  assert overlay_files["graph"].read_text("utf-8") == (
+      "GRAPH DELTA added=1 removed=0 changed=0"
+  )
+  assert overlay_files["affected"].read_text("utf-8") == (
+      "HARD upper_ball   |   SOFT none"
+  )
+  assert "target > upper_ball" in overlay_files["propagation"].read_text(
+      "utf-8"
   )
 
-  result = subprocess.run(
+
+def test_contact_cue_prefers_changed_contact_peer_among_hard_affected(
+    compositor, tmp_path
+):
+  summary = _summary()
+  summary["ground_truth"]["hard_affected"] = ["lower_ball", "upper_ball"]
+  overlay_files = compositor._write_overlay_textfiles(
+      tmp_path,
+      summary,
+      source_duration=5.0,
+      source_fps=24.0,
+  )
+
+  assert overlay_files["contact"].read_text("utf-8") == (
+      "CONTACT → UPPER BALL 3.000s"
+  )
+
+
+def _render_textfile_frame(compositor, ffmpeg, font, textfile):
+  drawtext = compositor._drawtext(
+      font,
+      textfile=textfile,
+      x="8",
+      y="8",
+      size=24,
+  )
+  return subprocess.run(
       [
           ffmpeg,
           "-hide_banner",
@@ -203,22 +234,69 @@ def test_drawtext_disables_percent_expansion_in_ffmpeg(compositor):
           "-f",
           "lavfi",
           "-i",
-          "color=s=64x64:r=24:d=0.1",
+          "color=c=black:s=320x64:r=24:d=0.1",
           "-vf",
           drawtext,
+          "-frames:v",
+          "1",
+          "-pix_fmt",
+          "gray",
           "-f",
-          "null",
+          "rawvideo",
           "-",
       ],
       check=False,
       capture_output=True,
-      text=True,
   )
 
-  assert result.returncode == 0, result.stderr
+
+def test_drawtext_textfile_renders_apostrophe_as_a_visible_glyph(
+    compositor, tmp_path
+):
+  ffmpeg = shutil.which("ffmpeg")
+  if ffmpeg is None:
+    pytest.skip("ffmpeg is required for drawtext parser coverage")
+  with_apostrophe = tmp_path / "with-apostrophe.txt"
+  without_apostrophe = tmp_path / "without-apostrophe.txt"
+  with_apostrophe.write_text("target's path", encoding="utf-8")
+  without_apostrophe.write_text("targets path", encoding="utf-8")
+  font = compositor._resolve_font(None)
+
+  rendered_with = _render_textfile_frame(
+      compositor, ffmpeg, font, with_apostrophe
+  )
+  rendered_without = _render_textfile_frame(
+      compositor, ffmpeg, font, without_apostrophe
+  )
+
+  assert rendered_with.returncode == 0, rendered_with.stderr.decode("utf-8")
+  assert rendered_without.returncode == 0, rendered_without.stderr.decode(
+      "utf-8"
+  )
+  assert rendered_with.stdout != rendered_without.stdout
 
 
-def test_full_filter_escapes_summary_metacharacters(compositor):
+def test_drawtext_escapes_apostrophe_in_textfile_path(compositor, tmp_path):
+  ffmpeg = shutil.which("ffmpeg")
+  if ffmpeg is None:
+    pytest.skip("ffmpeg is required for drawtext path coverage")
+  apostrophe_dir = tmp_path / "apostrophe's directory"
+  apostrophe_dir.mkdir()
+  textfile = apostrophe_dir / "cue.txt"
+  textfile.write_text("CONTACT → UPPER BALL", encoding="utf-8")
+
+  rendered = _render_textfile_frame(
+      compositor,
+      ffmpeg,
+      compositor._resolve_font(None),
+      textfile,
+  )
+
+  assert rendered.returncode == 0, rendered.stderr.decode("utf-8")
+  assert len(rendered.stdout) == 320 * 64
+
+
+def test_full_filter_escapes_summary_metacharacters(compositor, tmp_path):
   ffmpeg = shutil.which("ffmpeg")
   if ffmpeg is None:
     pytest.skip("ffmpeg is required for filter parser coverage")
@@ -228,11 +306,20 @@ def test_full_filter_escapes_summary_metacharacters(compositor):
   summary["ground_truth"]["propagation_path"] = {
       affected: ["target", affected]
   }
+  overlay_dir = tmp_path / "special-overlays"
+  overlay_dir.mkdir()
+  overlay_files = compositor._write_overlay_textfiles(
+      overlay_dir,
+      summary,
+      source_duration=0.25,
+      source_fps=24.0,
+  )
   filter_graph = compositor._build_filter(
       summary,
       compositor._resolve_font(None),
       source_duration=0.25,
       source_fps=24.0,
+      overlay_files=overlay_files,
   )
   command = [ffmpeg, "-hide_banner", "-loglevel", "error"]
   for color in ("red", "green", "blue"):
@@ -296,7 +383,8 @@ def test_probe_video_parses_positive_stream_metadata(
 
   assert info.width == 640
   assert info.height == 540
-  assert info.fps == 24.0
+  assert info.fps == Fraction(24, 1)
+  assert isinstance(info.fps, Fraction)
   assert info.frame_count == 120
   assert info.duration == 5.0
   assert info.codec_name == "h264"
@@ -424,6 +512,107 @@ def test_source_probe_mismatch_is_rejected_before_ffmpeg_or_output(
   assert not output.exists()
 
 
+@pytest.mark.parametrize("codec_name", ("vp9", "mpeg4"))
+def test_equal_non_h264_sources_are_rejected_before_ffmpeg_or_output(
+    compositor, tmp_path, monkeypatch, codec_name
+):
+  _write_summary(tmp_path)
+  _touch_sources(tmp_path)
+  output = tmp_path / "final.mp4"
+  font = _font(tmp_path)
+  info = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=120,
+      duration=5.0,
+      codec_name=codec_name,
+      pix_fmt="yuv420p",
+  )
+  monkeypatch.setattr(compositor, "_probe_video", lambda *args, **kwargs: info)
+  monkeypatch.setattr(
+      compositor.shutil,
+      "which",
+      lambda name: f"/tools/{name}",
+  )
+  monkeypatch.setattr(
+      compositor,
+      "_run_ffmpeg",
+      lambda command: pytest.fail("ffmpeg ran for a non-H264 source"),
+  )
+
+  with pytest.raises(ValueError, match="H264|h264|codec"):
+    compositor.compose_intervention_demo(tmp_path, output, font)
+
+  assert not output.exists()
+
+
+def _synchronized_infos(compositor, *, rates=None, durations=None):
+  branch_names = ("normal", "trajectory_changed", "target_removed")
+  rates = rates or (Fraction(24, 1),) * 3
+  durations = durations or (5.0,) * 3
+  return {
+      branch: compositor.VideoInfo(
+          width=640,
+          height=540,
+          fps=rate,
+          frame_count=120,
+          duration=duration,
+          codec_name="h264",
+          pix_fmt="yuv420p",
+      )
+      for branch, rate, duration in zip(branch_names, rates, durations)
+  }
+
+
+def _validate_fake_infos(compositor, monkeypatch, infos):
+  sources = {
+      branch: Path(f"/{branch}.mp4") for branch in infos
+  }
+  monkeypatch.setattr(
+      compositor,
+      "_probe_video",
+      lambda path, ffprobe=None: infos[Path(path).stem],
+  )
+  return compositor._validate_synchronized_sources(sources, "/tools/ffprobe")
+
+
+def test_source_fps_compares_normalized_fractions_exactly(
+    compositor, monkeypatch
+):
+  equivalent = _synchronized_infos(
+      compositor,
+      rates=(Fraction(24, 1), Fraction(48, 2), Fraction(240, 10)),
+  )
+
+  reference, _ = _validate_fake_infos(compositor, monkeypatch, equivalent)
+
+  assert reference.fps == Fraction(24, 1)
+
+  mismatched = _synchronized_infos(
+      compositor,
+      rates=(
+          Fraction(24, 1),
+          Fraction(240000001, 10000000),
+          Fraction(24, 1),
+      ),
+  )
+  with pytest.raises(ValueError, match="fps|frame rate|synchronized"):
+    _validate_fake_infos(compositor, monkeypatch, mismatched)
+
+
+def test_source_duration_rejects_difference_above_one_microsecond(
+    compositor, monkeypatch
+):
+  infos = _synchronized_infos(
+      compositor,
+      durations=(5.0, 5.0000011, 5.0),
+  )
+
+  with pytest.raises(ValueError, match="duration|synchronized"):
+    _validate_fake_infos(compositor, monkeypatch, infos)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
@@ -517,15 +706,31 @@ def test_failed_encode_preserves_existing_output_and_removes_staging(
   )
 
   def fail_encode(command):
+    filter_graph = command[command.index("-filter_complex") + 1]
+    textfiles = [Path(value) for value in re.findall(
+        r"textfile=([^:]+):reload=0", filter_graph
+    )]
+    assert textfiles
+    assert all(path.is_file() for path in textfiles)
+    assert any(
+        path.read_text("utf-8").startswith("CONTACT → UPPER BALL")
+        for path in textfiles
+    )
+    overlay_directories = {path.parent for path in textfiles}
+    assert len(overlay_directories) == 1
+    observed_overlay_dirs.extend(overlay_directories)
     Path(command[-1]).write_bytes(b"partial")
     raise RuntimeError("synthetic ffmpeg failure")
 
+  observed_overlay_dirs = []
   monkeypatch.setattr(compositor, "_run_ffmpeg", fail_encode)
 
   with pytest.raises(RuntimeError, match="synthetic ffmpeg failure"):
     compositor.compose_intervention_demo(tmp_path, output, font)
 
   assert output.read_bytes() == b"existing video"
+  assert observed_overlay_dirs
+  assert all(not path.exists() for path in observed_overlay_dirs)
   assert sorted(path.name for path in tmp_path.iterdir()) == [
       "Test Font.ttf",
       "normal_blender.mp4",
