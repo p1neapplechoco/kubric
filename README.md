@@ -22,6 +22,10 @@ Kubric is mainly built on-top of pybullet (for physics simulation) and Blender (
 ## Getting started
 For instructions, please refer to [https://kubric.readthedocs.io](https://kubric.readthedocs.io)
 
+For factual/counterfactual trajectory rollouts, dataset generation, artifact
+semantics, and the isolated `thesis` environment workflow, see the
+[trajectory interventions guide](docs/trajectory_interventions.md).
+
 Assuming you have docker installed, to generate the data above simply execute:
 ```
 git clone https://github.com/google-research/kubric.git

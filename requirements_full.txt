@@ -1,3 +1,4 @@
+imageio-ffmpeg
 matplotlib
 mediapy
 OpenEXR

@@ -1,0 +1,59 @@
+# Scene units are metres, seconds, kilograms, and WXYZ quaternions.
+scene:
+  bounds: [[-5.0, -5.0, -1.0], [5.0, 5.0, 5.0]]
+  gravity: [0.0, 0.0, -9.81]
+  frame_range: [0, 2]       # Half-open frames: 20 Bullet steps at 240/24.
+  frame_rate: 24
+  step_rate: 240
+
+# count is the number of freely simulated objects, excluding floor and target.
+objects:
+  count: [2, 5]
+  shapes: [cube, sphere]
+  size: [0.12, 0.28]       # Kubric primitive half-extents/radius.
+  mass: [0.5, 2.0]
+  friction: [0.05, 0.6]
+  restitution: [0.0, 0.4]
+  # Concentrate free bodies around the target sweep while retaining lateral misses.
+  x: [-1.4, 1.2]
+  y: [-1.8, 1.8]
+  floor_size: [4.5, 4.5, 0.25]
+
+# The target remains static in Kubric bookkeeping; push_mass is toggled per step.
+target:
+  shape: cube
+  size: [0.16, 0.26]
+  x: [-2.2, -1.8]
+  y: [-0.8, 0.8]
+  displacement_x: [2.5, 3.2]
+  displacement_y: [-0.5, 0.5]
+  friction: [0.05, 0.4]
+  restitution: [0.0, 0.2]
+
+trajectory:
+  waypoint_count: [2, 4]
+  method: linear
+
+intervention:
+  recipes: [remove_collision, create_collision, retime, break_contact, maintain_contact]
+  magnitude: [0.05, 0.30]
+  start_step: [1, 4]
+  duration_steps: [12, 16]
+  push_mass: [0.5, 2.0]
+  expected_effects: [non_null]
+
+qc:
+  linear_velocity_ceiling: 80.0
+  angular_velocity_ceiling: 120.0
+  clip_epsilon: 0.000001
+
+balance:
+  seed: 1701
+
+# Topology groups are assigned together; fractions must sum to one.
+split:
+  seed: 2301
+  fractions:
+    train: 0.8
+    val: 0.1
+    test: 0.1
