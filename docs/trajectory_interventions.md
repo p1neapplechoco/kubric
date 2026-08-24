@@ -145,11 +145,12 @@ the ephemeral container only when the cached image lacks it.
 ### Procedural realistic scene
 
 The renderer uses the logged collider poses exactly; appearance is added only
-as collider-parented decoration. The target has rounded, noise-textured wood,
-all nine balls use glossy billiard lacquer with bands and number decals, and the
-table has procedural dark-green felt plus wooden rails outside the simulated
-contact area. A shared studio-light rig, neutral world, camera, depth of field,
-Cycles adaptive sampling, and denoising are identical across all branches.
+as collider-parented decoration. The target has rounded, noise-textured wood;
+all nine balls use glossy billiard lacquer and number decals, while striped balls
+additionally receive a white band (currently only `side_02`). The table has
+procedural dark-green felt plus wooden rails outside the simulated contact area.
+A shared studio-light rig, neutral world, camera, depth of field, Cycles adaptive
+sampling, and denoising are identical across all branches.
 
 The complete output tree is:
 

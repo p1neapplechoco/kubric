@@ -4,8 +4,9 @@ Purpose: sample attempts, run paired candidates, evaluate QC, balance accepted
 examples, assign grouped splits, journal outcomes, and publish resumable datasets.
 Public API: InstanceSpec, QCResult, CandidateSummary, load_ranges(), seed/spec
 helpers, candidate/QC helpers, balancing/split helpers, and run_batch().
-Dependencies: standard-library persistence plus YAML, schema, graph, tag, and
-twin-runner APIs; each simulated candidate receives fresh Bullet clients.
+Dependencies: direct dependencies include NumPy, YAML, logging, schema,
+trajectory, and twin-runner APIs; graph/tag results arrive through validated pair
+ground truth, and each simulated candidate receives fresh Bullet clients.
 Trust boundary: attempt journals, hashes, QC, balance, splits, atomic publication,
 and resume checks protect internal consistency, not producer identity; resume
 accepts only a matching run contract and batch generation is single-worker.

@@ -5,7 +5,9 @@ Purpose: run the immutable eleven-object forked-rack scene and atomically publis
 normal, trajectory-changed, and target-removed replay arrays plus metadata.
 Public API: RemovedBranch, DemoResult, build_demo_inputs(), dynamic_contacts(),
 generate_demo(), write_demo_bundle(), and main().
-Dependencies: NumPy, the public intervention pipeline, and trajectory_demo_spec.
+Dependencies: NumPy, the public intervention pipeline, trajectory_demo_spec, and
+the private demo-only twin-runner helpers ``_build_scene`` and
+``_configure_physics`` used to execute physical target removal.
 Trust boundary: canonical digest binding governs every replay; normal and changed
 use the public paired runner, while removed is visualization-only data with the
 ``demo_only_removal_v1`` trust model and is not a dataset recipe or attested pair.
