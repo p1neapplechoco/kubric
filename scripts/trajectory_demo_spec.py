@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import numbers
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
@@ -102,16 +101,29 @@ def _finite_vector(value: Sequence[object], length: int, name: str) -> tuple[flo
         values = tuple(value)
     except (TypeError, ValueError):
         raise ValueError(f"{name} must contain {length} finite values") from None
-    if len(values) != length or any(isinstance(v, bool) or not isinstance(v, numbers.Real) or not math.isfinite(v) for v in values):
+    if len(values) != length:
         raise ValueError(f"{name} must contain {length} finite values")
-    return tuple(float(v) for v in values)
+    try:
+        converted = tuple(_finite_leaf(v) for v in values)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError(f"{name} must contain {length} finite values") from None
+    return converted
+
+
+def _finite_leaf(value: object) -> float:
+    if isinstance(value, bool) or type(value) not in (int, float):
+        raise ValueError("numeric leaf must be a JSON-native number")
+    converted = float(value)
+    if not math.isfinite(converted):
+        raise ValueError("numeric leaf must be finite")
+    return converted
 
 
 def _number(value: object, name: str, *, positive: bool = False, nonnegative: bool = False) -> float:
-    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+    if isinstance(value, bool) or type(value) not in (int, float):
         raise ValueError(f"{name} must be finite real")
     try:
-        result = float(value)
+        result = _finite_leaf(value)
     except (OverflowError, ValueError):
         raise ValueError(f"{name} must be finite real") from None
     if not math.isfinite(result):
@@ -144,7 +156,7 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
             raise ValueError("unsupported shape")
         if isinstance(obj.size, bool):
             raise ValueError("size must not be bool")
-        if isinstance(obj.size, numbers.Real):
+        if type(obj.size) in (int, float):
             _number(obj.size, "size", positive=True)
         else:
             if not isinstance(obj.size, tuple):

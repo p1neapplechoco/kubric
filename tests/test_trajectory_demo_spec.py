@@ -1,4 +1,5 @@
 import dataclasses
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -254,3 +255,27 @@ def test_valid_spec_hash_is_repeatable():
 def test_huge_numeric_values_raise_value_error():
     with pytest.raises(ValueError, match="mass"):
         demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", mass=10**1000))
+
+
+def test_fraction_scalar_is_rejected_before_canonicalization():
+    with pytest.raises(ValueError, match="mass"):
+        demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", mass=Fraction(1, 1)))
+
+
+def test_fraction_vector_component_is_rejected():
+    with pytest.raises(ValueError, match="position"):
+        demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", position=(Fraction(1, 1), 0.6, 0.22)))
+
+
+def test_huge_integer_vector_component_is_rejected_intentionally():
+    with pytest.raises(ValueError, match="gravity|finite"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, gravity=(10**1000, 0, 0)))
+
+
+def test_rotated_quaternion_hash_is_stable_and_distinct():
+    rotated = _replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", quaternion=(0.0, 0.0, 0.0, 1.0))
+    canonical_hashes = [demo_spec.spec_sha256(demo_spec.FORKED_RACK_SPEC) for _ in range(2)]
+    rotated_hashes = [demo_spec.spec_sha256(rotated) for _ in range(2)]
+    assert canonical_hashes[0] == canonical_hashes[1]
+    assert rotated_hashes[0] == rotated_hashes[1]
+    assert canonical_hashes[0] != rotated_hashes[0]
