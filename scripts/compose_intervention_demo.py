@@ -15,6 +15,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from scripts.trajectory_demo_spec import FORKED_RACK_SPEC, demo_spec_summary
+
 
 _BRANCH_FILES = (
     ("normal", "normal_blender.mp4"),
@@ -23,6 +25,7 @@ _BRANCH_FILES = (
 )
 _TOP_LEVEL_KEYS = frozenset({
     "branches",
+    "demo_spec",
     "ground_truth",
     "intervention_end",
     "intervention_start",
@@ -100,6 +103,19 @@ def _require_exact_keys(
 def _require_object(value: Any, name: str) -> dict[str, Any]:
   if not isinstance(value, dict):
     raise TypeError(f"{name} must be a JSON object")
+  return value
+
+
+def _validate_demo_spec_identity(value: Any) -> Mapping[str, Any]:
+  """Reject summary metadata produced from a different scene contract."""
+  if not isinstance(value, dict):
+    raise TypeError("demo_spec must be a JSON object")
+  expected = demo_spec_summary(FORKED_RACK_SPEC)
+  if set(value) != set(expected):
+    raise ValueError("demo_spec keys mismatch")
+  for field, expected_value in expected.items():
+    if value[field] != expected_value:
+      raise ValueError(f"demo_spec.{field} mismatch")
   return value
 
 
@@ -241,6 +257,57 @@ def _validate_ground_truth(value: Any) -> dict[str, Any]:
   return truth
 
 
+def _contact_pair_endpoints(pairs: Mapping[str, Any]) -> set[str]:
+  return {
+      endpoint
+      for pair in pairs
+      for endpoint in pair.split("|")
+  }
+
+
+def _validate_demo_branch_contract(summary: Mapping[str, Any]) -> None:
+  """Validate the small normal fork and large changed fork signatures."""
+  branches = summary["branches"]
+  normal_pairs = branches["normal"]["contact_pairs"]
+  changed_pairs = branches["trajectory_changed"]["contact_pairs"]
+  normal_count = len(normal_pairs)
+  changed_count = len(changed_pairs)
+  if not 2 <= normal_count <= 3:
+    raise ValueError("normal branch must contain 2 to 3 unique contact pairs")
+  if not 7 <= changed_count <= 9:
+    raise ValueError(
+        "trajectory_changed branch must contain 7 to 9 unique contact pairs"
+    )
+  if changed_count < normal_count + 5:
+    raise ValueError(
+        "trajectory_changed branch must contain at least 5 more unique "
+        "contact pairs than normal"
+    )
+  normal_endpoints = _contact_pair_endpoints(normal_pairs)
+  changed_endpoints = _contact_pair_endpoints(changed_pairs)
+  if normal_endpoints.intersection(FORKED_RACK_SPEC.main_ball_ids):
+    raise ValueError(
+        "normal branch contact pairs must not include main-group balls"
+    )
+  if changed_endpoints.intersection(FORKED_RACK_SPEC.side_ball_ids):
+    raise ValueError(
+        "trajectory_changed branch contact pairs must not include "
+        "side-group balls"
+    )
+  if len(changed_endpoints.intersection(FORKED_RACK_SPEC.main_ball_ids)) < 6:
+    raise ValueError(
+        "trajectory_changed branch contact pairs must reach at least 6 "
+        "main-group balls"
+    )
+  intervention_start = summary["intervention_start"]
+  removed_steps = branches["target_removed"]["contact_steps"]
+  if any(step >= intervention_start for step in removed_steps):
+    raise ValueError(
+        "target_removed branch must not contain contact steps at or after "
+        "intervention_start"
+    )
+
+
 def _require_regular_input(path: Path, name: str) -> None:
   _reject_symlink_components(path, name)
   if not path.exists():
@@ -281,6 +348,7 @@ def _load_summary(states_dir: str | Path) -> dict[str, Any]:
     raise ValueError(f"{summary_path} must contain valid JSON") from error
   summary = _require_object(summary, "summary")
   _require_exact_keys(summary, _TOP_LEVEL_KEYS, "summary")
+  _validate_demo_spec_identity(summary["demo_spec"])
 
   object_ids = _require_string_list(summary["object_ids"], "object_ids")
   seed = summary["seed"]
@@ -321,7 +389,9 @@ def _load_summary(states_dir: str | Path) -> dict[str, Any]:
   if removed["target_id"] not in object_ids:
     raise ValueError("branches.target_removed.target_id must name an object_id")
   _validate_ground_truth(summary["ground_truth"])
-  _contact_cue_event(summary)
+  _validate_demo_branch_contract(summary)
+  _chain_cue_event(summary, "normal")
+  _chain_cue_event(summary, "trajectory_changed")
   return summary
 
 
@@ -560,45 +630,53 @@ def _summary_overlay_lines(summary: Mapping[str, Any]) -> tuple[str, str, str]:
       f"removed={len(graph_delta['removed'])} "
       f"changed={len(graph_delta['changed'])}"
   )
-  hard = ", ".join(truth["hard_affected"]) or "none"
-  soft = ", ".join(truth["soft_affected"]) or "none"
-  affected_line = f"HARD {hard}   |   SOFT {soft}"
-  paths = truth["propagation_path"]
-  propagation = "; ".join(
-      f"{affected}: {' > '.join(paths[affected])}" for affected in sorted(paths)
-  ) or "none"
-  return graph_line, affected_line, f"PROPAGATION {propagation}"
-
-
-def _contact_cue_event(summary: Mapping[str, Any]) -> tuple[str, int]:
-  """Return one peer and step bound by the same validated graph event."""
-  hard_affected = set(summary["ground_truth"]["hard_affected"])
-  changed_pairs = summary["branches"]["trajectory_changed"]["contact_pairs"]
-  changed_steps = set(
-      summary["branches"]["trajectory_changed"]["contact_steps"]
+  affected_line = (
+      f"AFFECTED hard={len(truth['hard_affected'])} "
+      f"soft={len(truth['soft_affected'])}"
   )
-  target = summary["branches"]["target_removed"]["target_id"]
-  candidates = []
-  graph_delta = summary["ground_truth"]["graph_delta"]
-  for bucket in ("added", "changed"):
-    for record in graph_delta[bucket]:
-      endpoints = (record["object_a"], record["object_b"])
-      if target not in endpoints:
-        continue
-      peer = endpoints[1] if endpoints[0] == target else endpoints[0]
-      pair_key = "|".join(sorted(endpoints))
-      step = record["start_step"]
-      if (
-          peer in hard_affected
-          and pair_key in changed_pairs
-          and step in changed_steps
-      ):
-        candidates.append((step, peer))
-  if not candidates:
-    raise ValueError(
-        "summary graph_delta must identify a target-to-hard-affected "
-        "contact pair at one trajectory_changed contact step"
+  paths = truth["propagation_path"]
+  if not paths:
+    propagation_line = "MAX PROPAGATION 0 HOPS none"
+  else:
+    _, path = min(
+        paths.items(), key=lambda item: (-(len(item[1]) - 1), item[0])
     )
+    hops = len(path) - 1
+    propagation_line = f"MAX PROPAGATION {hops} HOPS {' > '.join(path)}"
+  return graph_line, affected_line, propagation_line
+
+
+def _chain_cue_event(
+    summary: Mapping[str, Any], branch: str
+) -> tuple[str, int]:
+  """Return the branch-specific peer and step bound to one graph delta."""
+  if branch == "normal":
+    buckets = ("removed",)
+    expected_peer = "side_01"
+  elif branch == "trajectory_changed":
+    buckets = ("added", "changed")
+    expected_peer = "breaker"
+  else:
+    raise ValueError("chain cue branch must be normal or trajectory_changed")
+  target = FORKED_RACK_SPEC.target_id
+  branch_pairs = summary["branches"][branch]["contact_pairs"]
+  branch_steps = set(summary["branches"][branch]["contact_steps"])
+  changed_pairs = summary["branches"]["trajectory_changed"]["contact_pairs"]
+  candidates = []
+  for bucket in buckets:
+    for record in summary["ground_truth"]["graph_delta"][bucket]:
+      endpoints = (record["object_a"], record["object_b"])
+      pair_key = "|".join(sorted(endpoints))
+      if target in endpoints and expected_peer in endpoints:
+        normal_only = branch != "normal" or pair_key not in changed_pairs
+        if (
+            normal_only
+            and pair_key in branch_pairs
+            and record["start_step"] in branch_steps
+        ):
+          candidates.append((record["start_step"], expected_peer))
+  if not candidates:
+    raise ValueError(f"summary cannot bind the {branch} chain cue")
   step, peer = min(candidates)
   return peer, step
 
@@ -611,16 +689,24 @@ def _overlay_texts(
 ) -> dict[str, str]:
   total_duration = source_duration + _START_HOLD + _END_HOLD
   intervention_time = _event_time(summary["intervention_start"], source_fps)
-  contact_object, contact_step = _contact_cue_event(summary)
-  contact_time = _event_time(contact_step, source_fps)
+  normal_object, normal_step = _chain_cue_event(summary, "normal")
+  changed_object, changed_step = _chain_cue_event(
+      summary, "trajectory_changed"
+  )
+  normal_time = _event_time(normal_step, source_fps)
+  changed_time = _event_time(changed_step, source_fps)
   removal_step = summary["branches"]["target_removed"]["removed_step"]
   removal_time = _event_time(removal_step, source_fps)
-  contact_object = contact_object.replace("_", " ").upper()
+  normal_object = normal_object.replace("_", " ").upper()
+  changed_object = changed_object.replace("_", " ").upper()
   graph_line, affected_line, propagation_line = _summary_overlay_lines(summary)
   return {
       "intervention": f"INTERVENTION {intervention_time:.3f}s",
       "duration": f"{total_duration:.3f}s",
-      "contact": f"CONTACT → {contact_object} {contact_time:.3f}s",
+      "normal_chain": f"SMALL CHAIN → {normal_object} {normal_time:.3f}s",
+      "changed_chain": (
+          f"LARGE CHAIN → {changed_object} {changed_time:.3f}s"
+      ),
       "removal": f"TARGET REMOVED {removal_time:.3f}s",
       "graph": graph_line,
       "affected": affected_line,
@@ -681,13 +767,16 @@ def _build_filter(
   intervention_time = _event_time(
       summary["intervention_start"], source_fps
   )
-  _, contact_step = _contact_cue_event(summary)
-  contact_time = _event_time(contact_step, source_fps)
+  _, normal_step = _chain_cue_event(summary, "normal")
+  _, changed_step = _chain_cue_event(summary, "trajectory_changed")
+  normal_time = _event_time(normal_step, source_fps)
+  changed_time = _event_time(changed_step, source_fps)
   removal_step = summary["branches"]["target_removed"]["removed_step"]
   removal_time = _event_time(removal_step, source_fps)
   marker_x = 80 + round(1760 * intervention_time / total_duration)
   final_enable = f"gte(t,{total_duration - _END_HOLD:.6f})"
-  contact_enable = f"between(t,{contact_time:.6f},{contact_time + 0.75:.6f})"
+  normal_enable = f"between(t,{normal_time:.6f},{normal_time + 0.9:.6f})"
+  changed_enable = f"between(t,{changed_time:.6f},{changed_time + 0.9:.6f})"
   removal_enable = f"between(t,{removal_time:.6f},{removal_time + 0.75:.6f})"
 
   chains = []
@@ -739,9 +828,14 @@ def _build_filter(
           size=16, color="0xa5adcb"
       ),
       _drawtext(
-          font_path, textfile=overlay_files["contact"],
+          font_path, textfile=overlay_files["normal_chain"],
+          x="(640-text_w)/2", y="120", size=26,
+          color="0xffd166", enable=normal_enable, box=True,
+      ),
+      _drawtext(
+          font_path, textfile=overlay_files["changed_chain"],
           x="640+(640-text_w)/2", y="120", size=26,
-          color="0xffd166", enable=contact_enable, box=True,
+          color="0xffd166", enable=changed_enable, box=True,
       ),
       _drawtext(
           font_path, textfile=overlay_files["removal"],
@@ -856,11 +950,17 @@ def _validate_synchronized_sources(
 
 
 def _validate_event_steps(summary: Mapping[str, Any], frame_count: int) -> None:
-  _, contact_step = _contact_cue_event(summary)
+  if frame_count != summary["demo_spec"]["source_frames"]:
+    raise ValueError(
+        "source frame count differs from demo_spec.source_frames"
+    )
+  _, normal_step = _chain_cue_event(summary, "normal")
+  _, changed_step = _chain_cue_event(summary, "trajectory_changed")
   named_steps = {
       "intervention_start": summary["intervention_start"],
       "intervention_end": summary["intervention_end"],
-      "selected graph contact": contact_step,
+      "normal chain event": normal_step,
+      "trajectory_changed chain event": changed_step,
       "removed_step": summary["branches"]["target_removed"]["removed_step"],
   }
   for name, step in named_steps.items():

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from scripts import trajectory_demo_spec as demo_spec
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT_NAME = "compose_intervention_demo"
 _SCRIPT_PATH = _PROJECT_ROOT / "scripts" / f"{_SCRIPT_NAME}.py"
@@ -30,6 +32,22 @@ def _import_script():
 
 compose_script = _import_script()
 
+NORMAL_PAIRS = {
+    "side_01|side_02": 1,
+    "side_01|target": 1,
+}
+CHANGED_PAIRS = {
+    "breaker|target": 1,
+    "rack_01|rack_03": 1,
+    "rack_01|target": 1,
+    "rack_02|rack_03": 1,
+    "rack_02|rack_05": 1,
+    "rack_02|target": 1,
+    "rack_03|rack_06": 1,
+    "rack_04|rack_06": 1,
+    "rack_05|rack_06": 1,
+}
+
 
 @pytest.fixture
 def compositor():
@@ -38,64 +56,90 @@ def compositor():
   return compose_script
 
 
-def _summary(*, frame_count=120):
+def _summary():
   return {
       "branches": {
           "normal": {
-              "contact_pairs": {},
-              "contact_steps": [],
+              "contact_pairs": NORMAL_PAIRS.copy(),
+              "contact_steps": [88],
           },
           "trajectory_changed": {
-              "contact_pairs": {"target|upper_ball": 2},
-              "contact_steps": [48, 49],
+              "contact_pairs": CHANGED_PAIRS.copy(),
+              "contact_steps": [70],
           },
           "target_removed": {
               "contact_pairs": {},
               "contact_steps": [],
-              "removed_step": 24,
+              "removed_step": 40,
               "target_id": "target",
               "trust_model": "demo_only_removal_v1",
           },
       },
+      "demo_spec": demo_spec.demo_spec_summary(demo_spec.FORKED_RACK_SPEC),
       "ground_truth": {
           "graph_delta": {
               "added": [{
-                  "object_a": "target",
-                  "object_b": "upper_ball",
-                  "start_step": 48,
-                  "end_step": 59,
+                  "object_a": "breaker",
+                  "object_b": "target",
+                  "start_step": 70,
+                  "end_step": 71,
               }],
               "changed": [],
-              "removed": [],
+              "removed": [{
+                  "object_a": "side_01",
+                  "object_b": "target",
+                  "start_step": 88,
+                  "end_step": 89,
+              }],
               "schema_version": "1.0",
           },
-          "hard_affected": ["upper_ball"],
+          "hard_affected": [
+              "breaker",
+              "rack_01",
+              "rack_02",
+              "rack_03",
+              "rack_04",
+              "rack_05",
+              "rack_06",
+              "side_01",
+              "side_02",
+          ],
           "propagation_path": {
-              "upper_ball": ["target", "upper_ball"],
+              "breaker": ["target", "breaker"],
+              "rack_01": ["target", "breaker", "rack_01"],
+              "rack_02": ["target", "breaker", "rack_01", "rack_02"],
+              "rack_03": [
+                  "target", "breaker", "rack_01", "rack_02", "rack_03"
+              ],
+              "rack_04": [
+                  "target", "breaker", "rack_01", "rack_02", "rack_03",
+                  "rack_04",
+              ],
+              "rack_05": [
+                  "target", "breaker", "rack_01", "rack_02", "rack_03",
+                  "rack_04", "rack_05",
+              ],
+              "rack_06": [
+                  "target", "breaker", "rack_01", "rack_02", "rack_03",
+                  "rack_04", "rack_05", "rack_06",
+              ],
+              "side_01": ["target", "side_01"],
+              "side_02": ["target", "side_01", "side_02"],
           },
           "schema_version": "1.0",
           "soft_affected": [],
       },
-      "intervention_end": min(96, frame_count - 1),
-      "intervention_start": min(24, frame_count - 2),
-      "intervention_window": [
-          min(24, frame_count - 2),
-          min(96, frame_count - 1),
-      ],
-      "object_ids": ["floor", "lower_ball", "target", "upper_ball"],
+      "intervention_end": 160,
+      "intervention_start": 40,
+      "intervention_window": [40, 160],
+      "object_ids": list(demo_spec.FORKED_RACK_SPEC.object_ids),
       "seed": 0,
       "step_rate": 240.0,
   }
 
 
-def _write_summary(directory, *, frame_count=120):
-  payload = _summary(frame_count=frame_count)
-  if frame_count < 50:
-    payload["branches"]["trajectory_changed"]["contact_steps"] = [2, 3]
-    payload["branches"]["target_removed"]["removed_step"] = 1
-    graph_event = payload["ground_truth"]["graph_delta"]["added"][0]
-    graph_event["start_step"] = 2
-    graph_event["end_step"] = 4
+def _write_summary(directory):
+  payload = _summary()
   (directory / "summary.json").write_text(
       json.dumps(payload), encoding="utf-8"
   )
@@ -122,6 +166,86 @@ def _cfr_frames(frame_count, *, ticks_per_frame=512):
 
 def test_compositor_script_exists():
   assert compose_script is not None, f"missing compositor: {_SCRIPT_PATH}"
+
+
+def test_overlay_texts_bind_small_and_large_chain_events(compositor):
+  texts = compositor._overlay_texts(
+      _summary(), source_duration=200 / 24, source_fps=24.0
+  )
+
+  assert texts["normal_chain"].startswith("SMALL CHAIN → SIDE 01")
+  assert texts["changed_chain"].startswith("LARGE CHAIN → BREAKER")
+
+
+def test_summary_overlay_formats_synthetic_counts_compactly(compositor):
+  graph, affected, propagation = compositor._summary_overlay_lines(_summary())
+
+  assert graph == "GRAPH DELTA added=1 removed=1 changed=0"
+  assert affected == "AFFECTED hard=9 soft=0"
+  assert propagation.startswith("MAX PROPAGATION 7 HOPS ")
+  assert propagation.count(";") == 0
+  assert len(propagation) < 110
+
+
+def test_load_summary_accepts_exact_current_demo_spec(compositor, tmp_path):
+  payload = _write_summary(tmp_path)
+
+  loaded = compositor._load_summary(tmp_path)
+
+  assert loaded["demo_spec"] == payload["demo_spec"]
+  assert loaded["demo_spec"] == demo_spec.demo_spec_summary(
+      demo_spec.FORKED_RACK_SPEC
+  )
+
+
+def test_load_summary_rejects_stale_demo_spec(compositor, tmp_path):
+  payload = _summary()
+  payload["demo_spec"]["version"] = "forked_rack_v0"
+  (tmp_path / "summary.json").write_text(
+      json.dumps(payload), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match=r"demo_spec\.version mismatch"):
+    compositor._load_summary(tmp_path)
+
+
+def test_filter_times_both_chain_cues_for_nine_tenths(
+    compositor, tmp_path
+):
+  overlay_dir = tmp_path / "overlays"
+  overlay_dir.mkdir()
+  summary = _summary()
+  overlay_files = compositor._write_overlay_textfiles(
+      overlay_dir,
+      summary,
+      source_duration=200 / 24,
+      source_fps=24.0,
+  )
+
+  filter_graph = compositor._build_filter(
+      summary,
+      _font(tmp_path),
+      source_duration=200 / 24,
+      source_fps=24.0,
+      overlay_files=overlay_files,
+  )
+
+  normal_time = compositor._event_time(88, 24.0)
+  changed_time = compositor._event_time(70, 24.0)
+  assert (
+      f"between(t,{normal_time:.6f},{normal_time + 0.9:.6f})"
+      in filter_graph
+  )
+  assert (
+      f"between(t,{changed_time:.6f},{changed_time + 0.9:.6f})"
+      in filter_graph
+  )
+  assert compositor._escape_filter_path(
+      overlay_files["normal_chain"]
+  ) in filter_graph
+  assert compositor._escape_filter_path(
+      overlay_files["changed_chain"]
+  ) in filter_graph
 
 
 def test_module_imports_without_kubric(compositor):
@@ -172,13 +296,13 @@ def test_filter_has_layout_labels_timeline_cues_and_summary(
   overlay_files = compositor._write_overlay_textfiles(
       overlay_dir,
       _summary(),
-      source_duration=5.0,
+      source_duration=200 / 24,
       source_fps=24.0,
   )
   filter_graph = compositor._build_filter(
       _summary(),
       _font(tmp_path),
-      source_duration=5.0,
+      source_duration=200 / 24,
       source_fps=24.0,
       overlay_files=overlay_files,
   )
@@ -192,102 +316,106 @@ def test_filter_has_layout_labels_timeline_cues_and_summary(
   assert "text='CONTACT" not in filter_graph
   assert "text='GRAPH DELTA" not in filter_graph
   assert overlay_files["intervention"].read_text("utf-8") == (
-      "INTERVENTION 2.000s"
+      "INTERVENTION 2.667s"
   )
-  assert overlay_files["contact"].read_text("utf-8") == (
-      "CONTACT → UPPER BALL 3.000s"
+  assert overlay_files["normal_chain"].read_text("utf-8") == (
+      "SMALL CHAIN → SIDE 01 4.667s"
+  )
+  assert overlay_files["changed_chain"].read_text("utf-8") == (
+      "LARGE CHAIN → BREAKER 3.917s"
   )
   assert overlay_files["removal"].read_text("utf-8") == (
-      "TARGET REMOVED 2.000s"
+      "TARGET REMOVED 2.667s"
   )
   assert overlay_files["graph"].read_text("utf-8") == (
-      "GRAPH DELTA added=1 removed=0 changed=0"
+      "GRAPH DELTA added=1 removed=1 changed=0"
   )
   assert overlay_files["affected"].read_text("utf-8") == (
-      "HARD upper_ball   |   SOFT none"
+      "AFFECTED hard=9 soft=0"
   )
-  assert "target > upper_ball" in overlay_files["propagation"].read_text(
+  assert "target > breaker > rack_01" in overlay_files[
+      "propagation"
+  ].read_text(
       "utf-8"
   )
 
 
-def test_contact_cue_prefers_changed_contact_peer_among_hard_affected(
+def test_overlay_textfiles_write_both_branch_specific_chain_cues(
     compositor, tmp_path
 ):
-  summary = _summary()
-  summary["ground_truth"]["hard_affected"] = ["lower_ball", "upper_ball"]
   overlay_files = compositor._write_overlay_textfiles(
       tmp_path,
-      summary,
-      source_duration=5.0,
+      _summary(),
+      source_duration=200 / 24,
       source_fps=24.0,
   )
 
-  assert overlay_files["contact"].read_text("utf-8") == (
-      "CONTACT → UPPER BALL 3.000s"
+  assert overlay_files["normal_chain"].read_text("utf-8") == (
+      "SMALL CHAIN → SIDE 01 4.667s"
+  )
+  assert overlay_files["changed_chain"].read_text("utf-8") == (
+      "LARGE CHAIN → BREAKER 3.917s"
   )
 
 
 def _summary_with_earlier_unrelated_contact():
   summary = _summary()
-  summary["branches"]["trajectory_changed"]["contact_pairs"] = {
-      "lower_ball|upper_ball": 1,
-      "target|upper_ball": 2,
-  }
-  summary["branches"]["trajectory_changed"]["contact_steps"] = [12, 48, 49]
+  summary["branches"]["trajectory_changed"]["contact_steps"] = [12, 70]
   summary["ground_truth"]["graph_delta"]["added"].insert(0, {
-      "object_a": "lower_ball",
-      "object_b": "upper_ball",
+      "object_a": "rack_01",
+      "object_b": "rack_03",
       "start_step": 12,
       "end_step": 13,
   })
   return summary
 
 
-def test_contact_cue_time_and_peer_come_from_same_graph_event(
+def test_changed_chain_time_and_peer_come_from_same_graph_event(
     compositor, tmp_path
 ):
   summary = _summary_with_earlier_unrelated_contact()
   overlay_files = compositor._write_overlay_textfiles(
       tmp_path,
       summary,
-      source_duration=5.0,
+      source_duration=200 / 24,
       source_fps=24.0,
   )
   filter_graph = compositor._build_filter(
       summary,
       _font(tmp_path),
-      source_duration=5.0,
+      source_duration=200 / 24,
       source_fps=24.0,
       overlay_files=overlay_files,
   )
 
-  assert overlay_files["contact"].read_text("utf-8") == (
-      "CONTACT → UPPER BALL 3.000s"
+  assert overlay_files["changed_chain"].read_text("utf-8") == (
+      "LARGE CHAIN → BREAKER 3.917s"
   )
-  assert "enable='between(t,3.000000,3.750000)'" in filter_graph
-  assert "enable='between(t,1.500000,2.250000)'" not in filter_graph
+  assert "enable='between(t,3.916667,4.816667)'" in filter_graph
+  assert "enable='between(t,1.500000,2.400000)'" not in filter_graph
 
 
-def test_event_bounds_validate_the_selected_graph_contact(compositor):
+def test_event_bounds_validate_the_selected_changed_chain_event(compositor):
   summary = _summary_with_earlier_unrelated_contact()
-  summary["intervention_end"] = 30
-  summary["intervention_window"] = [24, 30]
+  summary["branches"]["trajectory_changed"]["contact_steps"] = [12, 200]
+  graph_event = summary["ground_truth"]["graph_delta"]["added"][1]
+  graph_event["start_step"] = 200
+  graph_event["end_step"] = 201
 
-  with pytest.raises(ValueError, match="contact|graph"):
-    compositor._validate_event_steps(summary, frame_count=40)
+  with pytest.raises(ValueError, match="trajectory_changed chain event"):
+    compositor._validate_event_steps(summary, frame_count=200)
 
 
 def test_load_summary_rejects_graph_contact_step_mismatch(
     compositor, tmp_path
 ):
   summary = _summary_with_earlier_unrelated_contact()
-  summary["ground_truth"]["graph_delta"]["added"][1]["start_step"] = 47
+  summary["ground_truth"]["graph_delta"]["added"][1]["start_step"] = 69
   (tmp_path / "summary.json").write_text(
       json.dumps(summary), encoding="utf-8"
   )
 
-  with pytest.raises(ValueError, match="graph|contact|step"):
+  with pytest.raises(ValueError, match="bind|chain|step"):
     compositor._load_summary(tmp_path)
 
 
@@ -357,7 +485,7 @@ def test_drawtext_escapes_apostrophe_in_textfile_path(compositor, tmp_path):
   apostrophe_dir = tmp_path / "apostrophe's directory"
   apostrophe_dir.mkdir()
   textfile = apostrophe_dir / "cue.txt"
-  textfile.write_text("CONTACT → UPPER BALL", encoding="utf-8")
+  textfile.write_text("LARGE CHAIN → BREAKER", encoding="utf-8")
 
   rendered = _render_textfile_frame(
       compositor,
@@ -376,10 +504,13 @@ def test_full_filter_escapes_summary_metacharacters(compositor, tmp_path):
     pytest.skip("ffmpeg is required for filter parser coverage")
   summary = _summary()
   affected = "target's 100% [path]: a,b\\c"
-  summary["ground_truth"]["hard_affected"] = ["upper_ball", affected]
+  summary["ground_truth"]["hard_affected"].append(affected)
   summary["ground_truth"]["propagation_path"] = {
-      "upper_ball": ["target", "upper_ball"],
-      affected: ["target", affected]
+      **summary["ground_truth"]["propagation_path"],
+      affected: [
+          "target", "breaker", "rack_01", "rack_02", "rack_03",
+          "rack_04", "rack_05", "rack_06", affected,
+      ],
   }
   overlay_dir = tmp_path / "special-overlays"
   overlay_dir.mkdir()
@@ -432,7 +563,7 @@ def test_probe_video_parses_positive_stream_metadata(
   video = tmp_path / "input.mp4"
   video.write_bytes(b"video")
   payload = {
-      "frames": _cfr_frames(120),
+      "frames": _cfr_frames(200),
       "streams": [{
           "codec_name": "h264",
           "width": 640,
@@ -441,10 +572,10 @@ def test_probe_video_parses_positive_stream_metadata(
           "avg_frame_rate": "24/1",
           "r_frame_rate": "24/1",
           "time_base": "1/12288",
-          "nb_frames": "120",
-          "duration": "5.000000",
+          "nb_frames": "200",
+          "duration": "8.333333",
       }],
-      "format": {"duration": "5.000000"},
+      "format": {"duration": "8.333333"},
   }
   calls = []
 
@@ -462,8 +593,8 @@ def test_probe_video_parses_positive_stream_metadata(
   assert info.height == 540
   assert info.fps == Fraction(24, 1)
   assert isinstance(info.fps, Fraction)
-  assert info.frame_count == 120
-  assert info.duration == 5.0
+  assert info.frame_count == 200
+  assert info.duration == pytest.approx(200 / 24, abs=1e-6)
   assert info.codec_name == "h264"
   assert info.pix_fmt == "yuv420p"
   assert calls[0][0][0] == "/tools/ffprobe"
@@ -477,7 +608,7 @@ def test_probe_video_prefers_counted_frames_over_declared_frames(
   video = tmp_path / "input.mp4"
   video.write_bytes(b"video")
   payload = {
-      "frames": _cfr_frames(119),
+      "frames": _cfr_frames(199),
       "streams": [{
           "codec_name": "h264",
           "width": 640,
@@ -486,11 +617,11 @@ def test_probe_video_prefers_counted_frames_over_declared_frames(
           "avg_frame_rate": "24/1",
           "r_frame_rate": "24/1",
           "time_base": "1/12288",
-          "nb_frames": "120",
-          "nb_read_frames": "119",
-          "duration": "5.0",
+          "nb_frames": "200",
+          "nb_read_frames": "199",
+          "duration": "8.333333",
       }],
-      "format": {"duration": "5.0"},
+      "format": {"duration": "8.333333"},
   }
   monkeypatch.setattr(
       subprocess,
@@ -502,7 +633,7 @@ def test_probe_video_prefers_counted_frames_over_declared_frames(
 
   info = compositor._probe_video(video, ffprobe="/tools/ffprobe")
 
-  assert info.frame_count == 119
+  assert info.frame_count == 199
 
 
 def test_probe_video_rejects_vfr_like_rate_metadata(
@@ -518,10 +649,10 @@ def test_probe_video_rejects_vfr_like_rate_metadata(
           "pix_fmt": "yuv420p",
           "avg_frame_rate": "24/1",
           "r_frame_rate": "30/1",
-          "nb_frames": "120",
-          "duration": "5.0",
+          "nb_frames": "200",
+          "duration": "8.333333",
       }],
-      "format": {"duration": "5.0"},
+      "format": {"duration": "8.333333"},
   }
   monkeypatch.setattr(
       subprocess,
@@ -629,14 +760,14 @@ def test_probe_video_rejects_nonpositive_or_nonfinite_metadata(
       "avg_frame_rate": "24/1",
       "r_frame_rate": "24/1",
       "time_base": "1/12288",
-      "nb_frames": "120",
-      "duration": "5.0",
+      "nb_frames": "200",
+      "duration": "8.333333",
   }
   stream[field] = value
   payload = {
-      "frames": _cfr_frames(120),
+      "frames": _cfr_frames(200),
       "streams": [stream],
-      "format": {"duration": "5.0"},
+      "format": {"duration": "8.333333"},
   }
   monkeypatch.setattr(
       subprocess,
@@ -661,8 +792,8 @@ def test_source_probe_mismatch_is_rejected_before_ffmpeg_or_output(
       width=640,
       height=540,
       fps=24.0,
-      frame_count=120,
-      duration=5.0,
+      frame_count=200,
+      duration=200 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -673,8 +804,8 @@ def test_source_probe_mismatch_is_rejected_before_ffmpeg_or_output(
           width=641,
           height=540,
           fps=24.0,
-          frame_count=120,
-          duration=5.0,
+          frame_count=200,
+          duration=200 / 24,
           codec_name="h264",
           pix_fmt="yuv420p",
       )
@@ -710,8 +841,8 @@ def test_equal_non_h264_sources_are_rejected_before_ffmpeg_or_output(
       width=640,
       height=540,
       fps=Fraction(24, 1),
-      frame_count=120,
-      duration=5.0,
+      frame_count=200,
+      duration=200 / 24,
       codec_name=codec_name,
       pix_fmt="yuv420p",
   )
@@ -736,13 +867,13 @@ def test_equal_non_h264_sources_are_rejected_before_ffmpeg_or_output(
 def _synchronized_infos(compositor, *, rates=None, durations=None):
   branch_names = ("normal", "trajectory_changed", "target_removed")
   rates = rates or (Fraction(24, 1),) * 3
-  durations = durations or (5.0,) * 3
+  durations = durations or (200 / 24,) * 3
   return {
       branch: compositor.VideoInfo(
           width=640,
           height=540,
           fps=rate,
-          frame_count=120,
+          frame_count=200,
           duration=duration,
           codec_name="h264",
           pix_fmt="yuv420p",
@@ -806,8 +937,8 @@ def test_composed_timing_uses_source_frame_count_not_float_duration(
       width=640,
       height=540,
       fps=Fraction(24, 1),
-      frame_count=120,
-      duration=5.021,
+      frame_count=200,
+      duration=200 / 24 + 0.021,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -815,8 +946,8 @@ def test_composed_timing_uses_source_frame_count_not_float_duration(
       width=1920,
       height=720,
       fps=Fraction(24, 1),
-      frame_count=192,
-      duration=8.0,
+      frame_count=272,
+      duration=272 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -829,7 +960,7 @@ def test_source_duration_rejects_difference_above_one_microsecond(
 ):
   infos = _synchronized_infos(
       compositor,
-      durations=(5.0, 5.0000011, 5.0),
+      durations=(200 / 24, 200 / 24 + 0.0000011, 200 / 24),
   )
 
   with pytest.raises(ValueError, match="duration|synchronized"):
@@ -915,8 +1046,8 @@ def test_compose_quantizes_overlay_duration_from_source_frame_count(
       width=640,
       height=540,
       fps=Fraction(24, 1),
-      frame_count=120,
-      duration=5.021,
+      frame_count=200,
+      duration=200 / 24 + 0.021,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -924,8 +1055,8 @@ def test_compose_quantizes_overlay_duration_from_source_frame_count(
       width=1920,
       height=720,
       fps=Fraction(24, 1),
-      frame_count=192,
-      duration=8.0,
+      frame_count=272,
+      duration=272 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -938,7 +1069,7 @@ def test_compose_quantizes_overlay_duration_from_source_frame_count(
     textfiles = [Path(value) for value in re.findall(
         r"textfile=([^:]+):reload=0", filter_graph
     )]
-    assert any(path.read_text("utf-8") == "8.000s" for path in textfiles)
+    assert any(path.read_text("utf-8") == "11.333s" for path in textfiles)
     Path(command[-1]).write_bytes(b"encoded")
 
   monkeypatch.setattr(compositor, "_probe_video", fake_probe)
@@ -951,7 +1082,7 @@ def test_compose_quantizes_overlay_duration_from_source_frame_count(
 
   metadata = compositor.compose_intervention_demo(tmp_path, output, font)
 
-  assert metadata["frame_count"] == 192
+  assert metadata["frame_count"] == 272
   assert output.read_bytes() == b"encoded"
 
 
@@ -967,8 +1098,8 @@ def test_failed_encode_preserves_existing_output_and_removes_staging(
       width=640,
       height=540,
       fps=24.0,
-      frame_count=120,
-      duration=5.0,
+      frame_count=200,
+      duration=200 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -987,7 +1118,7 @@ def test_failed_encode_preserves_existing_output_and_removes_staging(
     assert textfiles
     assert all(path.is_file() for path in textfiles)
     assert any(
-        path.read_text("utf-8").startswith("CONTACT → UPPER BALL")
+        path.read_text("utf-8").startswith("LARGE CHAIN → BREAKER")
         for path in textfiles
     )
     overlay_directories = {path.parent for path in textfiles}
@@ -1085,8 +1216,8 @@ def test_states_dir_rejects_symlink_ancestor_before_ffmpeg(
       width=640,
       height=540,
       fps=Fraction(24, 1),
-      frame_count=120,
-      duration=5.0,
+      frame_count=200,
+      duration=200 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -1124,8 +1255,8 @@ def test_output_rejects_symlink_ancestor_canonical_source_alias_before_ffmpeg(
       width=640,
       height=540,
       fps=Fraction(24, 1),
-      frame_count=120,
-      duration=5.0,
+      frame_count=200,
+      duration=200 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -1166,8 +1297,8 @@ def test_output_rejects_source_hardlink_before_ffmpeg(
       width=640,
       height=540,
       fps=Fraction(24, 1),
-      frame_count=120,
-      duration=5.0,
+      frame_count=200,
+      duration=200 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -1204,8 +1335,8 @@ def test_output_is_revalidated_before_publish_and_preserves_source_hash(
       width=640,
       height=540,
       fps=Fraction(24, 1),
-      frame_count=120,
-      duration=5.0,
+      frame_count=200,
+      duration=200 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -1213,8 +1344,8 @@ def test_output_is_revalidated_before_publish_and_preserves_source_hash(
       width=1920,
       height=720,
       fps=Fraction(24, 1),
-      frame_count=192,
-      duration=8.0,
+      frame_count=272,
+      duration=272 / 24,
       codec_name="h264",
       pix_fmt="yuv420p",
   )
@@ -1257,9 +1388,9 @@ def _make_synthetic_video(ffmpeg, path, color):
           "-f",
           "lavfi",
           "-i",
-          f"color=c={color}:s=160x120:r=24:d=0.25",
+          f"color=c={color}:s=160x120:r=24:d={200 / 24}",
           "-frames:v",
-          "6",
+          "200",
           "-c:v",
           "libx264",
           "-pix_fmt",
@@ -1275,7 +1406,7 @@ def _make_synthetic_video(ffmpeg, path, color):
   assert result.returncode == 0, result.stderr
 
 
-def test_real_ffmpeg_composes_six_frame_sources(compositor, tmp_path):
+def test_real_ffmpeg_composes_full_demo_frame_count(compositor, tmp_path):
   ffmpeg = shutil.which("ffmpeg")
   ffprobe = shutil.which("ffprobe")
   if ffmpeg is None or ffprobe is None:
@@ -1287,31 +1418,31 @@ def test_real_ffmpeg_composes_six_frame_sources(compositor, tmp_path):
       ("target_removed", "blue"),
   ):
     _make_synthetic_video(ffmpeg, tmp_path / f"{name}_blender.mp4", color)
-  _write_summary(tmp_path, frame_count=6)
+  _write_summary(tmp_path)
   output = tmp_path / "comparison.mp4"
 
   metadata = compositor.compose_intervention_demo(tmp_path, output, font)
   info = compositor._probe_video(output, ffprobe=ffprobe)
 
   assert metadata == {
-      "duration": pytest.approx(3.25, abs=0.01),
-      "frame_count": 78,
+      "duration": pytest.approx(272 / 24, abs=0.01),
+      "frame_count": 272,
       "output": str(output),
       "size": [1920, 720],
   }
   assert info.width == 1920
   assert info.height == 720
   assert info.fps == pytest.approx(24.0)
-  assert info.frame_count == 78
-  assert info.duration == pytest.approx(3.25, abs=0.01)
+  assert info.frame_count == 272
+  assert info.duration == pytest.approx(272 / 24, abs=0.01)
   assert info.codec_name == "h264"
   assert info.pix_fmt == "yuv420p"
 
 
 def test_cli_prints_compact_json_metadata(compositor, tmp_path, monkeypatch, capsys):
   expected = {
-      "duration": 8.0,
-      "frame_count": 192,
+      "duration": 272 / 24,
+      "frame_count": 272,
       "output": str(tmp_path / "result.mp4"),
       "size": [1920, 720],
   }
