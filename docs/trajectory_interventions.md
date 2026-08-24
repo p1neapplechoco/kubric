@@ -86,8 +86,8 @@ an exception returns machine-readable `status: error` and exit code 1.
 ## Run the three-branch collision demo
 
 The inspectable forked-rack demo compares three synchronized outcomes from one
-immutable scene contract. Its eleven canonical objects, in stored replay order,
-are:
+immutable scene contract. Its eleven canonical objects fall into these semantic
+groups:
 
 | Semantic group | Canonical object IDs | Role |
 | --- | --- | --- |
@@ -181,6 +181,51 @@ ffprobe -v error -select_streams v:0 \
   -show_entries format=duration,size \
   -of json output/demo_collision_intervention/trajectory_intervention_demo.mp4
 ```
+
+### Verified forked-rack artifact
+
+Verification completed on 2026-08-25 (Asia/Ho_Chi_Minh) on branch
+`feature/dramatic-forked-rack-implementation` at implementation HEAD
+`ae021dea92bfcdda89181316e9ca360f317053c7`. The documentation handoff commit
+follows that implementation hash; recording its own final hash here would be
+self-referential. The canonical `forked_rack_v1` seed-0 specification has
+SHA-256
+`792a36f2376cf7acf994819d885ec8bd0babf1d273dc5369892fd98a4017b977`.
+Its exact replay order is `breaker`, `floor`, `rack_01` through
+`rack_06`, `side_01`, `side_02`, `target`.
+
+The supported `./run_demo.sh intervention` workflow exited 0 and produced
+three 200-frame, 640x540, H.264/yuv420p, CFR-24 branch videos at 64 Cycles
+samples. It used Docker image
+`sha256:cc4fb8a65172cc1da81dd0ce04bfe47c2405db2e357d842c17583400079d1a80`.
+Blender's shutdown report of `3 blocks / 0.003777 MB unfreed` was nonfatal.
+The 1920x720 composite is H.264/yuv420p, CFR 24/1, 272 decoded frames, and
+11.333333 seconds; all four videos passed full `ffmpeg -xerror` decoding.
+
+Visual review found the complete target, nine balls, and table/floor visible
+and unclipped before the intervention; an aligned prefix; the expected small
+normal chain; the changed branch reaching all seven main balls by step 160;
+and target removal only at step 40 with no later contact or motion. No teleport,
+detached decoration, label overlap, or panel desynchronization was observed.
+The maximum observed one-frame displacement was 3.07 cm, and the ending
+metadata remained readable inside its lower band. A visual QA pass caught
+rounded-time cues one frame late; commits `b965116`, `d315435`, and
+`ae021dea` moved them to the exact decoded-frame lattice: removal frames
+64-81, changed-chain frames 112-133, normal-chain frames 117-138, and final
+metadata beginning at frame 224. Decoded integration tests cover the frame
+before, first, last, and frame after each cue. The final compositor was rerun
+with `python -m scripts.compose_intervention_demo`; no Blender rerender was
+needed because the later commits changed only compositor code and tests. A
+fresh implementation-head suite reported 922 passed in 66.50 seconds.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `summary.json` | `24db6d3be0265e667bb98e957aa98f96c8db9a75c31ebfaa27287866ab8a5ec4` |
+| `contacts.json` | `f32f77358fa9a45643f5b86cc79a4952dfa15905d0784f93e363d5eec9ed97ad` |
+| `normal_blender.mp4` | `9aa973fa211776adbed699ddb8dfbcc5370728bba105e6416c8f1d8fa2f09373` |
+| `trajectory_changed_blender.mp4` | `ef052fb4f7b760f7067546c9e264238ea1bf7e2b7b816ae2fa25ba53cd2ddaef` |
+| `target_removed_blender.mp4` | `1cd5187e8bbd505f82e2a5eee0076457e389e8e2f837441dc25b7d1c1ae01cd9` |
+| `trajectory_intervention_demo.mp4` | `40323ab0ec96992305365326ce7eb9ad03d9f143c63c175a52b14996d94e54be` |
 
 ### Demo-only removal trust boundary
 
