@@ -209,6 +209,190 @@ def test_load_summary_rejects_stale_demo_spec(compositor, tmp_path):
     compositor._load_summary(tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda value: value.__setitem__(
+                "object_ids", list(reversed(value["object_ids"]))
+            ),
+            "object_ids mismatch",
+        ),
+        (
+            lambda value: value["branches"]["target_removed"].__setitem__(
+                "target_id", "breaker"
+            ),
+            "target_id mismatch",
+        ),
+        (lambda value: value.__setitem__("seed", 1), "seed mismatch"),
+        (
+            lambda value: value.__setitem__("step_rate", 241.0),
+            "step_rate mismatch",
+        ),
+        (
+            lambda value: (
+                value.__setitem__("intervention_start", 41),
+                value.__setitem__("intervention_window", [41, 160]),
+            ),
+            "intervention_start mismatch",
+        ),
+        (
+            lambda value: (
+                value.__setitem__("intervention_end", 159),
+                value.__setitem__("intervention_window", [40, 159]),
+            ),
+            "intervention_end mismatch",
+        ),
+        (
+            lambda value: value["branches"]["target_removed"].__setitem__(
+                "removed_step", 41
+            ),
+            "removed_step mismatch",
+        ),
+    ),
+)
+def test_load_summary_rejects_demo_contract_metadata_mismatches(
+    compositor, tmp_path, mutation, message
+):
+  payload = _summary()
+  mutation(payload)
+  (tmp_path / "summary.json").write_text(
+      json.dumps(payload), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match=message):
+    compositor._load_summary(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("branch", "bad_pair", "message"),
+    (
+        ("normal", "side_01", "exactly two"),
+        ("normal", "side_01|side_02|target", "exactly two"),
+        ("normal", "ghost|side_01", "canonical object_ids"),
+        ("normal", "side_01|side_01", "distinct"),
+        ("normal", "target|side_01", "canonically ordered"),
+        ("trajectory_changed", "target|breaker", "canonically ordered"),
+    ),
+)
+def test_load_summary_rejects_malformed_contact_pair_keys(
+    compositor, tmp_path, branch, bad_pair, message
+):
+  payload = _summary()
+  pairs = payload["branches"][branch]["contact_pairs"]
+  original = next(iter(pairs))
+  pairs[bad_pair] = pairs.pop(original)
+  (tmp_path / "summary.json").write_text(
+      json.dumps(payload), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match=message):
+    compositor._load_summary(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda value: value["branches"]["normal"].__setitem__(
+                "contact_pairs",
+                {
+                    "floor|side_01": 1,
+                    "floor|side_02": 1,
+                    "floor|target": 1,
+                    "side_01|target": 1,
+                },
+            ),
+            "normal branch must contain 2 to 3",
+        ),
+        (
+            lambda value: value["branches"]["trajectory_changed"].__setitem__(
+                "contact_pairs",
+                dict(list(CHANGED_PAIRS.items())[:6]),
+            ),
+            "trajectory_changed branch must contain 7 to 9",
+        ),
+        (
+            lambda value: value["branches"]["normal"].__setitem__(
+                "contact_pairs",
+                {"breaker|target": 1, "side_01|target": 1},
+            ),
+            "normal branch.*main-group",
+        ),
+        (
+            lambda value: value["branches"]["trajectory_changed"].__setitem__(
+                "contact_pairs",
+                {
+                    **{
+                        pair: count
+                        for pair, count in CHANGED_PAIRS.items()
+                        if pair != "rack_05|rack_06"
+                    },
+                    "side_01|target": 1,
+                },
+            ),
+            "trajectory_changed branch.*side-group",
+        ),
+        (
+            lambda value: value["branches"]["trajectory_changed"].__setitem__(
+                "contact_pairs",
+                {
+                    "breaker|target": 1,
+                    "floor|rack_01": 1,
+                    "floor|target": 1,
+                    "rack_01|target": 1,
+                    "rack_02|target": 1,
+                    "rack_03|target": 1,
+                    "rack_04|target": 1,
+                },
+            ),
+            "trajectory_changed branch.*at least 6 main-group",
+        ),
+    ),
+)
+def test_load_summary_rejects_invalid_chain_pair_ranges_and_groups(
+    compositor, tmp_path, mutation, message
+):
+  payload = _summary()
+  mutation(payload)
+  (tmp_path / "summary.json").write_text(
+      json.dumps(payload), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match=message):
+    compositor._load_summary(tmp_path)
+
+
+def test_load_summary_allows_only_prefix_contacts_for_removed_branch(
+    compositor, tmp_path
+):
+  payload = _summary()
+  removed = payload["branches"]["target_removed"]
+  removed["contact_pairs"] = {"side_01|side_02": 1}
+  removed["contact_steps"] = [39]
+  (tmp_path / "summary.json").write_text(
+      json.dumps(payload), encoding="utf-8"
+  )
+
+  assert compositor._load_summary(tmp_path) == payload
+
+
+@pytest.mark.parametrize("step", (40, 41, 199))
+def test_load_summary_rejects_post_removal_contacts(
+    compositor, tmp_path, step
+):
+  payload = _summary()
+  removed = payload["branches"]["target_removed"]
+  removed["contact_pairs"] = {"side_01|side_02": 1}
+  removed["contact_steps"] = [step]
+  (tmp_path / "summary.json").write_text(
+      json.dumps(payload), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="target_removed branch.*at or after"):
+    compositor._load_summary(tmp_path)
+
+
 def test_filter_times_both_chain_cues_for_nine_tenths(
     compositor, tmp_path
 ):
@@ -222,9 +406,10 @@ def test_filter_times_both_chain_cues_for_nine_tenths(
       source_fps=24.0,
   )
 
+  font = _font(tmp_path)
   filter_graph = compositor._build_filter(
       summary,
-      _font(tmp_path),
+      font,
       source_duration=200 / 24,
       source_fps=24.0,
       overlay_files=overlay_files,
@@ -245,6 +430,26 @@ def test_filter_times_both_chain_cues_for_nine_tenths(
   ) in filter_graph
   assert compositor._escape_filter_path(
       overlay_files["changed_chain"]
+  ) in filter_graph
+  assert compositor._drawtext(
+      font,
+      textfile=overlay_files["normal_chain"],
+      x="(640-text_w)/2",
+      y="120",
+      size=26,
+      color="0xffd166",
+      enable=f"between(t,{normal_time:.6f},{normal_time + 0.9:.6f})",
+      box=True,
+  ) in filter_graph
+  assert compositor._drawtext(
+      font,
+      textfile=overlay_files["changed_chain"],
+      x="640+(640-text_w)/2",
+      y="120",
+      size=26,
+      color="0xffd166",
+      enable=f"between(t,{changed_time:.6f},{changed_time + 0.9:.6f})",
+      box=True,
   ) in filter_graph
 
 
@@ -824,6 +1029,42 @@ def test_source_probe_mismatch_is_rejected_before_ffmpeg_or_output(
   )
 
   with pytest.raises(ValueError, match="width|synchronized|match"):
+    compositor.compose_intervention_demo(tmp_path, output, font)
+
+  assert not output.exists()
+
+
+def test_synchronized_199_frame_sources_rejected_before_ffmpeg_or_output(
+    compositor, tmp_path, monkeypatch
+):
+  _write_summary(tmp_path)
+  _touch_sources(tmp_path)
+  output = tmp_path / "final.mp4"
+  font = _font(tmp_path)
+  info = compositor.VideoInfo(
+      width=640,
+      height=540,
+      fps=Fraction(24, 1),
+      frame_count=199,
+      duration=199 / 24,
+      codec_name="h264",
+      pix_fmt="yuv420p",
+  )
+  monkeypatch.setattr(compositor, "_probe_video", lambda *args, **kwargs: info)
+  monkeypatch.setattr(
+      compositor.shutil,
+      "which",
+      lambda name: f"/tools/{name}",
+  )
+  monkeypatch.setattr(
+      compositor,
+      "_run_ffmpeg",
+      lambda command: pytest.fail("ffmpeg ran for 199-frame sources"),
+  )
+
+  with pytest.raises(
+      ValueError, match=r"source frame count differs.*source_frames"
+  ):
     compositor.compose_intervention_demo(tmp_path, output, font)
 
   assert not output.exists()

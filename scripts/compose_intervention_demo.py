@@ -153,6 +153,23 @@ def _require_step_list(value: Any, name: str) -> list[int]:
   return result
 
 
+def _validate_contact_pair_key(pair: str, name: str) -> tuple[str, str]:
+  endpoints = pair.split("|")
+  if len(endpoints) != 2:
+    raise ValueError(
+        f"{name} must contain exactly two object IDs separated by '|'"
+    )
+  object_a, object_b = endpoints
+  canonical_ids = set(FORKED_RACK_SPEC.object_ids)
+  if object_a not in canonical_ids or object_b not in canonical_ids:
+    raise ValueError(f"{name} endpoints must name canonical object_ids")
+  if object_a == object_b:
+    raise ValueError(f"{name} endpoints must be distinct")
+  if object_a > object_b:
+    raise ValueError(f"{name} endpoints must be canonically ordered")
+  return object_a, object_b
+
+
 def _validate_contact_summary(
     value: Any, name: str, *, removal: bool = False
 ) -> dict[str, Any]:
@@ -163,6 +180,7 @@ def _validate_contact_summary(
   pairs = _require_object(branch["contact_pairs"], f"{name}.contact_pairs")
   for pair, count in pairs.items():
     _require_nonempty_string(pair, f"{name}.contact_pairs key")
+    _validate_contact_pair_key(pair, f"{name}.contact_pairs[{pair!r}]")
     _require_integer(count, f"{name}.contact_pairs[{pair!r}]", minimum=1)
   _require_step_list(branch["contact_steps"], f"{name}.contact_steps")
   if removal:
@@ -351,8 +369,12 @@ def _load_summary(states_dir: str | Path) -> dict[str, Any]:
   _validate_demo_spec_identity(summary["demo_spec"])
 
   object_ids = _require_string_list(summary["object_ids"], "object_ids")
+  if object_ids != list(FORKED_RACK_SPEC.object_ids):
+    raise ValueError("object_ids mismatch")
   seed = summary["seed"]
   _require_integer(seed, "seed")
+  if seed != FORKED_RACK_SPEC.seed:
+    raise ValueError("seed mismatch")
   step_rate = summary["step_rate"]
   if (
       isinstance(step_rate, bool)
@@ -361,6 +383,8 @@ def _load_summary(states_dir: str | Path) -> dict[str, Any]:
       or step_rate <= 0
   ):
     raise ValueError("step_rate must be a positive finite number")
+  if step_rate != FORKED_RACK_SPEC.step_rate:
+    raise ValueError("step_rate mismatch")
 
   start = _require_integer(summary["intervention_start"], "intervention_start")
   end = _require_integer(summary["intervention_end"], "intervention_end")
@@ -371,6 +395,11 @@ def _load_summary(states_dir: str | Path) -> dict[str, Any]:
     raise ValueError(
         f"intervention_window must exactly equal {[start, end]!r}"
     )
+  expected_start, expected_end = FORKED_RACK_SPEC.intervention_window
+  if start != expected_start:
+    raise ValueError("intervention_start mismatch")
+  if end != expected_end:
+    raise ValueError("intervention_end mismatch")
 
   branches = _require_object(summary["branches"], "branches")
   expected_branches = frozenset(name for name, _ in _BRANCH_FILES)
@@ -386,8 +415,10 @@ def _load_summary(states_dir: str | Path) -> dict[str, Any]:
   removed = _validate_contact_summary(
       branches["target_removed"], "branches.target_removed", removal=True
   )
-  if removed["target_id"] not in object_ids:
-    raise ValueError("branches.target_removed.target_id must name an object_id")
+  if removed["target_id"] != FORKED_RACK_SPEC.target_id:
+    raise ValueError("branches.target_removed.target_id mismatch")
+  if removed["removed_step"] != expected_start:
+    raise ValueError("branches.target_removed.removed_step mismatch")
   _validate_ground_truth(summary["ground_truth"])
   _validate_demo_branch_contract(summary)
   _chain_cue_event(summary, "normal")
