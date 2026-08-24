@@ -32,12 +32,14 @@ from scripts.trajectory_demo_spec import (
     FORKED_RACK_SPEC,
     DemoSceneSpec,
     demo_spec_summary,
+    spec_sha256,
     validate_demo_spec,
 )
 
 
 _OUTPUT_DIR = Path("output/demo_collision_intervention")
 _DEMO_SPEC = FORKED_RACK_SPEC
+_DEMO_SPEC_SHA256 = spec_sha256(_DEMO_SPEC)
 _DEMO_SEED = _DEMO_SPEC.seed
 _BUNDLE_BRANCHES = ("normal", "trajectory_changed", "target_removed")
 
@@ -538,9 +540,13 @@ def _validate_demo_bundle(result: DemoResult) -> None:
   """Validates the fixed three-branch replay contract before any writes."""
   if not isinstance(result, DemoResult):
     raise TypeError("result must be a DemoResult")
-  if result.demo_spec != _DEMO_SPEC:
+  try:
+    validate_demo_spec(result.demo_spec)
+    result_spec_sha256 = spec_sha256(result.demo_spec)
+  except (TypeError, ValueError) as error:
+    raise ValueError("demo result spec identity differs from canonical") from error
+  if result_spec_sha256 != _DEMO_SPEC_SHA256:
     raise ValueError("demo result spec identity differs from canonical")
-  validate_demo_spec(result.demo_spec)
   expected_scene, expected_intervention, expected_path = build_demo_inputs(
       result.demo_spec
   )

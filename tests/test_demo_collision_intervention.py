@@ -584,6 +584,24 @@ def test_bundle_rejects_result_from_different_spec(generated_demo, tmp_path):
   assert not any(tmp_path.iterdir())
 
 
+def test_bundle_rejects_digest_distinct_equal_spec(generated_demo, tmp_path):
+  wrong_spec = dataclasses.replace(
+      demo_spec.FORKED_RACK_SPEC, gravity=(0.0, 0.0, -0.0)
+  )
+  assert wrong_spec == demo_spec.FORKED_RACK_SPEC
+  assert demo_spec.spec_sha256(wrong_spec) != demo_spec.spec_sha256(
+      demo_spec.FORKED_RACK_SPEC
+  )
+  wrong_result = dataclasses.replace(generated_demo, demo_spec=wrong_spec)
+  output = tmp_path / "bundle"
+
+  with pytest.raises(
+      ValueError, match="demo result spec identity differs from canonical"
+  ):
+    demo.write_demo_bundle(output, wrong_result)
+  assert not output.exists()
+
+
 def test_bundle_rejects_scene_different_from_stored_spec(
     generated_demo, tmp_path
 ):
