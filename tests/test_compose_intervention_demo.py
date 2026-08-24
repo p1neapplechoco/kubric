@@ -61,11 +61,11 @@ def _summary():
       "branches": {
           "normal": {
               "contact_pairs": NORMAL_PAIRS.copy(),
-              "contact_steps": [88],
+              "contact_steps": [93, 94, 95, 96],
           },
           "trajectory_changed": {
               "contact_pairs": CHANGED_PAIRS.copy(),
-              "contact_steps": [70],
+              "contact_steps": [88, 110, 131, 137, 142, 153, 156, 160, 195],
           },
           "target_removed": {
               "contact_pairs": {},
@@ -81,15 +81,15 @@ def _summary():
               "added": [{
                   "object_a": "breaker",
                   "object_b": "target",
-                  "start_step": 70,
-                  "end_step": 71,
+                  "start_step": 88,
+                  "end_step": 89,
               }],
               "changed": [],
               "removed": [{
                   "object_a": "side_01",
                   "object_b": "target",
-                  "start_step": 88,
-                  "end_step": 89,
+                  "start_step": 93,
+                  "end_step": 97,
               }],
               "schema_version": "1.0",
           },
@@ -393,7 +393,36 @@ def test_load_summary_rejects_post_removal_contacts(
     compositor._load_summary(tmp_path)
 
 
-def test_filter_times_both_chain_cues_for_nine_tenths(
+@pytest.mark.parametrize(
+    ("start_frame", "duration", "expected", "displayed_frames"),
+    (
+        (112, Fraction(9, 10), "between(n,112,133)", 22),
+        (117, Fraction(9, 10), "between(n,117,138)", 22),
+        (64, Fraction(3, 4), "between(n,64,81)", 18),
+    ),
+)
+def test_frame_window_enable_uses_half_open_duration_policy(
+    compositor, start_frame, duration, expected, displayed_frames
+):
+  expression = compositor._frame_window_enable(start_frame, duration)
+  match = re.fullmatch(r"between\(n,(\d+),(\d+)\)", expression)
+
+  assert expression == expected
+  assert match is not None
+  first, last = (int(value) for value in match.groups())
+  assert first == start_frame
+  assert not first <= start_frame - 1 <= last
+  assert first <= start_frame <= last
+  assert last - first + 1 == displayed_frames
+
+
+def test_event_output_frame_adds_exact_opening_hold_frames(compositor):
+  assert compositor._event_output_frame(40) == 64
+  assert compositor._event_output_frame(88) == 112
+  assert compositor._event_output_frame(93) == 117
+
+
+def test_filter_uses_exact_frame_lattice_for_all_timed_overlays(
     compositor, tmp_path
 ):
   overlay_dir = tmp_path / "overlays"
@@ -415,16 +444,12 @@ def test_filter_times_both_chain_cues_for_nine_tenths(
       overlay_files=overlay_files,
   )
 
-  normal_time = compositor._event_time(88, 24.0)
-  changed_time = compositor._event_time(70, 24.0)
-  assert (
-      f"between(t,{normal_time:.6f},{normal_time + 0.9:.6f})"
-      in filter_graph
-  )
-  assert (
-      f"between(t,{changed_time:.6f},{changed_time + 0.9:.6f})"
-      in filter_graph
-  )
+  normal_enable = "between(n,117,138)"
+  changed_enable = "between(n,112,133)"
+  removal_enable = "between(n,64,81)"
+  final_enable = "gte(n,224)"
+  assert "between(t" not in filter_graph
+  assert "gte(t" not in filter_graph
   assert compositor._escape_filter_path(
       overlay_files["normal_chain"]
   ) in filter_graph
@@ -438,7 +463,7 @@ def test_filter_times_both_chain_cues_for_nine_tenths(
       y="120",
       size=26,
       color="0xffd166",
-      enable=f"between(t,{normal_time:.6f},{normal_time + 0.9:.6f})",
+      enable=normal_enable,
       box=True,
   ) in filter_graph
   assert compositor._drawtext(
@@ -448,9 +473,34 @@ def test_filter_times_both_chain_cues_for_nine_tenths(
       y="120",
       size=26,
       color="0xffd166",
-      enable=f"between(t,{changed_time:.6f},{changed_time + 0.9:.6f})",
+      enable=changed_enable,
       box=True,
   ) in filter_graph
+  assert compositor._drawtext(
+      font,
+      textfile=overlay_files["removal"],
+      x="1280+(640-text_w)/2",
+      y="120",
+      size=26,
+      color="0xff8fab",
+      enable=removal_enable,
+      box=True,
+  ) in filter_graph
+  for name, y, size in (
+      ("graph", "530", 22),
+      ("affected", "566", 20),
+      ("propagation", "602", 18),
+  ):
+    assert compositor._drawtext(
+        font,
+        textfile=overlay_files[name],
+        x="(w-text_w)/2",
+        y=y,
+        size=size,
+        color="white",
+        enable=final_enable,
+        box=True,
+    ) in filter_graph
 
 
 def test_module_imports_without_kubric(compositor):
@@ -524,10 +574,10 @@ def test_filter_has_layout_labels_timeline_cues_and_summary(
       "INTERVENTION 2.667s"
   )
   assert overlay_files["normal_chain"].read_text("utf-8") == (
-      "SMALL CHAIN → SIDE 01 4.667s"
+      "SMALL CHAIN → SIDE 01 4.875s"
   )
   assert overlay_files["changed_chain"].read_text("utf-8") == (
-      "LARGE CHAIN → BREAKER 3.917s"
+      "LARGE CHAIN → BREAKER 4.667s"
   )
   assert overlay_files["removal"].read_text("utf-8") == (
       "TARGET REMOVED 2.667s"
@@ -556,16 +606,16 @@ def test_overlay_textfiles_write_both_branch_specific_chain_cues(
   )
 
   assert overlay_files["normal_chain"].read_text("utf-8") == (
-      "SMALL CHAIN → SIDE 01 4.667s"
+      "SMALL CHAIN → SIDE 01 4.875s"
   )
   assert overlay_files["changed_chain"].read_text("utf-8") == (
-      "LARGE CHAIN → BREAKER 3.917s"
+      "LARGE CHAIN → BREAKER 4.667s"
   )
 
 
 def _summary_with_earlier_unrelated_contact():
   summary = _summary()
-  summary["branches"]["trajectory_changed"]["contact_steps"] = [12, 70]
+  summary["branches"]["trajectory_changed"]["contact_steps"] = [12, 88]
   summary["ground_truth"]["graph_delta"]["added"].insert(0, {
       "object_a": "rack_01",
       "object_b": "rack_03",
@@ -594,10 +644,10 @@ def test_changed_chain_time_and_peer_come_from_same_graph_event(
   )
 
   assert overlay_files["changed_chain"].read_text("utf-8") == (
-      "LARGE CHAIN → BREAKER 3.917s"
+      "LARGE CHAIN → BREAKER 4.667s"
   )
-  assert "enable='between(t,3.916667,4.816667)'" in filter_graph
-  assert "enable='between(t,1.500000,2.400000)'" not in filter_graph
+  assert "enable='between(n,112,133)'" in filter_graph
+  assert "enable='between(n,36,57)'" not in filter_graph
 
 
 def test_event_bounds_validate_the_selected_changed_chain_event(compositor):
@@ -615,7 +665,7 @@ def test_load_summary_rejects_graph_contact_step_mismatch(
     compositor, tmp_path
 ):
   summary = _summary_with_earlier_unrelated_contact()
-  summary["ground_truth"]["graph_delta"]["added"][1]["start_step"] = 69
+  summary["ground_truth"]["graph_delta"]["added"][1]["start_step"] = 87
   (tmp_path / "summary.json").write_text(
       json.dumps(summary), encoding="utf-8"
   )

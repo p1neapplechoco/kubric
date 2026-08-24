@@ -75,8 +75,12 @@ _OUTPUT_HEIGHT = 720
 _PANEL_WIDTH = 640
 _PANEL_HEIGHT = 540
 _OUTPUT_FPS = Fraction(24, 1)
-_START_HOLD = 1.0
-_END_HOLD = 2.0
+_START_HOLD_DURATION = Fraction(1, 1)
+_END_HOLD_DURATION = Fraction(2, 1)
+_CHAIN_CUE_DURATION = Fraction(9, 10)
+_REMOVAL_CUE_DURATION = Fraction(3, 4)
+_START_HOLD = float(_START_HOLD_DURATION)
+_END_HOLD = float(_END_HOLD_DURATION)
 _SOURCE_DURATION_TOLERANCE = 1e-6
 _FFMPEG_TIMEOUT_SECONDS = 600
 _SCHEMA_VERSION = "1.0"
@@ -661,6 +665,28 @@ def _event_time(step: int, source_fps: float) -> float:
   return _START_HOLD + step / source_fps
 
 
+def _exact_duration_frames(duration: Fraction) -> int:
+  frames = duration * _OUTPUT_FPS
+  if frames.denominator != 1:
+    raise ValueError("duration must equal an integral number of output frames")
+  return frames.numerator
+
+
+def _event_output_frame(step: int) -> int:
+  """Map one source event step to its exact post-hold output frame."""
+  return _exact_duration_frames(_START_HOLD_DURATION) + step
+
+
+def _frame_window_enable(start_frame: int, duration: Fraction) -> str:
+  """Return an inclusive expression for a half-open frame-duration window."""
+  duration_frames = duration * _OUTPUT_FPS
+  displayed_frames = (
+      duration_frames.numerator + duration_frames.denominator - 1
+  ) // duration_frames.denominator
+  end_frame = start_frame + displayed_frames - 1
+  return f"between(n,{start_frame},{end_frame})"
+
+
 def _summary_overlay_lines(summary: Mapping[str, Any]) -> tuple[str, str, str]:
   truth = summary["ground_truth"]
   graph_delta = truth["graph_delta"]
@@ -809,15 +835,21 @@ def _build_filter(
   )
   _, normal_step = _chain_cue_event(summary, "normal")
   _, changed_step = _chain_cue_event(summary, "trajectory_changed")
-  normal_time = _event_time(normal_step, source_fps)
-  changed_time = _event_time(changed_step, source_fps)
   removal_step = summary["branches"]["target_removed"]["removed_step"]
-  removal_time = _event_time(removal_step, source_fps)
   marker_x = 80 + round(1760 * intervention_time / total_duration)
-  final_enable = f"gte(t,{total_duration - _END_HOLD:.6f})"
-  normal_enable = f"between(t,{normal_time:.6f},{normal_time + 0.9:.6f})"
-  changed_enable = f"between(t,{changed_time:.6f},{changed_time + 0.9:.6f})"
-  removal_enable = f"between(t,{removal_time:.6f},{removal_time + 0.75:.6f})"
+  final_start_frame = _event_output_frame(
+      summary["demo_spec"]["source_frames"]
+  )
+  final_enable = f"gte(n,{final_start_frame})"
+  normal_enable = _frame_window_enable(
+      _event_output_frame(normal_step), _CHAIN_CUE_DURATION
+  )
+  changed_enable = _frame_window_enable(
+      _event_output_frame(changed_step), _CHAIN_CUE_DURATION
+  )
+  removal_enable = _frame_window_enable(
+      _event_output_frame(removal_step), _REMOVAL_CUE_DURATION
+  )
 
   chains = []
   for index in range(3):
@@ -1039,9 +1071,8 @@ def _run_ffmpeg(command: Sequence[str]) -> None:
 def _validate_composed_video(
     info: VideoInfo, source: VideoInfo
 ) -> None:
-  hold_frames = int(
-      (Fraction(str(_START_HOLD)) + Fraction(str(_END_HOLD)))
-      * _OUTPUT_FPS
+  hold_frames = _exact_duration_frames(
+      _START_HOLD_DURATION + _END_HOLD_DURATION
   )
   expected_frames = source.frame_count + hold_frames
   expected_duration = expected_frames / float(_OUTPUT_FPS)
