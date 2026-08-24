@@ -168,6 +168,21 @@ def test_run_demo_intervention_orders_generate_render_and_compose(tmp_path):
   )
 
 
+def test_run_demo_intervention_invokes_renderer_as_package(tmp_path):
+  script, root, call_log, environment = _workflow_sandbox(tmp_path)
+
+  completed = _run_workflow(script, root, environment, "intervention")
+
+  assert completed.returncode == 0, completed.stderr
+  render_call = next(
+      call
+      for call in call_log.read_text("utf-8").splitlines()
+      if call.startswith("docker run ")
+  )
+  assert "python3 -m scripts.render_demo_branches_blender" in render_call
+  assert "python3 /workspace/scripts/render_demo_branches_blender.py" not in render_call
+
+
 def test_run_demo_intervention_fails_explicitly_without_docker(tmp_path):
   script, root, call_log, environment = _workflow_sandbox(
       tmp_path, docker=False

@@ -113,7 +113,7 @@ render_blender_branches() {
   require_blender_renderer
 
   echo "[kubric-demo] Replaying all three branches through Blender in ${DOCKER_IMAGE}..."
-  render_command='set -eu; cd /workspace; if ! python3 -c "import imageio_ffmpeg" >/dev/null 2>&1; then python3 -m pip install --quiet --disable-pip-version-check --no-cache-dir --target /tmp/kubric-demo-imageio imageio-ffmpeg; export PYTHONPATH="/tmp/kubric-demo-imageio${PYTHONPATH:+:$PYTHONPATH}"; fi; python3 /workspace/scripts/render_demo_branches_blender.py --states-dir /workspace/output/demo_collision_intervention --branches normal trajectory_changed target_removed'
+  render_command='set -eu; cd /workspace; if ! python3 -c "import imageio_ffmpeg" >/dev/null 2>&1; then python3 -m pip install --quiet --disable-pip-version-check --no-cache-dir --target /tmp/kubric-demo-imageio imageio-ffmpeg; export PYTHONPATH="/tmp/kubric-demo-imageio${PYTHONPATH:+:$PYTHONPATH}"; fi; python3 -m scripts.render_demo_branches_blender --states-dir /workspace/output/demo_collision_intervention --branches normal trajectory_changed target_removed'
   if ! docker run --rm --interactive \
     --user "${DOCKER_USER}" \
     --volume "${DOCKER_MOUNT}" \

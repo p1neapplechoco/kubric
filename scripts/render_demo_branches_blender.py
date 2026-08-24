@@ -22,6 +22,8 @@ from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
 
 import numpy as np
 
+from scripts.trajectory_demo_spec import FORKED_RACK_SPEC, demo_spec_summary
+
 _DEFAULT_STATES_DIR = Path("output/demo_collision_intervention")
 _ALLOWED_BRANCHES = ("normal", "trajectory_changed", "target_removed")
 _BRANCH_FILENAMES = {
@@ -34,12 +36,14 @@ _FRAME_RATE = 24
 # State layout matches SimulationLog: position XYZ, quaternion WXYZ, then linear
 # and angular velocity. The ordering is persisted in summary.json and fixed for
 # this deterministic demo.
-_CANONICAL_OBJECT_IDS = ("floor", "lower_ball", "target", "upper_ball")
+_DEMO_SPEC = FORKED_RACK_SPEC
+_CANONICAL_OBJECT_IDS = _DEMO_SPEC.object_ids
 _STATE_STRIDE = 13
 _POSITION_SLICE = slice(0, 3)
 _QUATERNION_WXYZ_SLICE = slice(3, 7)
 _SYNCHRONIZED_SUMMARY_KEYS = (
     "branches",
+    "demo_spec",
     "ground_truth",
     "intervention_end",
     "intervention_start",
@@ -49,18 +53,9 @@ _SYNCHRONIZED_SUMMARY_KEYS = (
     "step_rate",
 )
 
-# Visual counterparts of the physics demo's scene. Sizes mirror the PyBullet
-# collision shapes: cube half-extents and sphere radii in metres.
-_COLLIDER_SPECS = {
-    "floor": {"kind": "cube", "scale": (4.0, 4.0, 0.25)},
-    "lower_ball": {"kind": "sphere", "scale": 0.26},
-    "target": {"kind": "cube", "scale": (0.18, 0.18, 0.18)},
-    "upper_ball": {"kind": "sphere", "scale": 0.26},
-}
-
-_CAMERA_POSITION = (5.9, -7.2, 6.8)
-_CAMERA_LOOK_AT = (0.0, 0.0, -0.05)
-_CAMERA_FOCAL_LENGTH = 52.0
+_CAMERA_POSITION = (7.6, -9.2, 8.4)
+_CAMERA_LOOK_AT = (0.35, 0.30, -0.02)
+_CAMERA_FOCAL_LENGTH = 55.0
 _AMBIENT_ILLUMINATION = (0.035, 0.04, 0.05)
 
 
@@ -80,42 +75,22 @@ def _camera_dof_spec() -> Dict[str, Any]:
   """Returns the deterministic focus settings for the shared camera."""
   return {
       "use_dof": True,
-      "focus_distance": math.dist(_CAMERA_POSITION, _CAMERA_LOOK_AT),
-      "aperture_fstop": 4.0,
+      "focus_distance": 12.0,
+      "aperture_fstop": 5.6,
+  }
+
+
+def _collider_specs() -> Dict[str, Dict[str, Any]]:
+  """Returns collider kinds and dimensions in canonical specification order."""
+  return {
+      item.object_id: {"kind": item.shape, "scale": item.size}
+      for item in _DEMO_SPEC.objects
   }
 
 
 def _material_specs() -> Dict[str, Dict[str, Any]]:
   """Returns fresh deterministic specifications for all procedural materials."""
   specs = {
-      "floor": {
-          "material": "felt",
-          "color": (0.018, 0.165, 0.075, 1.0),
-          "roughness": 0.96,
-          "noise_scale": 92.0,
-          "bump_strength": 0.16,
-      },
-      "target": {
-          "material": "wood",
-          "color": (0.31, 0.105, 0.028, 1.0),
-          "light_color": (0.72, 0.31, 0.075, 1.0),
-          "roughness": 0.34,
-          "grain_scale": 5.5,
-      },
-      "upper_ball": {
-          "material": "lacquer",
-          "color": (0.82, 0.035, 0.025, 1.0),
-          "roughness": 0.12,
-          "metallic": 0.05,
-          "number": "3",
-      },
-      "lower_ball": {
-          "material": "lacquer",
-          "color": (0.035, 0.12, 0.72, 1.0),
-          "roughness": 0.1,
-          "metallic": 0.08,
-          "number": "8",
-      },
       "rail": {
           "material": "wood",
           "color": (0.16, 0.045, 0.012, 1.0),
@@ -140,13 +115,40 @@ def _material_specs() -> Dict[str, Dict[str, Any]]:
           "roughness": 0.45,
       },
   }
+  for item in _DEMO_SPEC.objects:
+    color = (*item.color, 1.0)
+    if item.visual_role == "ball":
+      specs[item.object_id] = {
+          "material": "lacquer",
+          "color": color,
+          "roughness": 0.16,
+          "metallic": 0.04,
+          "number": item.ball_number,
+          "striped": item.striped,
+      }
+    elif item.visual_role == "target":
+      specs[item.object_id] = {
+          "material": "wood",
+          "color": color,
+          "light_color": (0.72, 0.31, 0.075, 1.0),
+          "roughness": 0.30,
+          "grain_scale": 5.5,
+      }
+    else:
+      specs[item.object_id] = {
+          "material": "felt",
+          "color": color,
+          "roughness": 0.88,
+          "noise_scale": 92.0,
+          "bump_strength": 0.16,
+      }
   return copy.deepcopy(specs)
 
 
 def _scene_specs() -> Dict[str, Any]:
   """Returns the collider and studio contract without importing Blender."""
   specs = {
-      "colliders": _COLLIDER_SPECS,
+      "colliders": _collider_specs(),
       "camera": {
           "position": _CAMERA_POSITION,
           "look_at": _CAMERA_LOOK_AT,
@@ -222,6 +224,8 @@ def _load_summary(states_dir: Path) -> Mapping[str, Any]:
   if not all(isinstance(value, dict) for value in branches.values()):
     raise TypeError(f"{summary_path} branches values must be JSON objects")
 
+  _validate_demo_spec_identity(summary["demo_spec"])
+
   ground_truth = summary["ground_truth"]
   if not isinstance(ground_truth, dict):
     raise TypeError(f"{summary_path} ground_truth must be a JSON object")
@@ -258,6 +262,19 @@ def _load_summary(states_dir: Path) -> Mapping[str, Any]:
   return summary
 
 
+def _validate_demo_spec_identity(value: Any) -> Mapping[str, Any]:
+  """Rejects replay metadata produced from a different scene contract."""
+  if not isinstance(value, dict):
+    raise TypeError("demo_spec must be a JSON object")
+  expected = demo_spec_summary(_DEMO_SPEC)
+  if set(value) != set(expected):
+    raise ValueError("demo_spec keys mismatch")
+  for field, expected_value in expected.items():
+    if value[field] != expected_value:
+      raise ValueError(f"demo_spec.{field} mismatch")
+  return value
+
+
 def _load_replay(states_dir: Path, branch: str) -> Replay:
   """Loads and validates one branch's states, presence mask, and metadata."""
   if branch not in _ALLOWED_BRANCHES:
@@ -272,15 +289,16 @@ def _load_replay(states_dir: Path, branch: str) -> Replay:
   states = np.load(states_path, allow_pickle=False)
   presence = np.load(presence_path, allow_pickle=False)
 
-  if states.ndim != 3 or states.shape[1:] != (
-      len(_CANONICAL_OBJECT_IDS), _STATE_STRIDE
-  ):
+  expected_shape = (
+      _DEMO_SPEC.num_steps,
+      len(_CANONICAL_OBJECT_IDS),
+      _STATE_STRIDE,
+  )
+  if states.shape != expected_shape:
     raise ValueError(
         f"{states_path} states have shape {states.shape}; expected "
-        f"(frames, {len(_CANONICAL_OBJECT_IDS)}, {_STATE_STRIDE})"
+        f"{expected_shape}"
     )
-  if states.shape[0] < 1:
-    raise ValueError(f"{states_path} must contain at least one frame")
   intervention_start = summary["intervention_start"]
   intervention_end = summary["intervention_end"]
   if (
@@ -297,10 +315,11 @@ def _load_replay(states_dir: Path, branch: str) -> Replay:
     raise ValueError(f"{states_path} contains non-finite states")
   if presence.dtype.kind != "b":
     raise TypeError(f"{presence_path} presence must contain Boolean values")
-  if presence.shape != states.shape[:2]:
+  expected_presence_shape = expected_shape[:2]
+  if presence.shape != expected_presence_shape:
     raise ValueError(
         f"{presence_path} presence has shape {presence.shape}; expected "
-        f"{states.shape[:2]} to match the states frame/object count"
+        f"{expected_presence_shape} to match the states frame/object count"
     )
 
   return Replay(
@@ -408,6 +427,51 @@ def _preflight_replays(
   )
   _validate_synchronized_replays(prepared_replays)
   return prepared_replays
+
+
+def _collider_radius(item) -> float:
+  """Returns a conservative rotation-invariant framing radius."""
+  if item.visual_role == "floor":
+    return 0.0
+  if item.shape == "sphere":
+    return float(item.size)
+  scale = (
+      (float(item.size),) * 3
+      if isinstance(item.size, (int, float))
+      else item.size
+  )
+  return math.sqrt(sum(float(component) ** 2 for component in scale))
+
+
+def _validate_camera_containment(
+    replays: Sequence[Replay],
+    resolution: Tuple[int, int],
+) -> None:
+  """Rejects replays whose conservative collider extents leave the frame."""
+  camera = np.asarray(_CAMERA_POSITION, dtype=float)
+  forward = np.asarray(_CAMERA_LOOK_AT, dtype=float) - camera
+  forward /= np.linalg.norm(forward)
+  right = np.cross(forward, np.asarray((0.0, 0.0, 1.0)))
+  right /= np.linalg.norm(right)
+  up = np.cross(right, forward)
+  width, height = resolution
+  item_by_id = {item.object_id: item for item in _DEMO_SPEC.objects}
+  for replay in replays:
+    for object_index, object_id in enumerate(replay.object_ids):
+      radius = _collider_radius(item_by_id[object_id])
+      for center in replay.states[:, object_index, _POSITION_SLICE]:
+        relative = center - camera
+        depth = float(relative @ forward)
+        near_depth = depth - radius
+        if near_depth <= 0:
+          raise ValueError(f"camera framing excludes {object_id}")
+        half_width = near_depth * 36.0 / (2.0 * _CAMERA_FOCAL_LENGTH)
+        half_height = half_width * height / width
+        if (
+            abs(float(relative @ right)) + radius > 0.94 * half_width
+            or abs(float(relative @ up)) + radius > 0.94 * half_height
+        ):
+          raise ValueError(f"camera framing excludes {object_id}")
 
 
 def _visibility_transitions(
@@ -597,29 +661,33 @@ def _add_ball_decorations(
     bpy,
     parent,
     object_id: str,
-    number: str,
+    number: int,
+    striped: bool,
     band_material,
     number_material,
 ) -> Tuple[object, ...]:
-  """Adds a raised white stripe and number badge in the ball's local frame."""
+  """Adds a number badge and an optional stripe in the ball's local frame."""
   import math
 
-  bpy.ops.mesh.primitive_torus_add(
-      align="WORLD",
-      major_segments=64,
-      minor_segments=16,
-      location=(0.0, 0.0, 0.0),
-      major_radius=0.79,
-      minor_radius=0.205,
-  )
-  band = _parent_local(
-      bpy.context.object,
-      parent,
-      (0.0, 0.0, 0.0),
-  )
-  band.name = f"{object_id}_white_band"
-  band.data.materials.append(band_material)
-  _smooth_mesh(band)
+  decorations = []
+  if striped:
+    bpy.ops.mesh.primitive_torus_add(
+        align="WORLD",
+        major_segments=64,
+        minor_segments=16,
+        location=(0.0, 0.0, 0.0),
+        major_radius=0.79,
+        minor_radius=0.205,
+    )
+    band = _parent_local(
+        bpy.context.object,
+        parent,
+        (0.0, 0.0, 0.0),
+    )
+    band.name = f"{object_id}_white_band"
+    band.data.materials.append(band_material)
+    _smooth_mesh(band)
+    decorations.append(band)
 
   bpy.ops.mesh.primitive_cylinder_add(
       align="WORLD",
@@ -637,6 +705,7 @@ def _add_ball_decorations(
   badge.name = f"{object_id}_number_badge"
   badge.data.materials.append(band_material)
   _smooth_mesh(badge)
+  decorations.append(badge)
 
   bpy.ops.object.text_add(align="WORLD", location=(0.0, 0.0, 0.0))
   decal = _parent_local(
@@ -646,14 +715,15 @@ def _add_ball_decorations(
       (math.pi / 2.0, 0.0, 0.0),
   )
   decal.name = f"{object_id}_number"
-  decal.data.body = number
+  decal.data.body = str(number)
   decal.data.align_x = "CENTER"
   decal.data.align_y = "CENTER"
   decal.data.size = 0.48
   decal.data.extrude = 0.008
   decal.data.bevel_depth = 0.004
   decal.data.materials.append(number_material)
-  return band, badge, decal
+  decorations.append(decal)
+  return tuple(decorations)
 
 
 def _insert_visibility_keyframes(
@@ -995,8 +1065,6 @@ def _build_and_render_branch_in_scratch(
   blender_assets["floor"].name = "floor_collider"
   blender_assets["target"].name = "target_collider"
   _round_target(blender_assets["target"])
-  _smooth_mesh(blender_assets["lower_ball"])
-  _smooth_mesh(blender_assets["upper_ball"])
 
   backdrop.linked_objects[renderer].active_material = _procedural_material(
       bpy, "neutral_backdrop_material", backdrop_spec
@@ -1014,12 +1082,17 @@ def _build_and_render_branch_in_scratch(
       bpy, "billiard_number_material", material_specs["number"]
   )
   decorations: Dict[str, Tuple[object, ...]] = {}
-  for name in ("lower_ball", "upper_ball"):
+  for item in _DEMO_SPEC.objects:
+    if item.visual_role != "ball":
+      continue
+    name = item.object_id
+    _smooth_mesh(blender_assets[name])
     decorations[name] = _add_ball_decorations(
         bpy,
         blender_assets[name],
         name,
         material_specs[name]["number"],
+        material_specs[name]["striped"],
         band_material,
         number_material,
     )
@@ -1171,6 +1244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
       args.branches,
       args.max_frames,
   )
+  _validate_camera_containment(replays, resolution)
   _require_imageio_ffmpeg()
   results = _render_replays_atomically(
       replays,

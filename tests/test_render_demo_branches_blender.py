@@ -12,10 +12,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from scripts import trajectory_demo_spec as demo_spec
+
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT_NAME = "render_demo_branches_blender"
 _SCRIPT_PATH = _PROJECT_ROOT / "scripts" / f"{_SCRIPT_NAME}.py"
-_OBJECT_IDS = ("floor", "lower_ball", "target", "upper_ball")
+_OBJECT_IDS = demo_spec.FORKED_RACK_SPEC.object_ids
 _ALLOWED_BRANCHES = ("normal", "trajectory_changed", "target_removed")
 
 _SPEC = importlib.util.spec_from_file_location(_SCRIPT_NAME, _SCRIPT_PATH)
@@ -24,14 +26,16 @@ sys.modules[_SCRIPT_NAME] = render_script
 _SPEC.loader.exec_module(render_script)
 
 
-def _synthetic_states(num_steps=5):
-  states = np.zeros((num_steps, 4, 13), dtype=np.float64)
+def _synthetic_states(num_steps=demo_spec.FORKED_RACK_SPEC.num_steps):
+  states = np.zeros((num_steps, len(_OBJECT_IDS), 13), dtype=np.float64)
   states[:, :, 3] = 1.0  # identity quaternion in SimulationLog WXYZ order
-  states[:, 0, 0:3] = (0.0, 0.0, -0.25)
-  for step in range(num_steps):
-    states[step, 1, 0:3] = (-0.5 + 0.1 * step, -0.45, 0.26)
-  states[:, 2, 0:3] = (0.0, 0.0, 0.18)
-  states[:, 3, 0:3] = (0.0, 0.45, 0.26)
+  for index, object_id in enumerate(_OBJECT_IDS):
+    initial = next(
+        item.position
+        for item in demo_spec.FORKED_RACK_SPEC.objects
+        if item.object_id == object_id
+    )
+    states[:, index, 0:3] = initial
   return states
 
 
@@ -54,9 +58,10 @@ def _write_bundle(
           name: {} for name in _ALLOWED_BRANCHES
       },
       "ground_truth": {"schema_version": "1.0"},
-      "intervention_end": 4,
-      "intervention_start": 2,
-      "intervention_window": [2, 4],
+      "demo_spec": demo_spec.demo_spec_summary(demo_spec.FORKED_RACK_SPEC),
+      "intervention_end": 160,
+      "intervention_start": 40,
+      "intervention_window": [40, 160],
       "object_ids": list(object_ids),
       "seed": 0,
       "step_rate": 240,
@@ -79,12 +84,43 @@ def test_load_replay_roundtrips_states_presence_and_summary(tmp_path):
   np.testing.assert_array_equal(replay.presence, presence)
 
 
+def test_load_replay_accepts_current_demo_spec(tmp_path):
+  _write_bundle(tmp_path)
+
+  replay = render_script._load_replay(tmp_path, "normal")
+
+  assert replay.object_ids == _OBJECT_IDS
+  assert replay.states.shape == (200, 11, 13)
+  assert replay.summary["demo_spec"] == demo_spec.demo_spec_summary(
+      demo_spec.FORKED_RACK_SPEC
+  )
+
+
+def test_load_replay_rejects_stale_demo_spec(tmp_path):
+  _, _, summary = _write_bundle(tmp_path)
+  summary["demo_spec"]["sha256"] = "0" * 64
+  (tmp_path / "summary.json").write_text(
+      json.dumps(summary), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match="demo_spec.sha256 mismatch"):
+    render_script._load_replay(tmp_path, "normal")
+
+
+def test_load_replay_rejects_truncated_states_before_slicing(tmp_path):
+  states, _, _ = _write_bundle(tmp_path)
+  np.save(tmp_path / "normal_states.npy", states[:-1])
+
+  with pytest.raises(ValueError, match=r"\(200, 11, 13\)"):
+    render_script._load_replay(tmp_path, "normal")
+
+
 def test_load_replay_requires_matching_presence(tmp_path):
   states = _synthetic_states()
   _write_bundle(
       tmp_path,
       states=states,
-      presence=np.ones((4, 4), dtype=np.bool_),
+      presence=np.ones((200, 10), dtype=np.bool_),
   )
 
   with pytest.raises(ValueError, match="presence"):
@@ -106,9 +142,9 @@ def test_load_replay_requires_boolean_presence(tmp_path):
 @pytest.mark.parametrize(
     "states",
     (
-        np.zeros((5, 4, 12), dtype=np.float64),
-        np.zeros((5, 3, 13), dtype=np.float64),
-        np.zeros((5, 4, 13, 1), dtype=np.float64),
+        np.zeros((200, 11, 12), dtype=np.float64),
+        np.zeros((200, 10, 13), dtype=np.float64),
+        np.zeros((200, 11, 13, 1), dtype=np.float64),
     ),
 )
 def test_load_replay_rejects_invalid_state_shape(tmp_path, states):
@@ -125,7 +161,7 @@ def test_load_replay_rejects_invalid_state_shape(tmp_path, states):
 def test_load_replay_rejects_empty_or_nonfinite_states(tmp_path):
   states = _synthetic_states(num_steps=0)
   _write_bundle(tmp_path, states=states)
-  with pytest.raises(ValueError, match="frame"):
+  with pytest.raises(ValueError, match=r"\(200, 11, 13\)"):
     render_script._load_replay(tmp_path, "normal")
 
   states = _synthetic_states()
@@ -138,7 +174,7 @@ def test_load_replay_rejects_empty_or_nonfinite_states(tmp_path):
 def test_load_replay_requires_canonical_summary_object_order(tmp_path):
   _write_bundle(
       tmp_path,
-      object_ids=("floor", "target", "lower_ball", "upper_ball"),
+      object_ids=tuple(reversed(_OBJECT_IDS)),
   )
 
   with pytest.raises(ValueError, match="object_ids"):
@@ -191,7 +227,7 @@ def test_load_replay_validates_summary_types_and_ranges(
     render_script._load_replay(tmp_path, "normal")
 
 
-@pytest.mark.parametrize(("start", "end"), ((5, 6), (2, 6)))
+@pytest.mark.parametrize(("start", "end"), ((201, 202), (40, 201)))
 def test_load_replay_requires_intervention_window_within_frames(
     tmp_path, start, end
 ):
@@ -219,12 +255,12 @@ def test_prepare_replay_slices_both_arrays_and_validates_max_frames(tmp_path):
   states, presence, _ = _write_bundle(tmp_path)
   replay = render_script._load_replay(tmp_path, "normal")
 
-  sliced = render_script._prepare_replay(replay, 3)
-  np.testing.assert_array_equal(sliced.states, states[:3])
-  np.testing.assert_array_equal(sliced.presence, presence[:3])
+  sliced = render_script._prepare_replay(replay, 100)
+  np.testing.assert_array_equal(sliced.states, states[:100])
+  np.testing.assert_array_equal(sliced.presence, presence[:100])
   assert sliced.object_ids == replay.object_ids
   assert render_script._prepare_replay(replay, None) is replay
-  assert len(render_script._prepare_replay(replay, 100).states) == len(states)
+  assert len(render_script._prepare_replay(replay, 500).states) == 200
 
   for invalid in (0, -1, 1.5, True):
     with pytest.raises((TypeError, ValueError), match="max-frames"):
@@ -233,11 +269,12 @@ def test_prepare_replay_slices_both_arrays_and_validates_max_frames(tmp_path):
 
 def test_pose_at_reads_simulation_log_wxyz_without_reordering():
   states = _synthetic_states(num_steps=1)
-  states[0, 1, 3:7] = (0.4, 0.1, 0.2, 0.3)
+  states[0, 0, 0:3] = (0.25, 0.60, 0.22)
+  states[0, 0, 3:7] = (0.4, 0.1, 0.2, 0.3)
 
-  position, quaternion = render_script._pose_at(states, 1, 0)
+  position, quaternion = render_script._pose_at(states, 0, 0)
 
-  assert position == (-0.5, -0.45, 0.26)
+  assert position == (0.25, 0.60, 0.22)
   assert quaternion == (0.4, 0.1, 0.2, 0.3)
 
 
@@ -251,21 +288,37 @@ def test_material_specs_are_deterministic_and_realistic():
   assert first["target"]["grain_scale"] > 1.0
   assert first["floor"]["material"] == "felt"
   assert first["floor"]["roughness"] > 0.8
-  assert first["upper_ball"]["material"] == "lacquer"
-  assert first["lower_ball"]["material"] == "lacquer"
-  assert first["upper_ball"]["roughness"] < 0.25
-  assert first["lower_ball"]["roughness"] < 0.25
+  assert first["breaker"]["material"] == "lacquer"
+  assert first["side_02"]["material"] == "lacquer"
+  assert first["breaker"]["roughness"] < 0.25
+  assert first["side_02"]["roughness"] < 0.25
+
+
+def test_material_specs_cover_all_nine_numbered_balls():
+  materials = render_script._material_specs()
+  ball_ids = set(demo_spec.FORKED_RACK_SPEC.ball_ids)
+
+  assert {
+      object_id
+      for object_id, spec in materials.items()
+      if spec.get("material") == "lacquer" and object_id in ball_ids
+  } == ball_ids
+  assert {materials[object_id]["number"] for object_id in ball_ids} == set(
+      range(1, 10)
+  )
+  assert {
+      object_id: materials[object_id]["striped"] for object_id in ball_ids
+  } == {
+      item.object_id: item.striped
+      for item in demo_spec.FORKED_RACK_SPEC.objects
+      if item.visual_role == "ball"
+  }
 
 
 def test_scene_specs_preserve_colliders_and_define_three_area_lights():
   specs = render_script._scene_specs()
 
-  assert specs["colliders"] == {
-      "floor": {"kind": "cube", "scale": (4.0, 4.0, 0.25)},
-      "lower_ball": {"kind": "sphere", "scale": 0.26},
-      "target": {"kind": "cube", "scale": (0.18, 0.18, 0.18)},
-      "upper_ball": {"kind": "sphere", "scale": 0.26},
-  }
+  assert specs["colliders"] == render_script._collider_specs()
   assert tuple(light["role"] for light in specs["lights"]) == (
       "key",
       "fill",
@@ -278,6 +331,42 @@ def test_scene_specs_preserve_colliders_and_define_three_area_lights():
       "denoising": True,
       "transparent": False,
   }
+
+
+def test_scene_specs_use_shared_object_contract_once():
+  colliders = render_script._scene_specs()["colliders"]
+
+  assert tuple(colliders) == _OBJECT_IDS
+  assert len(colliders) == len(set(colliders)) == 11
+  assert colliders["breaker"]["kind"] == "sphere"
+  assert colliders["target"]["kind"] == "cube"
+
+
+def test_camera_contract_contains_canonical_replay_and_rejects_clipping():
+  states = _synthetic_states()
+  replay = render_script.Replay(
+      branch="normal",
+      object_ids=_OBJECT_IDS,
+      steps=tuple(range(len(states))),
+      states=states,
+      presence=np.ones((len(states), 11), dtype=np.bool_),
+      summary={},
+  )
+  render_script._validate_camera_containment((replay,), (640, 540))
+
+  clipped_states = states.copy()
+  camera = np.asarray(render_script._CAMERA_POSITION, dtype=float)
+  forward = np.asarray(render_script._CAMERA_LOOK_AT, dtype=float) - camera
+  forward /= np.linalg.norm(forward)
+  right = np.cross(forward, np.asarray((0.0, 0.0, 1.0)))
+  right /= np.linalg.norm(right)
+  depth = 10.0
+  half_width = depth * 36.0 / (2.0 * render_script._CAMERA_FOCAL_LENGTH)
+  clipped_states[0, 0, 0:3] = camera + depth * forward + half_width * right
+  clipped = dataclasses.replace(replay, states=clipped_states)
+
+  with pytest.raises(ValueError, match="camera framing"):
+    render_script._validate_camera_containment((clipped,), (640, 540))
 
 
 def test_create_replay_scene_aligns_step_rate_with_nondivisor_fps():
@@ -312,18 +401,29 @@ def test_create_replay_scene_aligns_step_rate_with_nondivisor_fps():
 def test_scene_specs_define_deterministic_camera_depth_of_field():
   first = render_script._scene_specs()["camera"]
   second = render_script._scene_specs()["camera"]
-  expected_distance = float(
-      np.linalg.norm(
-          np.asarray(first["position"]) - np.asarray(first["look_at"])
-      )
-  )
 
   assert first == second
   assert first["dof"] == {
       "use_dof": True,
-      "focus_distance": pytest.approx(expected_distance),
-      "aperture_fstop": 4.0,
+      "focus_distance": 12.0,
+      "aperture_fstop": 5.6,
   }
+
+
+def test_camera_dof_uses_approved_deterministic_values():
+  assert render_script._camera_dof_spec() == {
+      "use_dof": True,
+      "focus_distance": 12.0,
+      "aperture_fstop": 5.6,
+  }
+
+
+def test_material_contract_distinguishes_solid_and_striped_balls():
+  materials = render_script._material_specs()
+  assert materials["side_01"]["number"] == 8
+  assert materials["side_01"]["striped"] is False
+  assert materials["side_02"]["number"] == 9
+  assert materials["side_02"]["striped"] is True
 
 
 def test_configure_camera_dof_updates_blender_camera_data():
@@ -466,7 +566,7 @@ def test_main_fails_fast_when_imageio_ffmpeg_is_unavailable(
 def test_main_rejects_corrupt_preintervention_state_before_render(
     tmp_path, monkeypatch
 ):
-  normal = _synthetic_states(num_steps=5)
+  normal = _synthetic_states()
   changed = normal.copy()
   changed[0, 1, 0] += 0.01
   _write_bundle(tmp_path, branch="normal", states=normal)
@@ -492,7 +592,7 @@ def test_main_rejects_corrupt_preintervention_state_before_render(
 def test_main_rejects_absent_preintervention_object_before_render(
     tmp_path, monkeypatch
 ):
-  states = _synthetic_states(num_steps=5)
+  states = _synthetic_states()
   normal_presence = np.ones(states.shape[:2], dtype=np.bool_)
   changed_presence = normal_presence.copy()
   changed_presence[0, 2] = False
@@ -529,16 +629,9 @@ def test_main_rejects_absent_preintervention_object_before_render(
 def test_main_preflights_synchronized_frame_counts_before_rendering(
     tmp_path, monkeypatch
 ):
-  _write_bundle(
-      tmp_path,
-      branch="normal",
-      states=_synthetic_states(num_steps=5),
-  )
-  _write_bundle(
-      tmp_path,
-      branch="trajectory_changed",
-      states=_synthetic_states(num_steps=4),
-  )
+  _write_bundle(tmp_path, branch="normal")
+  changed, _, _ = _write_bundle(tmp_path, branch="trajectory_changed")
+  np.save(tmp_path / "trajectory_changed_states.npy", changed[:-1])
   rendered = []
 
   def fake_render(branch, replay, output, *args):
@@ -548,7 +641,7 @@ def test_main_preflights_synchronized_frame_counts_before_rendering(
 
   monkeypatch.setattr(render_script, "_build_and_render_branch", fake_render)
 
-  with pytest.raises(ValueError, match="synchronized|frame count"):
+  with pytest.raises(ValueError, match=r"\(200, 11, 13\)"):
     render_script.main([
         "--states-dir",
         str(tmp_path),
@@ -565,16 +658,9 @@ def test_main_preflights_synchronized_frame_counts_before_rendering(
 def test_main_rejects_source_length_mismatch_before_max_frames(
     tmp_path, monkeypatch
 ):
-  _write_bundle(
-      tmp_path,
-      branch="normal",
-      states=_synthetic_states(num_steps=5),
-  )
-  _write_bundle(
-      tmp_path,
-      branch="trajectory_changed",
-      states=_synthetic_states(num_steps=4),
-  )
+  _write_bundle(tmp_path, branch="normal")
+  changed, _, _ = _write_bundle(tmp_path, branch="trajectory_changed")
+  np.save(tmp_path / "trajectory_changed_states.npy", changed[:-1])
   rendered = []
 
   def fake_render(branch, replay, output, *args):
@@ -584,7 +670,7 @@ def test_main_rejects_source_length_mismatch_before_max_frames(
 
   monkeypatch.setattr(render_script, "_build_and_render_branch", fake_render)
 
-  with pytest.raises(ValueError, match="synchronized|frame count"):
+  with pytest.raises(ValueError, match=r"\(200, 11, 13\)"):
     render_script.main([
         "--states-dir",
         str(tmp_path),
@@ -592,7 +678,7 @@ def test_main_rejects_source_length_mismatch_before_max_frames(
         "normal",
         "trajectory_changed",
         "--max-frames",
-        "4",
+        "100",
     ])
 
   assert rendered == []
@@ -602,11 +688,7 @@ def test_main_rejects_source_length_mismatch_before_max_frames(
 
 def test_main_slices_synchronized_sources_after_preflight(tmp_path, monkeypatch):
   for branch in ("normal", "trajectory_changed"):
-    _write_bundle(
-        tmp_path,
-        branch=branch,
-        states=_synthetic_states(num_steps=5),
-    )
+    _write_bundle(tmp_path, branch=branch)
   rendered = []
 
   def fake_render(branch, replay, output, *args):
@@ -630,11 +712,11 @@ def test_main_slices_synchronized_sources_after_preflight(tmp_path, monkeypatch)
       "normal",
       "trajectory_changed",
       "--max-frames",
-      "4",
+      "100",
   ]) == 0
   assert rendered == [
-      ("normal", 4, tuple(range(4))),
-      ("trajectory_changed", 4, tuple(range(4))),
+      ("normal", 100, tuple(range(100))),
+      ("trajectory_changed", 100, tuple(range(100))),
   ]
 
 
@@ -665,14 +747,14 @@ def test_main_allows_a_single_requested_branch(tmp_path, monkeypatch):
   assert rendered == [(
       "normal",
       _OBJECT_IDS,
-      tuple(range(5)),
+      tuple(range(200)),
   )]
 
 
 def test_main_keeps_existing_outputs_when_a_later_render_fails(
     tmp_path, monkeypatch
 ):
-  states = _synthetic_states(num_steps=5)
+  states = _synthetic_states()
   for branch in ("normal", "trajectory_changed"):
     _write_bundle(tmp_path, branch=branch, states=states)
   normal_output = tmp_path / "normal_blender.mp4"
@@ -814,7 +896,7 @@ def test_temporary_scratch_is_removed_after_render_error():
     (
         (
             "object_ids",
-            ("floor", "target", "lower_ball", "upper_ball"),
+            tuple(reversed(_OBJECT_IDS)),
             "object_ids",
         ),
         ("steps", (0, 1, 2, 4, 5), "step arrays"),
