@@ -14,10 +14,6 @@ from typing import get_type_hints
 import pytest
 
 pytest.importorskip("pybullet")
-pytest.importorskip("imageio")
-pytest.importorskip("imageio_ffmpeg")
-
-import imageio.v2 as imageio  # noqa: E402  (guarded above)
 import numpy as np  # noqa: E402
 
 _SCRIPT_NAME = "demo_collision_intervention"
@@ -29,7 +25,6 @@ demo = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SCRIPT_NAME] = demo
 _SPEC.loader.exec_module(demo)
 
-_NUM_STEPS = 6
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _RUN_DEMO = _PROJECT_ROOT / "run_demo.sh"
 _DEMO_DOCS = _PROJECT_ROOT / "docs" / "trajectory_interventions.md"
@@ -236,75 +231,95 @@ def test_full_requirements_declares_direct_video_encoder_dependency():
   assert "imageio-ffmpeg" in requirements
 
 
-def test_build_demo_inputs_matches_verified_public_pair_fixture():
+def _unique_dynamic_pairs(records):
+  return {
+      tuple(sorted((record.object_a, record.object_b)))
+      for record in demo.dynamic_contacts(records)
+  }
+
+
+def test_build_demo_inputs_uses_shared_forked_rack_spec():
   scene, intervention, factual_path = demo.build_demo_inputs()
+  spec = demo.FORKED_RACK_SPEC
   objects = {item.object_id: item for item in scene.objects}
 
-  assert tuple(objects) == ("floor", "target", "upper_ball", "lower_ball")
-  assert objects["floor"].shape == "cube"
-  assert objects["floor"].size == (4.0, 4.0, 0.25)
-  assert objects["floor"].position == (0.0, 0.0, -0.25)
-  assert objects["floor"].static
-  assert objects["target"].shape == "cube"
-  assert objects["target"].size == (0.18, 0.18, 0.18)
-  assert objects["target"].position == (-1.0, 0.0, 0.18)
-  assert objects["target"].mass == 2.0
-  assert objects["target"].static
-  assert objects["upper_ball"].shape == "sphere"
-  assert objects["upper_ball"].size == (0.26, 0.26, 0.26)
-  assert objects["upper_ball"].position == (0.0, 0.45, 0.26)
-  assert not objects["upper_ball"].static
-  assert objects["lower_ball"].shape == "sphere"
-  assert objects["lower_ball"].size == (0.26, 0.26, 0.26)
-  assert objects["lower_ball"].position == (0.0, -0.45, 0.26)
-  assert not objects["lower_ball"].static
-  assert all(item.friction == 0.0 for item in objects.values())
-  assert all(item.restitution == 0.0 for item in objects.values())
-
-  assert scene.seed == 0
-  assert scene.gravity == (0.0, 0.0, 0.0)
-  assert scene.scene_bounds == ((-4.5, -4.5, -1.0), (4.5, 4.5, 2.0))
-  assert scene.frame_range == (0, 12)
-  assert scene.frame_rate == 24
-  assert scene.step_rate == 240
-  assert intervention.target_id == "target"
-  assert intervention.recipe == "create_collision"
-  assert intervention.magnitude == 0.35
-  assert intervention.time_window == (24.0, 96.0)
-  assert intervention.push_mass == 2.0
-
-  assert factual_path.shape == (120, 7)
-  np.testing.assert_array_equal(factual_path[:, 0], np.linspace(-1.0, 1.0, 120))
-  np.testing.assert_array_equal(factual_path[:, 1], np.zeros(120))
-  np.testing.assert_array_equal(factual_path[:, 2], np.full(120, 0.18))
+  assert tuple(sorted(objects)) == spec.object_ids
+  assert len(objects) == 11
+  assert factual_path.shape == (200, 7)
+  np.testing.assert_array_equal(factual_path[0, :3], spec.path_start)
+  np.testing.assert_array_equal(factual_path[-1, :3], spec.path_end)
   np.testing.assert_array_equal(
-      factual_path[:, 3:], np.tile((1.0, 0.0, 0.0, 0.0), (120, 1))
+      factual_path[:, 3:], np.tile((1.0, 0.0, 0.0, 0.0), (200, 1))
   )
+  assert scene.frame_range == (0, 20)
+  assert intervention.time_window == (40.0, 160.0)
 
 
-def test_generate_demo_uses_public_pair_and_expected_ground_truth(generated_demo):
-  result = generated_demo
-
-  assert result.normal.branch == "factual"
-  assert result.changed.branch == "counterfactual"
-  assert isinstance(result.removed, demo.RemovedBranch)
-  assert result.removed.branch == "target_removed"
-  assert result.ground_truth.hard_affected == ("upper_ball",)
-  assert result.ground_truth.soft_affected == ()
-  assert not demo.dynamic_contacts(result.normal.contacts)
-  assert any(
-      {record.object_a, record.object_b} == {"target", "upper_ball"}
-      for record in result.changed.contacts
+def test_demo_has_small_normal_and_large_changed_chain(generated_demo):
+  assert generated_demo.demo_spec == demo.FORKED_RACK_SPEC
+  normal_pairs = _unique_dynamic_pairs(generated_demo.normal.contacts)
+  changed_pairs = _unique_dynamic_pairs(generated_demo.changed.contacts)
+  assert 2 <= len(normal_pairs) <= 3
+  assert ("side_01", "target") in normal_pairs
+  assert {"side_01", "side_02"}.issubset(
+      {endpoint for pair in normal_pairs for endpoint in pair}
+  )
+  assert not any(
+      endpoint in demo.FORKED_RACK_SPEC.main_ball_ids
+      for pair in normal_pairs for endpoint in pair
+  )
+  assert 7 <= len(changed_pairs) <= 9
+  assert ("breaker", "target") in changed_pairs
+  changed_main = {
+      endpoint for pair in changed_pairs for endpoint in pair
+      if endpoint in demo.FORKED_RACK_SPEC.main_ball_ids
+  }
+  assert len(changed_main) >= 6
+  assert not any(
+      endpoint in demo.FORKED_RACK_SPEC.side_ball_ids
+      for pair in changed_pairs for endpoint in pair
+  )
+  assert len(changed_pairs) >= len(normal_pairs) + 5
+  hard = set(generated_demo.ground_truth.hard_affected)
+  soft = set(generated_demo.ground_truth.soft_affected)
+  assert hard.isdisjoint(soft)
+  assert set(generated_demo.ground_truth.propagation_path) == hard
+  assert all(
+      path[0] == "target" and path[-1] == affected
+      for affected, path in generated_demo.ground_truth.propagation_path.items()
   )
   with pytest.raises(FrozenInstanceError):
-    result.changed = result.normal
+    generated_demo.changed = generated_demo.normal
+
+
+def test_calibrated_forked_rack_has_exact_chain_outcomes(generated_demo):
+  assert _unique_dynamic_pairs(generated_demo.normal.contacts) == {
+      ("side_01", "side_02"),
+      ("side_01", "target"),
+  }
+  assert _unique_dynamic_pairs(generated_demo.changed.contacts) == {
+      ("breaker", "target"),
+      ("rack_01", "rack_03"),
+      ("rack_01", "target"),
+      ("rack_02", "rack_03"),
+      ("rack_02", "rack_05"),
+      ("rack_02", "target"),
+      ("rack_03", "rack_06"),
+      ("rack_04", "rack_06"),
+      ("rack_05", "rack_06"),
+  }
+  assert generated_demo.ground_truth.hard_affected == (
+      "breaker", "rack_01", "rack_02", "rack_03", "rack_04", "rack_05",
+      "rack_06", "side_01", "side_02",
+  )
+  assert generated_demo.ground_truth.soft_affected == ()
 
 
 def test_changed_branch_diverges_only_inside_intervention_window(generated_demo):
   result = generated_demo
   start, end = result.intervention_window
 
-  assert (start, end) == (24, 96)
+  assert (start, end) == (40, 160)
   np.testing.assert_array_equal(
       result.normal.commanded_path[:start], result.changed.commanded_path[:start]
   )
@@ -407,9 +422,9 @@ def test_removed_branch_has_exact_prefix_and_presence_mask(generated_demo):
   )
 
   assert removed.object_ids == result.normal.object_ids
-  assert removed.steps == result.normal.steps == tuple(range(120))
-  assert removed.states.shape == result.normal.states.shape == (120, 4, 13)
-  assert removed.presence.shape == (120, 4)
+  assert removed.steps == result.normal.steps == tuple(range(200))
+  assert removed.states.shape == result.normal.states.shape == (200, 11, 13)
+  assert removed.presence.shape == (200, 11)
   assert removed.presence.dtype == np.bool_
   assert np.isfinite(removed.states).all()
   np.testing.assert_array_equal(
@@ -433,7 +448,7 @@ def test_removed_branch_has_exact_prefix_and_presence_mask(generated_demo):
   assert removed.metadata["removed_step"] == start
 
 
-def test_removed_target_has_no_post_removal_contacts(generated_demo):
+def test_removed_branch_has_no_post_removal_dynamic_chain(generated_demo):
   removed = generated_demo.removed
   start, _ = generated_demo.intervention_window
   known_ids = set(removed.object_ids)
@@ -443,11 +458,9 @@ def test_removed_target_has_no_post_removal_contacts(generated_demo):
       {record.object_a, record.object_b} <= known_ids
       for record in removed.contacts
   )
-  assert all(
-      record.step < start
-      for record in removed.contacts
-      if "target" in (record.object_a, record.object_b)
-  )
+  assert not demo.dynamic_contacts(tuple(
+      record for record in removed.contacts if record.step >= 40
+  ))
 
 
 def test_generate_demo_rejects_a_corrupted_removed_prefix(
@@ -507,8 +520,8 @@ def test_write_demo_bundle_roundtrips_all_branches(generated_demo, tmp_path):
     presence = np.load(
         tmp_path / f"{branch_name}_presence.npy", allow_pickle=False
     )
-    assert states.shape == (120, 4, 13)
-    assert presence.shape == (120, 4)
+    assert states.shape == (200, 11, 13)
+    assert presence.shape == (200, 11)
     assert presence.dtype == np.bool_
     np.testing.assert_array_equal(states, expected_states)
     np.testing.assert_array_equal(presence, expected_presence)
@@ -539,11 +552,14 @@ def test_write_demo_bundle_summary_has_exact_event_metadata(
   assert summary["object_ids"] == list(generated_demo.normal.object_ids)
   assert summary["step_rate"] == generated_demo.scene_config.step_rate == 240
   assert summary["seed"] == 0
-  assert summary["intervention_start"] == 24
-  assert summary["intervention_end"] == 96
-  assert summary["intervention_window"] == [24, 96]
+  assert summary["intervention_start"] == 40
+  assert summary["intervention_end"] == 160
+  assert summary["intervention_window"] == [40, 160]
   assert summary["ground_truth"] == generated_demo.ground_truth.to_dict()
-  assert summary["ground_truth"]["hard_affected"] == ["upper_ball"]
+  assert summary["ground_truth"]["hard_affected"] == [
+      "breaker", "rack_01", "rack_02", "rack_03", "rack_04", "rack_05",
+      "rack_06", "side_01", "side_02",
+  ]
   assert summary["ground_truth"]["soft_affected"] == []
   assert set(summary["ground_truth"]) == {
       "graph_delta",
@@ -573,7 +589,7 @@ def test_write_demo_bundle_summary_has_exact_event_metadata(
     )
 
   removal = summary["branches"]["target_removed"]
-  assert removal["removed_step"] == 24
+  assert removal["removed_step"] == 40
   assert removal["target_id"] == "target"
   assert removal["trust_model"] == "demo_only_removal_v1"
 
@@ -635,9 +651,7 @@ def test_write_demo_bundle_rejects_jointly_permuted_object_order(
     generated_demo, tmp_path
 ):
   canonical_ids = generated_demo.normal.object_ids
-  permuted_ids = tuple(
-      item.object_id for item in generated_demo.scene_config.objects
-  )
+  permuted_ids = tuple(reversed(canonical_ids))
   permutation = tuple(canonical_ids.index(item) for item in permuted_ids)
   assert permuted_ids != tuple(sorted(permuted_ids))
 
@@ -694,11 +708,7 @@ def test_write_demo_bundle_revalidates_the_public_pair_before_writing(
     commanded_path[start + 1, 1] += 0.01
     changed = dataclasses.replace(changed, commanded_path=commanded_path)
   else:
-    prefix_index = next(
-        index
-        for index, record in enumerate(changed.contacts)
-        if record.step < start
-    )
+    prefix_index = 0
     contacts = tuple(
         record
         for index, record in enumerate(changed.contacts)
@@ -752,93 +762,3 @@ def test_main_generates_then_writes_the_replay_bundle(
       ("write", tmp_path, generated_demo),
   ]
   assert json.loads(capsys.readouterr().out) == expected_summary
-
-
-def _contact(step, object_a, object_b):
-  return {
-      "step": step,
-      "object_a": object_a,
-      "object_b": object_b,
-      "contact_distance": -0.01,
-      "normal_force": 3.5,
-  }
-
-
-def _contact_records():
-  records = [_contact(step, "floor", "pusher") for step in range(_NUM_STEPS)]
-  records.append(_contact(2, "pusher", "upper_ball"))
-  records.append(_contact(3, "pusher", "upper_ball"))
-  return records
-
-
-def _synthetic_branch():
-  states = np.zeros((_NUM_STEPS, 4, 13), dtype=np.float64)
-  states[:, :, 3] = 1.0
-  states[:, 0, 0:3] = (0.0, 0.0, -0.25)
-  for step in range(_NUM_STEPS):
-    states[step, 1, 0] = -0.6 + 0.2 * step
-    states[step, 1, 1] = 0.0
-  states[:, 2, 0:3] = (0.0, 0.45, 0.26)
-  states[:, 3, 0:3] = (0.0, -0.45, 0.26)
-  return demo.BranchResult(
-      branch="counterfactual",
-      states=states,
-      contact_records=_contact_records(),
-  )
-
-
-def _strong_red_mask(frame):
-  channels = frame.astype(int)
-  return (
-      (channels[:, :, 0] > 140)
-      & (channels[:, :, 1] < 110)
-      & (channels[:, :, 2] < 110)
-  )
-
-
-def test_dynamic_contact_records_filters_floor_and_object():
-  records = _contact_records()
-  dynamic = demo._dynamic_contact_records(records)
-  assert len(dynamic) == 2
-  assert all("floor" not in (r["object_a"], r["object_b"]) for r in dynamic)
-
-  assert len(demo._dynamic_contact_records(records, "upper_ball")) == 2
-  assert demo._dynamic_contact_records(records, "lower_ball") == []
-  assert demo._dynamic_contact_records(records, "pusher") == dynamic
-
-
-def test_render_branch_video_writes_readable_mp4(tmp_path):
-  output = tmp_path / "counterfactual.mp4"
-  demo._render_branch_video(output, _synthetic_branch())
-
-  assert output.exists()
-  assert output.stat().st_size > 0
-  reader = imageio.get_reader(output)
-  try:
-    metadata = reader.get_meta_data()
-    frame_count = reader.count_frames()
-    frames = [reader.get_data(index) for index in range(min(frame_count, 2))]
-  finally:
-    reader.close()
-  assert tuple(metadata["size"]) == demo._CANVAS_SIZE
-  assert metadata["fps"] == 24.0
-  assert frame_count == _NUM_STEPS
-  expected_shape = (demo._CANVAS_SIZE[1], demo._CANVAS_SIZE[0], 3)
-  assert len(frames) == 2
-  assert all(frame.shape == expected_shape for frame in frames)
-
-
-def test_render_branch_video_draws_impact_ring_only_on_contact_frames(tmp_path):
-  output = tmp_path / "counterfactual.mp4"
-  demo._render_branch_video(output, _synthetic_branch())
-
-  reader = imageio.get_reader(output)
-  try:
-    impact_frame = reader.get_data(2)
-    idle_frame = reader.get_data(0)
-  finally:
-    reader.close()
-  impact_red = int(_strong_red_mask(impact_frame).sum())
-  idle_red = int(_strong_red_mask(idle_frame).sum())
-  assert impact_red > 100
-  assert idle_red == 0

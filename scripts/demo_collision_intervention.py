@@ -13,9 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, BinaryIO
 
-import imageio
 import numpy as np
-from PIL import Image, ImageDraw
 
 from interventions import (
     ContactLogger,
@@ -30,21 +28,18 @@ from interventions import (
     generate_paired_instance,
 )
 from interventions.twin_runner import _build_scene, _configure_physics
+from scripts.trajectory_demo_spec import (
+    FORKED_RACK_SPEC,
+    DemoSceneSpec,
+    demo_spec_summary,
+)
 
 
 _OUTPUT_DIR = Path("output/demo_collision_intervention")
-_DEMO_SEED = 0
-_NUM_STEPS = 120
+_DEMO_SPEC = FORKED_RACK_SPEC
+_DEMO_SEED = _DEMO_SPEC.seed
+_NUM_STEPS = _DEMO_SPEC.num_steps
 _BUNDLE_BRANCHES = ("normal", "trajectory_changed", "target_removed")
-_CANVAS_SIZE = (960, 544)
-_WORLD_BOUNDS = (-4.5, 4.5, -4.5, 4.5)
-
-
-@dataclass(frozen=True)
-class BranchResult:
-  branch: str
-  states: np.ndarray
-  contact_records: Sequence[Mapping[str, object] | ContactRecord]
 
 
 def _freeze_demo_metadata(value: Mapping[str, object]) -> Mapping[str, object]:
@@ -158,6 +153,9 @@ class RemovedBranch:
 
 @dataclass(frozen=True)
 class DemoResult:
+  """Carries the canonical spec and its three validated replay branches."""
+
+  demo_spec: DemoSceneSpec
   scene_config: SceneConfig
   intervention: Intervention
   normal: SimulationLog
@@ -170,65 +168,41 @@ class DemoResult:
     return tuple(int(value) for value in self.intervention.time_window)
 
 
-def build_demo_inputs() -> tuple[SceneConfig, Intervention, np.ndarray]:
+def build_demo_inputs(
+    spec: DemoSceneSpec = _DEMO_SPEC,
+) -> tuple[SceneConfig, Intervention, np.ndarray]:
   """Builds the deterministic public-API fixture used by the demo."""
-  floor = ObjectConfig(
-      "floor",
-      "cube",
-      size=(4.0, 4.0, 0.25),
-      mass=1.0,
-      position=(0.0, 0.0, -0.25),
-      static=True,
-      friction=0.0,
-      restitution=0.0,
-  )
-  target = ObjectConfig(
-      "target",
-      "cube",
-      size=0.18,
-      mass=2.0,
-      position=(-1.0, 0.0, 0.18),
-      static=True,
-      friction=0.0,
-      restitution=0.0,
-  )
-  upper_ball = ObjectConfig(
-      "upper_ball",
-      "sphere",
-      size=0.26,
-      mass=1.0,
-      position=(0.0, 0.45, 0.26),
-      friction=0.0,
-      restitution=0.0,
-  )
-  lower_ball = ObjectConfig(
-      "lower_ball",
-      "sphere",
-      size=0.26,
-      mass=1.0,
-      position=(0.0, -0.45, 0.26),
-      friction=0.0,
-      restitution=0.0,
-  )
+  objects = tuple(ObjectConfig(
+      item.object_id,
+      item.shape,
+      size=item.size,
+      mass=item.mass,
+      position=item.position,
+      quaternion=item.quaternion,
+      static=item.static,
+      friction=item.friction,
+      restitution=item.restitution,
+  ) for item in spec.objects)
   scene = SceneConfig(
-      objects=(floor, target, upper_ball, lower_ball),
-      seed=0,
-      scene_bounds=((-4.5, -4.5, -1.0), (4.5, 4.5, 2.0)),
-      gravity=(0.0, 0.0, 0.0),
-      frame_range=(0, 12),
-      frame_rate=24,
-      step_rate=240,
+      objects=objects,
+      seed=spec.seed,
+      scene_bounds=spec.scene_bounds,
+      gravity=spec.gravity,
+      frame_range=spec.frame_range,
+      frame_rate=spec.frame_rate,
+      step_rate=spec.step_rate,
   )
   intervention = Intervention(
-      target_id="target",
-      recipe="create_collision",
-      magnitude=0.35,
-      time_window=(24, 96),
-      push_mass=2.0,
+      target_id=spec.target_id,
+      recipe=spec.intervention_recipe,
+      magnitude=spec.intervention_magnitude,
+      time_window=spec.intervention_window,
+      push_mass=spec.push_mass,
   )
-  factual_path = np.zeros((_NUM_STEPS, 7), dtype=np.float64)
-  factual_path[:, 0] = np.linspace(-1.0, 1.0, _NUM_STEPS)
-  factual_path[:, 2] = 0.18
+  factual_path = np.zeros((spec.num_steps, 7), dtype=np.float64)
+  factual_path[:, :3] = np.linspace(
+      spec.path_start, spec.path_end, spec.num_steps
+  )
   factual_path[:, 3] = 1.0
   return scene, intervention, factual_path
 
@@ -261,21 +235,94 @@ def dynamic_contacts(
   )
 
 
+def _unique_dynamic_pairs(
+    records: Sequence[Mapping[str, object] | ContactRecord],
+) -> frozenset[tuple[str, str]]:
+  return frozenset(
+      tuple(sorted((
+          str(_record_value(record, "object_a")),
+          str(_record_value(record, "object_b")),
+      )))
+      for record in dynamic_contacts(records)
+  )
+
+
 def _validate_demo_outcomes(
     normal: SimulationLog,
     changed: SimulationLog,
     ground_truth: GroundTruth,
 ) -> None:
-  if dynamic_contacts(normal.contacts):
-    raise RuntimeError("normal branch unexpectedly contains a dynamic contact")
-  if not any(
-      {_record_value(record, "object_a"), _record_value(record, "object_b")}
-      == {"target", "upper_ball"}
-      for record in changed.contacts
-  ):
-    raise RuntimeError("changed branch did not create the target|upper_ball contact")
-  if ground_truth.hard_affected != ("upper_ball",):
-    raise RuntimeError("changed branch did not hard-affect only upper_ball")
+  normal_pairs = _unique_dynamic_pairs(normal.contacts)
+  changed_pairs = _unique_dynamic_pairs(changed.contacts)
+  normal_endpoints = {endpoint for pair in normal_pairs for endpoint in pair}
+  changed_endpoints = {endpoint for pair in changed_pairs for endpoint in pair}
+  main_balls = set(_DEMO_SPEC.main_ball_ids)
+  side_balls = set(_DEMO_SPEC.side_ball_ids)
+
+  if not 2 <= len(normal_pairs) <= 3:
+    raise RuntimeError(
+        "normal branch must contain 2..3 dynamic pairs; got "
+        f"{sorted(normal_pairs)!r}"
+    )
+  if ("side_01", "target") not in normal_pairs:
+    raise RuntimeError(
+        "normal branch lacks side_01|target; got "
+        f"{sorted(normal_pairs)!r}"
+    )
+  if not side_balls.issubset(normal_endpoints):
+    raise RuntimeError(
+        "normal branch does not reach both side balls; got "
+        f"{sorted(normal_pairs)!r}"
+    )
+  if main_balls & normal_endpoints:
+    raise RuntimeError(
+        "normal branch reaches main balls; got "
+        f"{sorted(normal_pairs)!r}"
+    )
+  if not 7 <= len(changed_pairs) <= 9:
+    raise RuntimeError(
+        "changed branch must contain 7..9 dynamic pairs; got "
+        f"{sorted(changed_pairs)!r}"
+    )
+  if ("breaker", "target") not in changed_pairs:
+    raise RuntimeError(
+        "changed branch lacks breaker|target; got "
+        f"{sorted(changed_pairs)!r}"
+    )
+  if len(main_balls & changed_endpoints) < 6:
+    raise RuntimeError(
+        "changed branch reaches fewer than six main balls; got "
+        f"{sorted(changed_pairs)!r}"
+    )
+  if side_balls & changed_endpoints:
+    raise RuntimeError(
+        "changed branch reaches side balls; got "
+        f"{sorted(changed_pairs)!r}"
+    )
+  if len(changed_pairs) < len(normal_pairs) + 5:
+    raise RuntimeError(
+        "changed branch must add at least five pairs; normal="
+        f"{sorted(normal_pairs)!r}, changed={sorted(changed_pairs)!r}"
+    )
+
+  hard = set(ground_truth.hard_affected)
+  soft = set(ground_truth.soft_affected)
+  if hard & soft:
+    raise RuntimeError(
+        f"hard and soft affected overlap: {sorted(hard & soft)!r}"
+    )
+  propagation_path = ground_truth.propagation_path
+  if set(propagation_path) != hard:
+    raise RuntimeError(
+        "propagation paths must cover exactly hard affected IDs; hard="
+        f"{sorted(hard)!r}, paths={sorted(propagation_path)!r}"
+    )
+  for affected, path in propagation_path.items():
+    if not path or path[0] != _DEMO_SPEC.target_id or path[-1] != affected:
+      raise RuntimeError(
+          "propagation path must start at target and end at affected ID; "
+          f"{affected!r}: {path!r}"
+      )
 
 
 def _run_removed_branch(
@@ -412,12 +459,13 @@ def _validate_removed_branch(
   )
   if removed_prefix_contacts != normal_prefix_contacts:
     raise RuntimeError("removed branch contact prefix differs from normal")
-  if any(
-      record.step >= removed_step
-      and target_id in (record.object_a, record.object_b)
-      for record in removed.contacts
-  ):
-    raise RuntimeError("removed target appears in a post-removal contact")
+  post_removal = dynamic_contacts(tuple(
+      record for record in removed.contacts if record.step >= removed_step
+  ))
+  if post_removal:
+    raise RuntimeError(
+        f"removed branch contains a post-removal dynamic contact: {post_removal!r}"
+    )
   if (
       removed.metadata.get("trust_model") != "demo_only_removal_v1"
       or removed.metadata.get("target_id") != target_id
@@ -430,7 +478,7 @@ def generate_demo(seed: int = _DEMO_SEED) -> DemoResult:
   """Generates factual and changed branches through the public pair runner."""
   if seed != _DEMO_SEED:
     raise ValueError("fixed deterministic demo seed is 0")
-  scene, intervention, factual_path = build_demo_inputs()
+  scene, intervention, factual_path = build_demo_inputs(_DEMO_SPEC)
   normal, changed = generate_paired_instance(
       scene,
       intervention.target_id,
@@ -452,6 +500,7 @@ def generate_demo(seed: int = _DEMO_SEED) -> DemoResult:
   _validate_demo_outcomes(normal, changed, ground_truth)
   _validate_removed_branch(removed, normal, intervention)
   return DemoResult(
+      demo_spec=_DEMO_SPEC,
       scene_config=scene,
       intervention=intervention,
       normal=normal,
@@ -495,28 +544,31 @@ def _validate_demo_bundle(result: DemoResult) -> None:
           f"{source_branches[role].branch!r}"
       )
 
-  canonical_object_ids = tuple(sorted(
-      item.object_id for item in result.scene_config.objects
-  ))
+  canonical_object_ids = result.demo_spec.object_ids
   object_ids = result.normal.object_ids
-  expected_shape = (_NUM_STEPS, len(object_ids), 13)
+  expected_shape = (
+      result.demo_spec.num_steps, len(result.demo_spec.object_ids), 13
+  )
   expected_presence_shape = expected_shape[:2]
   if object_ids != canonical_object_ids:
     raise ValueError(
-        "normal object order must match the sorted demo scene object IDs"
+        "normal object order must match the canonical demo scene object IDs"
     )
-  if expected_shape != (_NUM_STEPS, 4, 13):
-    raise ValueError("normal states must have shape (120, 4, 13)")
   if result.scene_config.seed != _DEMO_SEED:
     raise ValueError("demo scene seed must be 0")
-  if result.intervention_window != (24, 96):
-    raise ValueError("demo intervention window must be (24, 96)")
+  if result.intervention_window != _DEMO_SPEC.intervention_window:
+    raise ValueError(
+        "demo intervention window must be "
+        f"{_DEMO_SPEC.intervention_window!r}"
+    )
 
   for role, branch in source_branches.items():
     if branch.object_ids != object_ids:
       raise ValueError(f"{role} object order differs from normal")
-    if branch.steps != tuple(range(_NUM_STEPS)):
-      raise ValueError(f"{role} steps must be exactly range(120)")
+    if branch.steps != tuple(range(result.demo_spec.num_steps)):
+      raise ValueError(
+          f"{role} steps must be exactly range({result.demo_spec.num_steps})"
+      )
     if branch.states.shape != expected_shape:
       raise ValueError(
           f"{role} states must have shape {expected_shape!r}"
@@ -663,103 +715,6 @@ def write_demo_bundle(
   _atomic_save_json(output / "contacts.json", contacts_bytes)
   _atomic_save_json(output / "summary.json", summary_bytes)
   return summary
-
-
-def _world_to_canvas(x: float, y: float) -> tuple[float, float]:
-  x0, x1, y0, y1 = _WORLD_BOUNDS
-  width, height = _CANVAS_SIZE
-  px = (x - x0) / (x1 - x0) * (width - 1)
-  py = (1.0 - (y - y0) / (y1 - y0)) * (height - 1)
-  return px, py
-
-
-def _draw_circle(draw: ImageDraw.ImageDraw, x: float, y: float, radius: float, fill, outline):
-  draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=fill, outline=outline)
-
-
-def _dynamic_contact_records(
-    contact_records: Sequence[Mapping[str, object] | ContactRecord],
-    object_id: str | None = None,
-) -> list[Mapping[str, object] | ContactRecord]:
-  return list(dynamic_contacts(contact_records, object_id))
-
-
-def _render_branch_video(
-    output: Path, branch: BranchResult | SimulationLog
-) -> None:
-  output.parent.mkdir(parents=True, exist_ok=True)
-  if isinstance(branch, SimulationLog):
-    object_ids = branch.object_ids
-    contact_records = branch.contacts
-  else:
-    object_ids = ("floor", "pusher", "upper_ball", "lower_ball")
-    contact_records = branch.contact_records
-  target_id = "target" if "target" in object_ids else "pusher"
-  contact_steps = {
-      int(_record_value(record, "step"))
-      for record in dynamic_contacts(contact_records, target_id)
-  }
-  colors = {
-      "floor": (70, 70, 70),
-      target_id: (50, 120, 255),
-      "upper_ball": (255, 140, 70),
-      "lower_ball": (90, 200, 120),
-  }
-  radii = {
-      "floor": 18,
-      target_id: 14,
-      "upper_ball": 16,
-      "lower_ball": 16,
-  }
-  frame_map = {
-      name: {
-          "index": object_ids.index(name),
-          "color": colors[name],
-          "radius": radii[name],
-      }
-      for name in ("floor", target_id, "upper_ball", "lower_ball")
-  }
-  states = branch.states
-  trails = {name: [] for name in frame_map if name != "floor"}
-  writer = imageio.get_writer(output, fps=24, codec="libx264", quality=8)
-  try:
-    for step in range(len(states)):
-      image = Image.new("RGB", _CANVAS_SIZE, (245, 245, 240))
-      draw = ImageDraw.Draw(image)
-
-      draw.rectangle((0, 0, _CANVAS_SIZE[0] - 1, _CANVAS_SIZE[1] - 1), outline=(210, 210, 205), width=2)
-      x0, x1, y0, y1 = _WORLD_BOUNDS
-      left_top = _world_to_canvas(x0, y1)
-      right_bottom = _world_to_canvas(x1, y0)
-      draw.rectangle((left_top[0], left_top[1], right_bottom[0], right_bottom[1]), outline=(180, 180, 175), width=3)
-      draw.text((20, 18), f"{branch.branch} | frame {step + 1:03d}/{len(states):03d}", fill=(30, 30, 30))
-
-      for name, spec in frame_map.items():
-        index = spec["index"]
-        position = states[step, index]
-        x, y = _world_to_canvas(float(position[0]), float(position[1]))
-        if name != "floor":
-          trails[name].append((x, y))
-          if len(trails[name]) > 1:
-            draw.line(trails[name][-40:], fill=spec["color"], width=3)
-        radius = spec["radius"]
-        fill = spec["color"]
-        outline = (25, 25, 25)
-        if name == target_id and step in contact_steps:
-          outline = (220, 30, 30)
-          draw.ellipse(
-              (x - radius - 7, y - radius - 7, x + radius + 7, y + radius + 7),
-              outline=(220, 30, 30),
-              width=4,
-          )
-        _draw_circle(draw, x, y, radius, fill, outline)
-        if name != "floor":
-          label = name.replace("_", " ")
-          draw.text((x + radius + 4, y - radius - 2), label, fill=(25, 25, 25))
-
-      writer.append_data(np.asarray(image))
-  finally:
-    writer.close()
 
 
 def _parser() -> argparse.ArgumentParser:
