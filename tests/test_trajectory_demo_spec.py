@@ -136,3 +136,71 @@ def test_role_counts_and_role_invariants_are_structural():
     objects = tuple(dataclasses.replace(obj, visual_role="target") if obj.object_id == "floor" else obj for obj in demo_spec.FORKED_RACK_SPEC.objects)
     with pytest.raises(ValueError, match="nine balls|target|floor"):
         demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, objects=objects))
+
+
+def test_floor_target_role_identity_is_canonical():
+    objects = tuple(
+        dataclasses.replace(obj, visual_role="target" if obj.object_id == "floor" else "floor")
+        if obj.object_id in ("floor", "target") else obj
+        for obj in demo_spec.FORKED_RACK_SPEC.objects
+    )
+    with pytest.raises(ValueError, match="target|role"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, objects=objects))
+
+
+def test_spec_and_version_types_rejected():
+    with pytest.raises(TypeError, match="DemoSceneSpec"):
+        demo_spec.validate_demo_spec(None)
+    with pytest.raises(ValueError, match="version"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, version="other"))
+
+
+@pytest.mark.parametrize("changes, pattern", [
+    ({"group": "other"}, "group"),
+    ({"mass": "x"}, "mass"), ({"mass": True}, "mass"), ({"mass": math.nan}, "mass"), ({"mass": -1}, "mass"),
+    ({"friction": "x"}, "friction"), ({"friction": True}, "friction"), ({"friction": math.nan}, "friction"), ({"friction": -1}, "friction"),
+    ({"restitution": "x"}, "restitution"), ({"restitution": True}, "restitution"), ({"restitution": math.nan}, "restitution"), ({"restitution": 2}, "restitution"),
+    ({"position": (0, 0)}, "position"), ({"position": (True, 0, 0)}, "position"), ({"position": ("x", 0, 0)}, "position"), ({"position": (math.inf, 0, 0)}, "position"),
+    ({"color": (0, 0)}, "color"), ({"color": (True, 0, 0)}, "color"), ({"color": ("x", 0, 0)}, "color"), ({"color": (math.nan, 0, 0)}, "color"), ({"color": (2, 0, 0)}, "color"),
+    ({"quaternion": (1, 0, 0)}, "quaternion"), ({"quaternion": (math.nan, 0, 0, 0)}, "quaternion"), ({"quaternion": (1, 1, 0, 0)}, "quaternion"),
+    ({"static": 1}, "static"), ({"striped": 1}, "striped"),
+])
+def test_object_numeric_and_type_matrix(changes, pattern):
+    with pytest.raises((TypeError, ValueError), match=pattern):
+        demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", **changes))
+
+
+@pytest.mark.parametrize("changes, pattern", [
+    ({"ball_number": 2}, "ball numbers"), ({"ball_number": 10}, "ball numbers"),
+    ({"ball_number": 1.0}, "ball numbers"), ({"ball_number": True}, "ball numbers"),
+    ({"group": "main"}, "group"), ({"ball_number": 1}, "group or ball number"),
+])
+def test_ball_numbers_and_nonball_metadata_matrix(changes, pattern):
+    object_id = "breaker" if changes.get("ball_number") in (2, 10, 1.0, True) else "floor"
+    if changes == {"ball_number": 1}:
+        object_id = "floor"
+    with pytest.raises((TypeError, ValueError), match=pattern):
+        demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, object_id, **changes))
+
+
+@pytest.mark.parametrize("changes, pattern", [
+    ({"frame_range": (False, 20)}, "frame_range"), ({"frame_range": (0, 20.0)}, "frame_range"),
+    ({"frame_range": (20, 0)}, "positive"), ({"frame_rate": True}, "frame rates"),
+    ({"frame_rate": "x"}, "frame rates"), ({"frame_rate": 0}, "positive"),
+    ({"step_rate": True}, "frame rates"), ({"step_rate": "x"}, "frame rates"), ({"step_rate": 0}, "positive"),
+    ({"frame_range": (0, 8), "step_rate": 25}, "integral"),
+    ({"frame_range": (0, 21)}, "200"), ({"intervention_window": (0, 201)}, "window"),
+    ({"scene_bounds": ((1, 0, 0), (0, 1, 1))}, "increasing"),
+    ({"gravity": (math.nan, 0, 0)}, "gravity"), ({"path_start": (math.inf, 0, 0)}, "path_start"),
+    ({"target_id": "breaker"}, "target"), ({"intervention_recipe": "push"}, "recipe"),
+    ({"intervention_magnitude": "x"}, "magnitude"), ({"intervention_magnitude": True}, "magnitude"), ({"intervention_magnitude": math.nan}, "magnitude"), ({"intervention_magnitude": 0}, "positive"),
+    ({"push_mass": "x"}, "push mass"), ({"push_mass": True}, "push mass"), ({"push_mass": math.nan}, "push mass"), ({"push_mass": 0}, "positive"),
+])
+def test_scene_numeric_and_timing_matrix(changes, pattern):
+    with pytest.raises((TypeError, ValueError), match=pattern):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, **changes))
+
+
+def test_object_dataclass_is_frozen():
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        demo_spec.FORKED_RACK_SPEC.objects[0].mass = 2.0

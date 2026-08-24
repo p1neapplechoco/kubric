@@ -177,6 +177,10 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
         raise ValueError("target role required exactly once")
     if roles.count("ball") != 9:
         raise ValueError("spec must contain exactly nine balls")
+    if next(obj.object_id for obj in spec.objects if obj.visual_role == "target") != spec.target_id:
+        raise ValueError("target role must belong to target object")
+    if next(obj.object_id for obj in spec.objects if obj.visual_role == "floor") != "floor":
+        raise ValueError("floor role must belong to floor object")
     if len(spec.objects) != 11 or len(spec.ball_ids) != 9:
         raise ValueError("spec must contain exactly nine balls")
     if spec.object_ids.count(spec.target_id) != 1 or spec.target_id != "target":
