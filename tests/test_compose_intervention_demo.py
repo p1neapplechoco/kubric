@@ -1828,22 +1828,22 @@ def test_real_ffmpeg_composes_full_demo_frame_count(compositor, tmp_path):
           "removal",
           (1380, 100, 440, 76),
           (255, 143, 171),
-          (63, 64, 82),
+          (63, 64, 81, 82),
       ),
       (
           "changed",
           (700, 100, 520, 76),
           (255, 209, 102),
-          (111, 112, 134),
+          (111, 112, 133, 134),
       ),
       (
           "normal",
           (60, 100, 520, 76),
           (255, 209, 102),
-          (116, 117, 139),
+          (116, 117, 138, 139),
       ),
   )
-  for name, crop, color, (before, first, after) in cue_boundaries:
+  for name, crop, color, (before, first, last, after) in cue_boundaries:
     counts = {
         frame: _near_color_count_at_frame(
             ffmpeg,
@@ -1852,10 +1852,11 @@ def test_real_ffmpeg_composes_full_demo_frame_count(compositor, tmp_path):
             crop=crop,
             color=color,
         )
-        for frame in (before, first, after)
+        for frame in (before, first, last, after)
     }
     assert counts[before] <= 10, (name, counts)
     assert counts[first] >= 300, (name, counts)
+    assert counts[last] >= 300, (name, counts)
     assert counts[after] <= 10, (name, counts)
 
   final_counts = {
