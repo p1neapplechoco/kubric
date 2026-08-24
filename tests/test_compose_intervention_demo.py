@@ -422,6 +422,57 @@ def test_event_output_frame_adds_exact_opening_hold_frames(compositor):
   assert compositor._event_output_frame(93) == 117
 
 
+@pytest.mark.parametrize(
+    "source_fps", (30.0, 23.976, Fraction(24000, 1001))
+)
+def test_build_filter_rejects_non_24fps_frame_lattice(
+    compositor, tmp_path, source_fps
+):
+  overlay_dir = tmp_path / "overlays"
+  overlay_dir.mkdir()
+  summary = _summary()
+  overlay_files = compositor._write_overlay_textfiles(
+      overlay_dir,
+      summary,
+      source_duration=200 / float(source_fps),
+      source_fps=source_fps,
+  )
+
+  with pytest.raises(ValueError, match=r"24 fps.*frame-lattice"):
+    compositor._build_filter(
+        summary,
+        _font(tmp_path),
+        source_duration=200 / float(source_fps),
+        source_fps=source_fps,
+        overlay_files=overlay_files,
+    )
+
+
+@pytest.mark.parametrize("source_fps", (24.0, Fraction(24, 1)))
+def test_build_filter_accepts_exact_normalized_24fps(
+    compositor, tmp_path, source_fps
+):
+  overlay_dir = tmp_path / "overlays"
+  overlay_dir.mkdir()
+  summary = _summary()
+  overlay_files = compositor._write_overlay_textfiles(
+      overlay_dir,
+      summary,
+      source_duration=200 / 24,
+      source_fps=source_fps,
+  )
+
+  filter_graph = compositor._build_filter(
+      summary,
+      _font(tmp_path),
+      source_duration=200 / 24,
+      source_fps=source_fps,
+      overlay_files=overlay_files,
+  )
+
+  assert "between(n,112,133)" in filter_graph
+
+
 def test_filter_uses_exact_frame_lattice_for_all_timed_overlays(
     compositor, tmp_path
 ):
@@ -1697,12 +1748,55 @@ def _make_synthetic_video(ffmpeg, path, color):
   assert result.returncode == 0, result.stderr
 
 
+def _near_color_count_at_frame(
+    ffmpeg, video, *, frame, crop, color, tolerance=24
+):
+  x, y, width, height = crop
+  result = subprocess.run(
+      [
+          ffmpeg,
+          "-hide_banner",
+          "-loglevel",
+          "error",
+          "-i",
+          str(video),
+          "-vf",
+          (
+              f"select=eq(n\\,{frame}),"
+              f"crop={width}:{height}:{x}:{y},format=rgb24"
+          ),
+          "-frames:v",
+          "1",
+          "-f",
+          "rawvideo",
+          "-",
+      ],
+      check=False,
+      capture_output=True,
+  )
+  assert result.returncode == 0, result.stderr.decode("utf-8")
+  assert len(result.stdout) == width * height * 3
+  red, green, blue = color
+  pixels = zip(
+      result.stdout[0::3], result.stdout[1::3], result.stdout[2::3]
+  )
+  return sum(
+      abs(r - red) <= tolerance
+      and abs(g - green) <= tolerance
+      and abs(b - blue) <= tolerance
+      for r, g, b in pixels
+  )
+
+
 def test_real_ffmpeg_composes_full_demo_frame_count(compositor, tmp_path):
   ffmpeg = shutil.which("ffmpeg")
   ffprobe = shutil.which("ffprobe")
   if ffmpeg is None or ffprobe is None:
     pytest.skip("ffmpeg and ffprobe are required for integration coverage")
-  font = compositor._resolve_font(None)
+  try:
+    font = compositor._resolve_font(None)
+  except FileNotFoundError:
+    pytest.skip("a supported font is required for integration coverage")
   for name, color in (
       ("normal", "red"),
       ("trajectory_changed", "green"),
@@ -1728,6 +1822,55 @@ def test_real_ffmpeg_composes_full_demo_frame_count(compositor, tmp_path):
   assert info.duration == pytest.approx(272 / 24, abs=0.01)
   assert info.codec_name == "h264"
   assert info.pix_fmt == "yuv420p"
+
+  cue_boundaries = (
+      (
+          "removal",
+          (1380, 100, 440, 76),
+          (255, 143, 171),
+          (63, 64, 82),
+      ),
+      (
+          "changed",
+          (700, 100, 520, 76),
+          (255, 209, 102),
+          (111, 112, 134),
+      ),
+      (
+          "normal",
+          (60, 100, 520, 76),
+          (255, 209, 102),
+          (116, 117, 139),
+      ),
+  )
+  for name, crop, color, (before, first, after) in cue_boundaries:
+    counts = {
+        frame: _near_color_count_at_frame(
+            ffmpeg,
+            output,
+            frame=frame,
+            crop=crop,
+            color=color,
+        )
+        for frame in (before, first, after)
+    }
+    assert counts[before] <= 10, (name, counts)
+    assert counts[first] >= 300, (name, counts)
+    assert counts[after] <= 10, (name, counts)
+
+  final_counts = {
+      frame: _near_color_count_at_frame(
+          ffmpeg,
+          output,
+          frame=frame,
+          crop=(480, 510, 960, 126),
+          color=(255, 255, 255),
+      )
+      for frame in (223, 224, 271)
+  }
+  assert final_counts[223] <= 10, final_counts
+  assert final_counts[224] >= 500, final_counts
+  assert final_counts[271] >= 500, final_counts
 
 
 def test_cli_prints_compact_json_metadata(compositor, tmp_path, monkeypatch, capsys):

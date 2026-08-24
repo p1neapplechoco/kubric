@@ -816,6 +816,8 @@ def _build_filter(
     raise ValueError("source_duration must be positive and finite")
   if not math.isfinite(source_fps) or source_fps <= 0:
     raise ValueError("source_fps must be positive and finite")
+  if _normalized_fps(source_fps) != _OUTPUT_FPS:
+    raise ValueError("source_fps must equal 24 fps for frame-lattice timing")
   font_path = Path(font)
   expected_overlays = frozenset(_overlay_texts(
       summary,
