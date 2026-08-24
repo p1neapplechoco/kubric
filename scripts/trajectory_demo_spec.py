@@ -1,10 +1,12 @@
-"""One immutable eleven-object contract for physics/replay/Blender/FFmpeg.
+"""Purpose: one immutable eleven-object contract for physics/replay/Blender/FFmpeg.
 
 Public API: DemoObjectSpec, DemoSceneSpec, FORKED_RACK_SPEC,
 validate_demo_spec(), canonical_spec_payload(), spec_sha256(), and
-demo_spec_summary(). Dependencies are standard-library only; importing this
-module never loads Kubric, PyBullet, Blender, NumPy, or TensorFlow. The digest
-detects local specification drift, not a signature or producer attestation.
+demo_spec_summary().
+Dependencies: standard-library only; importing this module never loads Kubric,
+PyBullet, Blender, NumPy, or TensorFlow.
+Trust boundary: the digest detects local specification drift, not a signature
+or producer attestation.
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ _SIDE_IDS = ("side_01", "side_02")
 
 @dataclass(frozen=True)
 class DemoObjectSpec:
+    """Immutable physical and presentation metadata for one scene object."""
     object_id: str
     shape: str
     size: float | tuple[float, float, float]
@@ -44,6 +47,7 @@ class DemoObjectSpec:
 
 @dataclass(frozen=True)
 class DemoSceneSpec:
+    """Immutable scene-wide contract consumed by all demo backends."""
     version: str
     objects: tuple[DemoObjectSpec, ...]
     seed: int
@@ -62,22 +66,27 @@ class DemoSceneSpec:
 
     @property
     def num_steps(self) -> int:
+        """Return integral physics steps covered by the frame range."""
         return ((self.frame_range[1] - self.frame_range[0]) * self.step_rate // self.frame_rate)
 
     @property
     def object_ids(self) -> tuple[str, ...]:
+        """Return object IDs in their stored, canonical order."""
         return tuple(obj.object_id for obj in self.objects)
 
     @property
     def ball_ids(self) -> tuple[str, ...]:
+        """Return IDs whose visual role is ball."""
         return tuple(obj.object_id for obj in self.objects if obj.visual_role == "ball")
 
     @property
     def main_ball_ids(self) -> tuple[str, ...]:
+        """Return ball IDs assigned to the main group."""
         return tuple(obj.object_id for obj in self.objects if obj.group == "main")
 
     @property
     def side_ball_ids(self) -> tuple[str, ...]:
+        """Return ball IDs assigned to the side group."""
         return tuple(obj.object_id for obj in self.objects if obj.group == "side")
 
 
@@ -105,10 +114,13 @@ def _number(value: object, name: str, *, positive: bool = False, nonnegative: bo
 
 
 def validate_demo_spec(spec: DemoSceneSpec) -> None:
+    """Validate the complete structural and numeric demo contract."""
     if not isinstance(spec, DemoSceneSpec):
         raise TypeError("spec must be DemoSceneSpec")
     if spec.version != "forked_rack_v1":
         raise ValueError("version must be forked_rack_v1")
+    if isinstance(spec.objects, (str, bytes)) or not isinstance(spec.objects, Sequence):
+        raise TypeError("objects must be a sequence of DemoObjectSpec")
     seen = set()
     for obj in spec.objects:
         if not isinstance(obj, DemoObjectSpec):
@@ -158,8 +170,13 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
             raise ValueError("floor and target cannot have group or ball number")
         if obj.visual_role in ("floor", "target") and (not obj.static or obj.shape != "cube"):
             raise ValueError("floor and target must be static cube")
-    if spec.object_ids.count("floor") != 1:
+    roles = tuple(obj.visual_role for obj in spec.objects)
+    if roles.count("floor") != 1:
         raise ValueError("floor required")
+    if roles.count("target") != 1:
+        raise ValueError("target role required exactly once")
+    if roles.count("ball") != 9:
+        raise ValueError("spec must contain exactly nine balls")
     if len(spec.objects) != 11 or len(spec.ball_ids) != 9:
         raise ValueError("spec must contain exactly nine balls")
     if spec.object_ids.count(spec.target_id) != 1 or spec.target_id != "target":
@@ -172,7 +189,7 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
     if spec.object_ids != _EXPECTED_IDS:
         raise ValueError("objects must use canonical order")
     for name, value in (("frame_range", spec.frame_range), ("intervention_window", spec.intervention_window)):
-        if isinstance(value, (str, bytes)) or len(value) != 2 or any(isinstance(v, bool) or not isinstance(v, int) for v in value):
+        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence) or len(value) != 2 or any(isinstance(v, bool) or not isinstance(v, int) for v in value):
             raise ValueError(f"{name} must contain integer endpoints")
     start, end = spec.frame_range
     if any(isinstance(v, bool) or not isinstance(v, int) for v in (spec.frame_rate, spec.step_rate)):
@@ -189,6 +206,8 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
     if isinstance(spec.seed, bool) or not isinstance(spec.seed, int) or spec.seed != 0:
         raise ValueError("seed must be 0")
     gravity = _finite_vector(spec.gravity, 3, "gravity")
+    if isinstance(spec.scene_bounds, (str, bytes)) or not isinstance(spec.scene_bounds, Sequence) or len(spec.scene_bounds) != 2:
+        raise ValueError("scene bounds must contain two vectors")
     bounds = tuple(_finite_vector(v, 3, "scene bounds") for v in spec.scene_bounds)
     if any(a >= b for a, b in zip(bounds[0], bounds[1])):
         raise ValueError("scene bounds must be increasing")
@@ -219,21 +238,23 @@ OBJECTS = (
 
 FORKED_RACK_SPEC = DemoSceneSpec("forked_rack_v1", OBJECTS, 0, ((-4.5, -4.5, -1.0), (4.5, 4.5, 2.0)), (0, 0, 0), (0, 20), 24, 240, (40, 160), "create_collision", 1.2, 2.0, "target", (-2.0, -0.25, 0.18), (2.0, -0.25, 0.18))
 
+validate_demo_spec(FORKED_RACK_SPEC)
+
 
 def canonical_spec_payload(spec: DemoSceneSpec) -> Mapping[str, object]:
+    """Return validated JSON-compatible data without reordering objects."""
     validate_demo_spec(spec)
     return asdict(spec)
 
 
 def spec_sha256(spec: DemoSceneSpec) -> str:
+    """Return the canonical lowercase SHA-256 digest of a scene spec."""
     payload = canonical_spec_payload(spec)
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
 def demo_spec_summary(spec: DemoSceneSpec) -> dict[str, object]:
+    """Return object count, digest, source frame count, and version."""
     validate_demo_spec(spec)
     return {"object_count": len(spec.objects), "sha256": spec_sha256(spec), "source_frames": spec.num_steps, "version": spec.version}
-
-
-validate_demo_spec(FORKED_RACK_SPEC)

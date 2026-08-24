@@ -2,7 +2,6 @@ import dataclasses
 import hashlib
 import json
 import math
-import re
 
 import pytest
 
@@ -38,6 +37,32 @@ def test_canonical_spec_contract():
     assert dataclasses.is_dataclass(spec) and dataclasses.is_dataclass(spec.objects[0])
     with pytest.raises(dataclasses.FrozenInstanceError):
         spec.num_steps = 1
+
+
+def test_calibrated_scene_values_are_exact():
+    spec = demo_spec.FORKED_RACK_SPEC
+    assert (spec.scene_bounds, spec.gravity, spec.intervention_recipe,
+            spec.intervention_magnitude, spec.push_mass, spec.path_start,
+            spec.path_end) == (((-4.5, -4.5, -1.0), (4.5, 4.5, 2.0)),
+                                (0, 0, 0), "create_collision", 1.2, 2.0,
+                                (-2.0, -0.25, 0.18), (2.0, -0.25, 0.18))
+    expected = {
+        "breaker": ("sphere", 0.22, 1.0, (0.25, 0.60, 0.22), False, 0.02, 0.65, "ball", "main", (0.95, 0.45, 0.08), 1, False),
+        "floor": ("cube", (4.0, 4.0, 0.25), 1.0, (0, 0, -0.25), True, 0, 0, "floor", None, (0.055, 0.19, 0.12), None, False),
+        "rack_01": ("sphere", 0.22, 1.0, (0.72, 0.60, 0.22), False, 0.02, 0.65, "ball", "main", (0.15, 0.55, 0.92), 2, False),
+        "rack_02": ("sphere", 0.22, 1.0, (1.18, 0.37, 0.22), False, 0.02, 0.65, "ball", "main", (0.84, 0.16, 0.20), 3, False),
+        "rack_03": ("sphere", 0.22, 1.0, (1.18, 0.83, 0.22), False, 0.02, 0.65, "ball", "main", (0.48, 0.22, 0.78), 4, False),
+        "rack_04": ("sphere", 0.22, 1.0, (2.00, 1.32, 0.22), False, 0.02, 0.65, "ball", "main", (0.96, 0.78, 0.08), 5, False),
+        "rack_05": ("sphere", 0.22, 1.0, (1.64, 0.60, 0.22), False, 0.02, 0.65, "ball", "main", (0.10, 0.62, 0.30), 6, False),
+        "rack_06": ("sphere", 0.22, 1.0, (1.64, 1.06, 0.22), False, 0.02, 0.65, "ball", "main", (0.50, 0.18, 0.10), 7, False),
+        "side_01": ("sphere", 0.22, 1.0, (0.25, -0.48, 0.22), False, 0.02, 0.65, "ball", "side", (0.08, 0.42, 0.90), 8, False),
+        "side_02": ("sphere", 0.22, 1.0, (0.72, -0.48, 0.22), False, 0.02, 0.65, "ball", "side", (0.82, 0.12, 0.18), 9, True),
+        "target": ("cube", 0.18, 2.0, (-2.0, -0.25, 0.18), True, 0.02, 0.65, "target", None, (0.58, 0.27, 0.08), None, False),
+    }
+    for obj in spec.objects:
+        assert (obj.shape, obj.size, obj.mass, obj.position, obj.static,
+                obj.friction, obj.restitution, obj.visual_role, obj.group,
+                obj.color, obj.ball_number, obj.striped) == expected[obj.object_id]
 
 
 def test_payload_digest_and_summary_preserve_order():
@@ -85,3 +110,29 @@ def test_invalid_object_mutants_rejected(object_id, changes, pattern):
 def test_invalid_scene_mutants_rejected(changes, pattern):
     with pytest.raises((TypeError, ValueError), match=pattern):
         demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, **changes))
+
+
+@pytest.mark.parametrize("objects, pattern", [
+    (None, "objects"),
+    ((None,), "DemoObjectSpec"),
+])
+def test_malformed_objects_rejected(objects, pattern):
+    with pytest.raises((TypeError, ValueError), match=pattern):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, objects=objects))
+
+
+@pytest.mark.parametrize("field, value", [
+    ("frame_range", None), ("frame_range", (0,)), ("frame_range", (0, 20, 1)),
+    ("intervention_window", None), ("intervention_window", (0,)),
+    ("scene_bounds", None), ("scene_bounds", ((0, 0, 0),)),
+    ("scene_bounds", ((0, 0), (1, 1, 1))),
+])
+def test_malformed_scene_containers_rejected(field, value):
+    with pytest.raises((TypeError, ValueError), match="must|bounds|window|range|objects"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, **{field: value}))
+
+
+def test_role_counts_and_role_invariants_are_structural():
+    objects = tuple(dataclasses.replace(obj, visual_role="target") if obj.object_id == "floor" else obj for obj in demo_spec.FORKED_RACK_SPEC.objects)
+    with pytest.raises(ValueError, match="nine balls|target|floor"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, objects=objects))
