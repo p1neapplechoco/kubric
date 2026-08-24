@@ -61,10 +61,11 @@ Create `scripts/trajectory_demo_spec.py` as an import-safe, pure-Python module.
 It must not import Kubric, PyBullet, Blender, or the intervention runtime.
 
 The module exposes frozen `DemoObjectSpec` and `DemoSceneSpec` values and one
-canonical `FORKED_RACK_SPEC`. The canonical object order is:
+canonical `FORKED_RACK_SPEC`. The canonical replay order follows the public twin
+runner's lexicographic object-ID contract:
 
-1. `floor`
-2. `breaker`
+1. `breaker`
+2. `floor`
 3. `rack_01`
 4. `rack_02`
 5. `rack_03`
