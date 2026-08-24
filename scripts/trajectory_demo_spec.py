@@ -1,12 +1,13 @@
-"""Purpose: one immutable eleven-object contract for physics/replay/Blender/FFmpeg.
+"""Purpose: define one immutable eleven-object contract that binds physics,
+replay, Blender, and FFmpeg consumers to the same canonical scene.
 
 Public API: DemoObjectSpec, DemoSceneSpec, FORKED_RACK_SPEC,
 validate_demo_spec(), canonical_spec_payload(), spec_sha256(), and
 demo_spec_summary().
 Dependencies: standard-library only; importing this module never loads Kubric,
 PyBullet, Blender, NumPy, or TensorFlow.
-Trust boundary: the digest detects local specification drift, not a signature
-or producer attestation.
+Trust boundary: exact payload and digest checks reject replay/specification drift;
+the SHA-256 identity is not a signature or producer attestation.
 """
 from __future__ import annotations
 

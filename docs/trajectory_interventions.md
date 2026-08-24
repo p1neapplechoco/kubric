@@ -9,18 +9,27 @@ package.
 
 ## Architecture and conventions
 
-- `schema.py` and `trajectory.py` define validated, backend-neutral inputs and
-  path construction/perturbation.
-- `kinematic_simulator.py` wraps Kubric's PyBullet simulator. The target remains
-  static in Kubric bookkeeping and receives a positive `push_mass` only during
-  each physics step.
-- `logging.py` records immutable state/contact generations.
-- `twin_runner.py` rebuilds both branches from one `SceneConfig` and seed, using
-  a fresh physics client per branch, and validates their common prefix.
-- `graph_extraction.py` and `tagging.py` derive temporal graph deltas, affected
-  sets, propagation paths, and deterministic tags.
-- `dataset.py` performs deterministic sampling, QC, balancing, grouped splits,
-  resumable journaling, and artifact publication.
+Each module declares the same four-part contract in its module docstring. The
+table below is the human-facing map of those boundaries.
+
+| Module | Purpose, public API, and dependencies | Trust boundary |
+| --- | --- | --- |
+| `interventions/schema.py` | Standard-library-only, backend-neutral validation and deterministic JSON conversion through the config/ground-truth dataclasses and `to_jsonable()`. | Shape and JSON safety are validated; physical feasibility, execution, and origin are not. |
+| `interventions/trajectory.py` | NumPy/SciPy construction, validation, comparison, and named perturbation recipes through `build_path()`, `validate_path()`, `max_position_deviation()`, and `perturb_path()`. | Recipes are heuristic candidates until a physics rollout and QC establish the requested effect. |
+| `interventions/logging.py` | Immutable NumPy state/contact logs, stable state-vector slices, serialization, hashing, and publication; it imports no Bullet or Kubric backend. | Immutability and hashes protect internal consistency, not simulator or producer origin. |
+| `interventions/graph_extraction.py` | Pure aggregation, temporal graphs, graph deltas, reachability, affected sets, and packaged ground truth over supplied logs/states. | The result is not causal proof beyond the completeness and authenticity of its inputs. |
+| `interventions/tagging.py` | `derive_tags()` creates deterministic metadata from validated ground truth and explicit role/stability inputs. | Tags summarize supplied metadata and do not independently verify physics or causality. |
+| `interventions/kinematic_simulator.py` | `KinematicSimulator` wraps Kubric/PyBullet for mass-carrying prescribed paths; the package exposes this backend lazily. | Private Bullet snapshots remain bound to the creating simulator, physics client, and backend lifetime. |
+| `interventions/twin_runner.py` | Creates fresh worlds for the canonical factual/counterfactual pair, checks prefixes/provenance, derives truth, and reads/writes paired artifacts. | Canonically generated pairs record provenance; caller-supplied logs remain `caller_trusted_unattested_logs_v1`. |
+| `interventions/dataset.py` | Deterministic attempts, QC, journals, balancing, grouped splits, atomic publication, and resume through `run_batch()` and supporting APIs. | Resume requires the same run contract; journals/hashes protect consistency but do not authenticate the producer. |
+| `interventions/__init__.py` | Stable public exports for schemas, trajectories, logs, graph extraction, tags, and lazy simulator/twin-runner entry points. | Re-exporting a value does not strengthen its provenance or attestation. |
+| `scripts/__init__.py` | Package marker for module-based CLI and demo entry points; it intentionally exports no callable API. | Import performs no validation, simulation, rendering, composition, or publication. |
+| `scripts/generate_dataset.py` | `main()` parses one resumable batch request and emits the stable `run_batch()` JSON status. | Sampling, QC, journaling, and publication trust remain those of `dataset.py`. |
+| `scripts/generate_instance.py` | `main()` samples, executes, evaluates, optionally publishes, and reports one inspectable attempt. | Attempt QC/integrity does not authenticate the machine or producer. |
+| `scripts/trajectory_demo_spec.py` | Standard-library-only immutable eleven-object contract, canonical payload, and SHA-256 identity shared by physics, replay, Blender, and FFmpeg. | The digest detects specification drift; it is not a signature or producer attestation. |
+| `scripts/demo_collision_intervention.py` | Builds the canonical inputs and atomically publishes three digest-bound replay branches. | Normal/changed use the public paired pipeline; removed is `demo_only_removal_v1`, not a dataset recipe or attested pair. |
+| `scripts/render_demo_branches_blender.py` | Preflights spec/summary/array contracts and renders logged colliders with procedural Blender appearance. | Pixels and decoration do not change or independently attest the logged physics. |
+| `scripts/compose_intervention_demo.py` | Validates exact summary/event/media contracts and atomically composes the synchronized comparison with FFmpeg. | Composition neither reruns physics nor attests the source producer. |
 
 Unless a field says otherwise, positions and sizes are in metres, time is in
 seconds, mass is in kilograms, and velocities use metres/second or
@@ -76,19 +85,41 @@ an exception returns machine-readable `status: error` and exit code 1.
 
 ## Run the three-branch collision demo
 
-The inspectable demo compares three synchronized outcomes from one fixed scene:
+The inspectable forked-rack demo compares three synchronized outcomes from one
+immutable scene contract. Its eleven canonical objects, in stored replay order,
+are:
 
-- `normal`: the factual target follows its straight path between the balls and
-  makes no dynamic-object contact;
-- `trajectory_changed`: the public `create_collision` intervention changes the
-  target path only inside steps `[24, 96)` and makes it strike `upper_ball`;
-- `target_removed`: a fresh matching physics world replays the exact common
-  prefix, then physically removes the target before step 24 physics. Its last
-  finite target pose stays in the replay array while its presence mask is false.
+| Semantic group | Canonical object IDs | Role |
+| --- | --- | --- |
+| Main balls | `breaker`, `rack_01`, `rack_02`, `rack_03`, `rack_04`, `rack_05`, `rack_06` | Seven numbered dynamic balls used by the large chain. |
+| Side balls | `side_01`, `side_02` | Two numbered dynamic balls used by the small chain. |
+| Target | `target` | Mass-carrying kinematic wooden striker. |
+| Environment | `floor` | Static simulated support surface. |
 
-The fixture always uses seed `0`, 120 Bullet steps at 240 Hz, and 24 rendered
-frames per second. The normal/changed pair comes from the public paired runner
-and ground-truth extractor; this is not a second implementation of those APIs.
+The specification fixes seed `0`, 200 Bullet steps at 240 Hz, 24 replay frames
+per second, and the half-open intervention window `[40, 160)`. The normal and
+changed rollouts come from the public paired runner and ground-truth extractor;
+the demo does not reimplement that pair pipeline.
+
+The branch envelopes and calibrated deterministic outcomes are:
+
+| Branch | Required acceptance envelope | Calibrated result |
+| --- | --- | --- |
+| `normal` | 2–3 unique dynamic contact pairs, including the side chain and no main-ball endpoint. | Exactly 2 pairs: `side_01|target` and `side_01|side_02`. |
+| `trajectory_changed` | 7–9 pairs, at least five more than normal, `breaker|target`, at least six main balls reached, and no side-ball endpoint. | Exactly 9 pairs and all 7 main balls reached. |
+| `target_removed` | Exact shared prefix, then no contact or dynamic-body motion at or after removal. | Target removed before step 40 physics; presence is false from step 40 and no post-removal chain occurs. |
+
+For the canonical normal/changed pair, the graph delta contains exactly 15
+`added`, 4 `removed`, and 0 `changed` temporal edges. The affected sets are
+`hard=9` (all nine balls) and `soft=0`. Target-removal is deliberately excluded
+from this pair ground truth.
+
+Every branch stores `states` with shape `[200, 11, 13]` (XYZ + WXYZ + linear and
+angular velocity) and `presence` with shape `[200, 11]`. The removed branch keeps
+the last finite target state row after removal, but its presence mask is
+authoritative. `summary.json` embeds the canonical demo-spec summary and SHA-256;
+the generator, renderer, and compositor require exact digest-bound identity.
+Legacy four-object bundles fail preflight and must be regenerated.
 
 Run the complete workflow from the repository root:
 
@@ -115,7 +146,7 @@ the ephemeral container only when the cached image lacks it.
 
 The renderer uses the logged collider poses exactly; appearance is added only
 as collider-parented decoration. The target has rounded, noise-textured wood,
-the two balls use glossy billiard lacquer with bands and number decals, and the
+all nine balls use glossy billiard lacquer with bands and number decals, and the
 table has procedural dark-green felt plus wooden rails outside the simulated
 contact area. A shared studio-light rig, neutral world, camera, depth of field,
 Cycles adaptive sampling, and denoising are identical across all branches.
@@ -138,9 +169,10 @@ output/demo_collision_intervention/
   trajectory_intervention_demo.mp4
 ```
 
-The final `trajectory_intervention_demo.mp4` is a synchronized, labelled
-three-panel H.264/yuv420p video at 1920x720 and 24 fps. Inspect its media contract
-with:
+Each branch video has 200 frames. The compositor adds a one-second opening hold
+and a two-second ending hold, so `trajectory_intervention_demo.mp4` has exactly
+272 frames / 11.333333 seconds. It is a synchronized, labelled three-panel
+H.264/yuv420p video at 1920x720 and 24 fps. Inspect its media contract with:
 
 ```bash
 ffprobe -v error -select_streams v:0 \
@@ -152,15 +184,16 @@ ffprobe -v error -select_streams v:0 \
 ### Demo-only removal trust boundary
 
 Only `normal` and `trajectory_changed` are canonical public paired rollouts.
-`target_removed` is narrowly scoped visualization data marked
-`demo_only_removal_v1`: it uses real removal from a fresh Bullet world, but is
-not a public dataset recipe, not covered by the paired-artifact attestation
-model, and must not be presented as training data. The presence mask, rather
-than the retained finite pose row, is authoritative after the removal step.
+`target_removed` retains the existing, narrowly scoped visualization semantics
+marked `demo_only_removal_v1`: a fresh matching Bullet world replays the exact
+prefix, physically removes the target before step 40 physics, and retains its
+last finite pose while setting presence false. It is not a public dataset recipe,
+not covered by paired-artifact attestation, and must not be presented as training
+data.
 
-This three-branch artifact completes Milestone E visual validation. It does not
-complete Milestone F: no large-scale generation, baseline training, or training
-handoff claim follows from this demo.
+This three-branch artifact completes Milestone E visual validation. Milestone F
+remains unchanged and incomplete: no large-scale generation, baseline training,
+or training handoff claim follows from this demo.
 
 ## Generate or resume a batch
 

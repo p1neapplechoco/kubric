@@ -1,4 +1,14 @@
-"""PyBullet simulation with mass-carrying kinematic path interventions."""
+"""PyBullet simulation with mass-carrying kinematic path interventions.
+
+Purpose: execute prescribed target paths while collecting synchronized physics
+states and contacts from Kubric's PyBullet backend.
+Public API: KinematicSimulator and its compatibility alias
+KinematicDragSimulator.
+Dependencies: NumPy, Kubric, and PyBullet; the interventions package exposes this
+backend lazily so backend-neutral imports do not load those runtime dependencies.
+Trust boundary: private Bullet save-state snapshots are bound to the creating
+simulator, physics client, and backend lifetime; they are not portable artifacts.
+"""
 
 from __future__ import annotations
 

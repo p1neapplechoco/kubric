@@ -1,8 +1,14 @@
 """Deterministic sampling, quality control, and dataset publication.
 
-The module keeps sampling and post-processing independent from simulator state.
-Batch generation is deliberately single-worker: each paired candidate owns fresh
-Bullet clients through :mod:`interventions.twin_runner`.
+Purpose: sample attempts, run paired candidates, evaluate QC, balance accepted
+examples, assign grouped splits, journal outcomes, and publish resumable datasets.
+Public API: InstanceSpec, QCResult, CandidateSummary, load_ranges(), seed/spec
+helpers, candidate/QC helpers, balancing/split helpers, and run_batch().
+Dependencies: standard-library persistence plus YAML, schema, graph, tag, and
+twin-runner APIs; each simulated candidate receives fresh Bullet clients.
+Trust boundary: attempt journals, hashes, QC, balance, splits, atomic publication,
+and resume checks protect internal consistency, not producer identity; resume
+accepts only a matching run contract and batch generation is single-worker.
 """
 
 from __future__ import annotations

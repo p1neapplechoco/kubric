@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Render the three intervention-demo replays with procedural Blender assets.
+"""Render canonical intervention replays with procedural Blender assets.
 
-The replay files contain position XYZ followed by quaternion WXYZ and velocity
-columns. Kubric, PyBullet, and Blender are deliberately imported only on the
-rendering path so validation helpers stay usable in an ordinary Python process.
+Purpose: preflight digest-bound eleven-object replay bundles and atomically render
+the requested normal, trajectory-changed, and target-removed branch videos.
+Public API: Replay and main(); private helpers define deterministic scene assets.
+Dependencies: ordinary preflight uses Python/NumPy; Kubric, PyBullet, and Blender
+are imported only on the rendering path. Replays store XYZ + WXYZ + velocities.
+Trust boundary: exact spec/summary, shape, presence, pose, and timing checks gate
+rendering; procedural appearance never changes logged colliders, and rendered
+pixels do not independently attest physics or producer origin.
 """
 
 from __future__ import annotations
@@ -1270,6 +1275,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+  """Preflights requested replays, renders them atomically, and returns zero."""
   args = _parser().parse_args(argv)
   states_dir = Path(args.states_dir)
   resolution = (args.resolution[0], args.resolution[1])

@@ -1,7 +1,14 @@
 """Deterministic factual/counterfactual execution from backend-neutral schemas.
 
-``ObjectConfig.size`` maps directly to Kubric's ``scale``.  Kubric primitives use
-unit half-extents, so a cube configured with size ``s`` has physical width ``2*s``.
+Purpose: rebuild fresh worlds, run the canonical branch pair, verify shared-prefix
+and provenance contracts, extract pair truth, and publish/read paired artifacts.
+Public API: generate_paired_instance(), extract_pair_ground_truth(),
+write_paired_artifact(), and read_paired_artifact().
+Dependencies: schemas, trajectories, logging/graph/tagging, and the lazily exposed
+Kubric/PyBullet simulator backend. ``ObjectConfig.size`` maps to Kubric ``scale``.
+Trust boundary: canonical generation uses fresh physics worlds and records
+provenance, while caller-supplied logs accepted by publication remain unattested
+(``caller_trusted_unattested_logs_v1``) even when internally consistent.
 """
 
 from __future__ import annotations

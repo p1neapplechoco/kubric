@@ -1,8 +1,12 @@
-"""Validated, renderer-independent schemas for intervention experiments.
+"""Validated backend- and renderer-independent intervention schemas.
 
-The classes in this module deliberately depend only on Python's standard library.
-They can therefore be used by planning, execution, and artifact-reading code without
-importing Kubric or a simulator backend.
+Purpose: define immutable experiment values and deterministic JSON conversion.
+Public API: ObjectConfig, CameraConfig, SceneConfig, Intervention,
+GraphEdgeDelta, GroundTruth, constants, and to_jsonable().
+Dependencies: Python's standard library only, so validation and JSON preparation
+never import Kubric, a renderer, or a simulator backend.
+Trust boundary: validation enforces backend-neutral shape, numeric, and JSON-safe
+contracts; it does not prove physical feasibility, execution, or data origin.
 """
 
 from __future__ import annotations

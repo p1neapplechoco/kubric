@@ -1,4 +1,13 @@
-"""Simulator-independent contact and rigid-body state logging."""
+"""Immutable simulator-independent contact and rigid-body state logging.
+
+Purpose: validate, freeze, serialize, hash, publish, and read contact/state logs.
+Public API: state-vector slices, state_index(), ContactRecord, ContactLogger,
+SimulationLog, write_simulation_log(), and read_simulation_log().
+Dependencies: the standard library and NumPy only; this module imports no Bullet,
+PyBullet, or Kubric runtime.
+Trust boundary: immutable values and manifest hashes detect malformed or changed
+payloads, but cannot attest which simulator or producer created supplied data.
+"""
 
 from __future__ import annotations
 

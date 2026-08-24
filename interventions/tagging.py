@@ -1,4 +1,12 @@
-"""Pure deterministic tag derivation for intervention ground truth."""
+"""Pure deterministic metadata tags for intervention ground truth.
+
+Purpose: derive stable descriptive tags from graph deltas, propagation paths,
+affected sets, target/environment roles, and explicit stability flags.
+Public API: derive_tags().
+Dependencies: the standard library and validated GroundTruth schema only.
+Trust boundary: tags deterministically summarize supplied metadata; they neither
+verify its simulator origin nor establish physical causality independently.
+"""
 
 from __future__ import annotations
 

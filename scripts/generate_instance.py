@@ -1,4 +1,11 @@
-"""Generate one inspectable factual/counterfactual candidate."""
+"""CLI for one inspectable factual/counterfactual candidate.
+
+Purpose: sample, execute, evaluate, optionally publish, and report one attempt.
+Public API: main().
+Dependencies: argparse plus dataset sampling/generation/QC and schema conversion.
+Trust boundary: reported QC and artifact integrity cover the generated attempt;
+the command does not authenticate the machine or producer that ran it.
+"""
 
 from __future__ import annotations
 
@@ -31,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+  """Runs one inspectable generation attempt and returns its CLI exit status."""
   args = _parser().parse_args(argv)
   try:
     ranges = load_ranges(args.config)

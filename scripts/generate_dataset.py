@@ -1,4 +1,11 @@
-"""Generate a resumable, balanced intervention dataset."""
+"""CLI for resumable, balanced intervention-dataset generation.
+
+Purpose: parse one batch request, run the dataset pipeline, and emit stable JSON.
+Public API: main().
+Dependencies: argparse plus interventions.dataset and schema serialization.
+Trust boundary: the CLI delegates sampling, QC, journaling, resume checks, and
+publication to run_batch(); its JSON status does not authenticate producer origin.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +34,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+  """Runs resumable batch generation and returns its stable CLI exit status."""
   args = _parser().parse_args(argv)
   try:
     result = run_batch(

@@ -1,4 +1,13 @@
-"""Pure post-processing for temporal contact graphs and affected-object labels."""
+"""Pure temporal-graph and affected-object post-processing.
+
+Purpose: aggregate contacts and compute temporal graphs, graph deltas,
+reachability walks, affected sets, and packaged ground truth.
+Public API: AggregatedContactStep, TemporalEdge, TemporalGraph, and the aggregate,
+graph, delta, reachability, affected-set, and ground-truth helpers.
+Dependencies: NumPy plus validated logging and schema values; no simulator backend.
+Trust boundary: results are deterministic computations over supplied contacts and
+states, not causal proof beyond the completeness and authenticity of those inputs.
+"""
 
 from __future__ import annotations
 

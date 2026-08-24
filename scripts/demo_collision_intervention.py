@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Generate deterministic replay data for three collision-demo branches."""
+"""Generate canonical replay data for three synchronized demo branches.
+
+Purpose: run the immutable eleven-object forked-rack scene and atomically publish
+normal, trajectory-changed, and target-removed replay arrays plus metadata.
+Public API: RemovedBranch, DemoResult, build_demo_inputs(), dynamic_contacts(),
+generate_demo(), write_demo_bundle(), and main().
+Dependencies: NumPy, the public intervention pipeline, and trajectory_demo_spec.
+Trust boundary: canonical digest binding governs every replay; normal and changed
+use the public paired runner, while removed is visualization-only data with the
+``demo_only_removal_v1`` trust model and is not a dataset recipe or attested pair.
+"""
 
 from __future__ import annotations
 
@@ -755,6 +765,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+  """Generates and atomically publishes the canonical three-branch replay."""
   args = _parser().parse_args(argv)
   output = Path(args.output)
   result = generate_demo()

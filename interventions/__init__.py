@@ -1,4 +1,13 @@
-"""Backend-independent tools for counterfactual trajectory interventions."""
+"""Stable public exports for counterfactual trajectory interventions.
+
+Purpose: expose the supported backend-neutral intervention API from one package.
+Public API: schemas, trajectories, logs, graph extraction, tags, and lazily loaded
+simulator/twin-runner entry points listed in ``__all__``.
+Dependencies: eager exports use the standard library and NumPy-facing modules;
+Kubric and PyBullet backends are imported only when a lazy export is requested.
+Trust boundary: this namespace defines stable access paths, but does not add
+provenance or simulator-origin attestation to values returned by its modules.
+"""
 
 from importlib import import_module
 

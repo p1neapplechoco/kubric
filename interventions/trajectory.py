@@ -1,8 +1,11 @@
 """Interpolation and bounded heuristic perturbation of XYZ/XYZ+WXYZ paths.
 
-Recipe names describe the contact outcome a caller is trying to produce. This module
-only generates heuristic candidate path profiles; a physics simulator and downstream
-quality control must determine whether the named contact outcome actually occurred.
+Purpose: build, validate, compare, and perturb trajectory samples for named recipes.
+Public API: RECIPE_PROFILE_SEMANTICS, build_path(), validate_path(),
+max_position_deviation(), and perturb_path().
+Dependencies: NumPy with SciPy interpolation for spline paths; no physics backend.
+Trust boundary: recipe profiles are heuristic candidates only; a physics rollout
+and downstream QC must establish whether the requested contact outcome occurred.
 """
 
 from __future__ import annotations

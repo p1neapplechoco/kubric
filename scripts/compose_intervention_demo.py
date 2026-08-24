@@ -1,4 +1,13 @@
-"""Compose the three Blender intervention replays into one comparison MP4."""
+"""Compose three canonical Blender replays into one comparison MP4.
+
+Purpose: validate synchronized branch media/metadata and atomically produce the
+labelled 1920x720 comparison with contact/removal and graph-summary overlays.
+Public API: VideoInfo, compose_intervention_demo(), and main().
+Dependencies: Python metadata validation plus external ffprobe/ffmpeg binaries;
+trajectory_demo_spec supplies the exact canonical scene identity.
+Trust boundary: exact digest, replay, event, codec, frame, and duration contracts
+gate composition; the compositor does not rerun physics or attest source origin.
+"""
 
 from __future__ import annotations
 
@@ -1187,6 +1196,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+  """Validates CLI inputs, composes the comparison atomically, and returns zero."""
   args = _parser().parse_args(argv)
   metadata = compose_intervention_demo(args.states_dir, args.output, args.font)
   print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
