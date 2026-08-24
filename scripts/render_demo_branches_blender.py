@@ -31,7 +31,7 @@ _BRANCH_FILENAMES = {
     "trajectory_changed": "trajectory_changed_blender.mp4",
     "target_removed": "target_removed_blender.mp4",
 }
-_FRAME_RATE = 24
+_FRAME_RATE = FORKED_RACK_SPEC.frame_rate
 
 # State layout matches SimulationLog: position XYZ, quaternion WXYZ, then linear
 # and angular velocity. The ordering is persisted in summary.json and fixed for
@@ -56,6 +56,8 @@ _SYNCHRONIZED_SUMMARY_KEYS = (
 _CAMERA_POSITION = (7.6, -9.2, 8.4)
 _CAMERA_LOOK_AT = (0.35, 0.30, -0.02)
 _CAMERA_FOCAL_LENGTH = 55.0
+_CAMERA_CLIP_START = 0.1
+_CAMERA_CLIP_END = 1000.0
 _AMBIENT_ILLUMINATION = (0.035, 0.04, 0.05)
 
 
@@ -153,6 +155,8 @@ def _scene_specs() -> Dict[str, Any]:
           "position": _CAMERA_POSITION,
           "look_at": _CAMERA_LOOK_AT,
           "focal_length": _CAMERA_FOCAL_LENGTH,
+          "clip_start": _CAMERA_CLIP_START,
+          "clip_end": _CAMERA_CLIP_END,
           "dof": _camera_dof_spec(),
       },
       "lights": (
@@ -259,6 +263,16 @@ def _load_summary(states_dir: Path) -> Mapping[str, Any]:
     raise ValueError(
         f"{summary_path} intervention_window must equal {[start, end]!r}"
     )
+  if start >= _DEMO_SPEC.num_steps or end > _DEMO_SPEC.num_steps:
+    raise ValueError(
+        f"{summary_path} intervention window must lie within replay frames"
+    )
+  if seed != _DEMO_SPEC.seed:
+    raise ValueError(f"{summary_path} seed mismatch")
+  if step_rate != _DEMO_SPEC.step_rate:
+    raise ValueError(f"{summary_path} step_rate mismatch")
+  if (start, end) != _DEMO_SPEC.intervention_window:
+    raise ValueError(f"{summary_path} intervention window mismatch")
   return summary
 
 
@@ -313,6 +327,15 @@ def _load_replay(states_dir: Path, branch: str) -> Replay:
     raise TypeError(f"{states_path} states must be numeric")
   if not np.isfinite(states).all():
     raise ValueError(f"{states_path} contains non-finite states")
+  quaternion_norms = np.linalg.norm(
+      states[..., _QUATERNION_WXYZ_SLICE], axis=-1
+  )
+  if not np.isclose(
+      quaternion_norms, 1.0, atol=1e-6, rtol=0.0
+  ).all():
+    raise ValueError(
+        f"{states_path} quaternion values must be unit normalized"
+    )
   if presence.dtype.kind != "b":
     raise TypeError(f"{presence_path} presence must contain Boolean values")
   expected_presence_shape = expected_shape[:2]
@@ -459,11 +482,19 @@ def _validate_camera_containment(
   for replay in replays:
     for object_index, object_id in enumerate(replay.object_ids):
       radius = _collider_radius(item_by_id[object_id])
-      for center in replay.states[:, object_index, _POSITION_SLICE]:
+      for frame, center in enumerate(
+          replay.states[:, object_index, _POSITION_SLICE]
+      ):
+        if not replay.presence[frame, object_index]:
+          continue
         relative = center - camera
         depth = float(relative @ forward)
         near_depth = depth - radius
-        if near_depth <= 0:
+        far_depth = depth + radius
+        if (
+            near_depth < _CAMERA_CLIP_START
+            or far_depth > _CAMERA_CLIP_END
+        ):
           raise ValueError(f"camera framing excludes {object_id}")
         half_width = near_depth * 36.0 / (2.0 * _CAMERA_FOCAL_LENGTH)
         half_height = half_width * height / width
@@ -635,6 +666,16 @@ def _configure_camera_dof(
   blender_camera.data.dof.aperture_fstop = spec["aperture_fstop"]
 
 
+def _configure_camera_settings(
+    blender_camera,
+    spec: Mapping[str, Any],
+) -> None:
+  """Applies the complete deterministic camera data contract."""
+  _configure_camera_dof(blender_camera, spec["dof"])
+  blender_camera.data.clip_start = spec["clip_start"]
+  blender_camera.data.clip_end = spec["clip_end"]
+
+
 def _round_target(blender_object) -> None:
   if hasattr(blender_object.data, "use_auto_smooth"):
     blender_object.data.use_auto_smooth = True
@@ -667,8 +708,6 @@ def _add_ball_decorations(
     number_material,
 ) -> Tuple[object, ...]:
   """Adds a number badge and an optional stripe in the ball's local frame."""
-  import math
-
   decorations = []
   if striped:
     bpy.ops.mesh.primitive_torus_add(
@@ -941,6 +980,8 @@ def _build_and_render_branch_in_scratch(
   num_frames = len(replay.states)
   scene_specs = _scene_specs()
   material_specs = _material_specs()
+  renderer_spec = scene_specs["renderer"]
+  camera_spec = scene_specs["camera"]
   scene = _create_replay_scene(
       kb,
       resolution,
@@ -950,13 +991,13 @@ def _build_and_render_branch_in_scratch(
   renderer = blender_factory(
       scene,
       scratch_dir=scratch_dir,
-      adaptive_sampling=True,
-      use_denoising=True,
+      adaptive_sampling=renderer_spec["adaptive_sampling"],
+      use_denoising=renderer_spec["denoising"],
       samples_per_pixel=samples_per_pixel,
-      background_transparency=False,
+      background_transparency=renderer_spec["transparent"],
   )
-  renderer.blender_scene.render.engine = "CYCLES"
-  renderer.blender_scene.render.film_transparent = False
+  renderer.blender_scene.render.engine = renderer_spec["engine"]
+  renderer.blender_scene.render.film_transparent = renderer_spec["transparent"]
 
   object_index = {
       name: index for index, name in enumerate(replay.object_ids)
@@ -1038,19 +1079,19 @@ def _build_and_render_branch_in_scratch(
         width=light_spec["width"],
         height=light_spec["height"],
     )
-    light.look_at(_CAMERA_LOOK_AT)
+    light.look_at(camera_spec["look_at"])
     scene += light
 
   scene.camera = kb.PerspectiveCamera(
       name="camera",
-      position=_CAMERA_POSITION,
-      look_at=_CAMERA_LOOK_AT,
-      focal_length=_CAMERA_FOCAL_LENGTH,
+      position=camera_spec["position"],
+      look_at=camera_spec["look_at"],
+      focal_length=camera_spec["focal_length"],
       sensor_width=36.0,
   )
-  _configure_camera_dof(
+  _configure_camera_settings(
       scene.camera.linked_objects[renderer],
-      scene_specs["camera"]["dof"],
+      camera_spec,
   )
 
   blender_assets = {

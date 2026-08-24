@@ -107,12 +107,66 @@ def test_load_replay_rejects_stale_demo_spec(tmp_path):
     render_script._load_replay(tmp_path, "normal")
 
 
+@pytest.mark.parametrize(
+    ("updates", "message"),
+    (
+        ({"seed": 1}, "seed mismatch"),
+        ({"step_rate": 120}, "step_rate mismatch"),
+        (
+            {
+                "intervention_start": 41,
+                "intervention_end": 161,
+                "intervention_window": [41, 161],
+            },
+            "intervention window mismatch",
+        ),
+    ),
+)
+def test_load_replay_rejects_noncanonical_summary_values(
+    tmp_path, monkeypatch, updates, message
+):
+  _, _, summary = _write_bundle(tmp_path)
+  summary.update(updates)
+  (tmp_path / "summary.json").write_text(
+      json.dumps(summary), encoding="utf-8"
+  )
+  load_calls = []
+
+  def fail_if_loaded(*args, **kwargs):
+    load_calls.append((args, kwargs))
+    raise AssertionError("arrays loaded before summary identity validation")
+
+  monkeypatch.setattr(render_script.np, "load", fail_if_loaded)
+
+  with pytest.raises(ValueError, match=message):
+    render_script._load_replay(tmp_path, "normal")
+  assert load_calls == []
+
+
 def test_load_replay_rejects_truncated_states_before_slicing(tmp_path):
   states, _, _ = _write_bundle(tmp_path)
   np.save(tmp_path / "normal_states.npy", states[:-1])
 
   with pytest.raises(ValueError, match=r"\(200, 11, 13\)"):
     render_script._load_replay(tmp_path, "normal")
+
+
+@pytest.mark.parametrize(
+    "quaternion",
+    (
+        (0.0, 0.0, 0.0, 0.0),
+        (2.0, 0.0, 0.0, 0.0),
+    ),
+)
+def test_load_replay_requires_unit_normalized_quaternions(
+    tmp_path, quaternion
+):
+  states = _synthetic_states()
+  states[199, 10, 3:7] = quaternion
+  _write_bundle(tmp_path, states=states)
+
+  with pytest.raises(ValueError, match="quaternion.*normalized|unit"):
+    render_script._preflight_replays(tmp_path, ("normal",), 1)
 
 
 def test_load_replay_requires_matching_presence(tmp_path):
@@ -369,6 +423,33 @@ def test_camera_contract_contains_canonical_replay_and_rejects_clipping():
     render_script._validate_camera_containment((clipped,), (640, 540))
 
 
+@pytest.mark.parametrize("clip_plane", ("near", "far"))
+def test_camera_contract_rejects_extents_outside_clip_range(clip_plane):
+  states = _synthetic_states()
+  replay = render_script.Replay(
+      branch="normal",
+      object_ids=_OBJECT_IDS,
+      steps=tuple(range(len(states))),
+      states=states,
+      presence=np.ones((len(states), 11), dtype=np.bool_),
+      summary={},
+  )
+  camera = np.asarray(render_script._CAMERA_POSITION, dtype=float)
+  forward = np.asarray(render_script._CAMERA_LOOK_AT, dtype=float) - camera
+  forward /= np.linalg.norm(forward)
+  radius = render_script._collider_radius(
+      demo_spec.FORKED_RACK_SPEC.objects[0]
+  )
+  if clip_plane == "near":
+    depth = render_script._CAMERA_CLIP_START + radius - 0.01
+  else:
+    depth = render_script._CAMERA_CLIP_END - radius + 0.01
+  states[0, 0, 0:3] = camera + depth * forward
+
+  with pytest.raises(ValueError, match="camera framing"):
+    render_script._validate_camera_containment((replay,), (640, 540))
+
+
 def test_create_replay_scene_aligns_step_rate_with_nondivisor_fps():
   captured = {}
   sentinel = object()
@@ -450,6 +531,32 @@ def test_configure_camera_dof_updates_blender_camera_data():
   assert camera.data.dof.use_dof is True
   assert camera.data.dof.focus_distance == 9.5
   assert camera.data.dof.aperture_fstop == 4.0
+
+
+def test_configure_camera_settings_applies_exact_dof_and_clip_range():
+  class FakeDof:
+    use_dof = False
+    focus_distance = 0.0
+    aperture_fstop = 0.0
+
+  class FakeCameraData:
+    dof = FakeDof()
+    clip_start = 0.0
+    clip_end = 0.0
+
+  class FakeCamera:
+    data = FakeCameraData()
+
+  spec = render_script._scene_specs()["camera"]
+  camera = FakeCamera()
+
+  render_script._configure_camera_settings(camera, spec)
+
+  assert camera.data.dof.use_dof is True
+  assert camera.data.dof.focus_distance == 12.0
+  assert camera.data.dof.aperture_fstop == 5.6
+  assert camera.data.clip_start == 0.1
+  assert camera.data.clip_end == 1000.0
 
 
 def test_encoder_backend_uses_imageio_when_blender_lacks_ffmpeg():
