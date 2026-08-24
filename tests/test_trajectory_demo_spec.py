@@ -204,3 +204,28 @@ def test_scene_numeric_and_timing_matrix(changes, pattern):
 def test_object_dataclass_is_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
         demo_spec.FORKED_RACK_SPEC.objects[0].mass = 2.0
+
+
+def test_seed_bool_is_rejected():
+    with pytest.raises(ValueError, match="seed"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, seed=True))
+
+
+def test_size_component_must_be_positive():
+    with pytest.raises(ValueError, match="size"):
+        demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", size=(0.22, 0.0, 0.22)))
+
+
+@pytest.mark.parametrize("path_end", [(2.0, -0.25), (2.0, math.nan, 0.18), (2.0, -0.25, math.inf)])
+def test_path_end_must_be_finite_three_vector(path_end):
+    with pytest.raises(ValueError, match="path_end|finite"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, path_end=path_end))
+
+
+def test_target_position_must_match_path_start():
+    objects = tuple(
+        dataclasses.replace(obj, position=(-1.0, -0.25, 0.18)) if obj.object_id == "target" else obj
+        for obj in demo_spec.FORKED_RACK_SPEC.objects
+    )
+    with pytest.raises(ValueError, match="target|path_start"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, objects=objects))
