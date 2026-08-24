@@ -32,6 +32,7 @@ from scripts.trajectory_demo_spec import (
     FORKED_RACK_SPEC,
     DemoSceneSpec,
     demo_spec_summary,
+    validate_demo_spec,
 )
 
 
@@ -537,6 +538,18 @@ def _validate_demo_bundle(result: DemoResult) -> None:
   """Validates the fixed three-branch replay contract before any writes."""
   if not isinstance(result, DemoResult):
     raise TypeError("result must be a DemoResult")
+  if result.demo_spec != _DEMO_SPEC:
+    raise ValueError("demo result spec identity differs from canonical")
+  validate_demo_spec(result.demo_spec)
+  expected_scene, expected_intervention, expected_path = build_demo_inputs(
+      result.demo_spec
+  )
+  if result.scene_config != expected_scene:
+    raise ValueError("demo scene differs from the stored demo spec")
+  if result.intervention != expected_intervention:
+    raise ValueError("demo intervention differs from the stored demo spec")
+  if not np.array_equal(result.normal.commanded_path, expected_path):
+    raise ValueError("factual commanded path differs from the stored demo spec")
   expected_source_branches = {
       "normal": "factual",
       "trajectory_changed": "counterfactual",
@@ -666,7 +679,8 @@ def _branch_contact_summary(
 
 
 def write_demo_bundle(
-    output_dir: str | Path, result: DemoResult
+    output_dir: str | Path,
+    result: DemoResult,
 ) -> dict[str, object]:
   """Atomically writes the canonical three-branch replay bundle."""
   _validate_demo_bundle(result)
@@ -707,6 +721,7 @@ def write_demo_bundle(
   })
   summary = {
       "branches": branch_summaries,
+      "demo_spec": demo_spec_summary(result.demo_spec),
       "ground_truth": result.ground_truth.to_dict(),
       "intervention_end": end,
       "intervention_start": start,

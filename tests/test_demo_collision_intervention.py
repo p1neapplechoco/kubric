@@ -16,6 +16,8 @@ import pytest
 pytest.importorskip("pybullet")
 import numpy as np  # noqa: E402
 
+from scripts import trajectory_demo_spec as demo_spec
+
 _SCRIPT_NAME = "demo_collision_intervention"
 _SCRIPT_PATH = (
     Path(__file__).resolve().parent.parent / "scripts" / f"{_SCRIPT_NAME}.py"
@@ -555,6 +557,81 @@ def test_write_demo_bundle_roundtrips_all_branches(generated_demo, tmp_path):
   }
 
 
+def test_bundle_summary_binds_exact_demo_spec(generated_demo, tmp_path):
+  summary = demo.write_demo_bundle(tmp_path, generated_demo)
+
+  assert summary["demo_spec"] == demo_spec.demo_spec_summary(
+      demo_spec.FORKED_RACK_SPEC
+  )
+  assert np.load(tmp_path / "normal_states.npy", allow_pickle=False).shape == (
+      200, 11, 13
+  )
+  assert np.load(
+      tmp_path / "target_removed_presence.npy", allow_pickle=False
+  ).shape == (200, 11)
+
+
+def test_bundle_rejects_result_from_different_spec(generated_demo, tmp_path):
+  wrong_spec = dataclasses.replace(
+      demo_spec.FORKED_RACK_SPEC, version="forked_rack_v2"
+  )
+  wrong_result = dataclasses.replace(generated_demo, demo_spec=wrong_spec)
+
+  with pytest.raises(
+      ValueError, match="demo result spec identity differs from canonical"
+  ):
+    demo.write_demo_bundle(tmp_path, wrong_result)
+  assert not any(tmp_path.iterdir())
+
+
+def test_bundle_rejects_scene_different_from_stored_spec(
+    generated_demo, tmp_path
+):
+  scene_config = dataclasses.replace(
+      generated_demo.scene_config, gravity=(0.0, 0.0, -1.0)
+  )
+  corrupted = dataclasses.replace(generated_demo, scene_config=scene_config)
+  output = tmp_path / "bundle"
+
+  with pytest.raises(ValueError, match="demo scene differs from the stored demo spec"):
+    demo.write_demo_bundle(output, corrupted)
+  assert not output.exists()
+
+
+def test_bundle_rejects_intervention_different_from_stored_spec(
+    generated_demo, tmp_path
+):
+  intervention = dataclasses.replace(
+      generated_demo.intervention, magnitude=1.1
+  )
+  corrupted = dataclasses.replace(generated_demo, intervention=intervention)
+  output = tmp_path / "bundle"
+
+  with pytest.raises(
+      ValueError, match="demo intervention differs from the stored demo spec"
+  ):
+    demo.write_demo_bundle(output, corrupted)
+  assert not output.exists()
+
+
+def test_bundle_rejects_factual_path_different_from_stored_spec(
+    generated_demo, tmp_path
+):
+  commanded_path = np.array(generated_demo.normal.commanded_path, copy=True)
+  commanded_path[1, 0] += 0.01
+  normal = dataclasses.replace(
+      generated_demo.normal, commanded_path=commanded_path
+  )
+  corrupted = dataclasses.replace(generated_demo, normal=normal)
+  output = tmp_path / "bundle"
+
+  with pytest.raises(
+      ValueError, match="factual commanded path differs from the stored demo spec"
+  ):
+    demo.write_demo_bundle(output, corrupted)
+  assert not output.exists()
+
+
 def test_write_demo_bundle_summary_has_exact_event_metadata(
     generated_demo, tmp_path
 ):
@@ -563,6 +640,7 @@ def test_write_demo_bundle_summary_has_exact_event_metadata(
 
   assert set(summary) == {
       "branches",
+      "demo_spec",
       "ground_truth",
       "intervention_end",
       "intervention_start",
@@ -571,6 +649,9 @@ def test_write_demo_bundle_summary_has_exact_event_metadata(
       "seed",
       "step_rate",
   }
+  assert summary["demo_spec"] == demo_spec.demo_spec_summary(
+      demo_spec.FORKED_RACK_SPEC
+  )
   assert summary["object_ids"] == list(generated_demo.normal.object_ids)
   assert summary["step_rate"] == generated_demo.scene_config.step_rate == 240
   assert summary["seed"] == 0
