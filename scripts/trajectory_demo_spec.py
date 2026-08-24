@@ -17,6 +17,11 @@ import numbers
 from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
+__all__ = (
+    "DemoObjectSpec", "DemoSceneSpec", "FORKED_RACK_SPEC", "validate_demo_spec",
+    "canonical_spec_payload", "spec_sha256", "demo_spec_summary",
+)
+
 BALL_RADIUS = 0.22
 BALL_MASS = 1.0
 BALL_FRICTION = 0.02
@@ -91,7 +96,7 @@ class DemoSceneSpec:
 
 
 def _finite_vector(value: Sequence[object], length: int, name: str) -> tuple[float, ...]:
-    if isinstance(value, (str, bytes)):
+    if not isinstance(value, tuple):
         raise ValueError(f"{name} must contain {length} finite values")
     try:
         values = tuple(value)
@@ -103,9 +108,14 @@ def _finite_vector(value: Sequence[object], length: int, name: str) -> tuple[flo
 
 
 def _number(value: object, name: str, *, positive: bool = False, nonnegative: bool = False) -> float:
-    if isinstance(value, bool) or not isinstance(value, numbers.Real) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
         raise ValueError(f"{name} must be finite real")
-    result = float(value)
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        raise ValueError(f"{name} must be finite real") from None
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite real")
     if positive and result <= 0:
         raise ValueError(f"{name} must be positive")
     if nonnegative and result < 0:
@@ -119,8 +129,8 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
         raise TypeError("spec must be DemoSceneSpec")
     if spec.version != "forked_rack_v1":
         raise ValueError("version must be forked_rack_v1")
-    if isinstance(spec.objects, (str, bytes)) or not isinstance(spec.objects, Sequence):
-        raise TypeError("objects must be a sequence of DemoObjectSpec")
+    if not isinstance(spec.objects, tuple):
+        raise TypeError("objects must be a tuple of DemoObjectSpec")
     seen = set()
     for obj in spec.objects:
         if not isinstance(obj, DemoObjectSpec):
@@ -137,11 +147,13 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
         if isinstance(obj.size, numbers.Real):
             _number(obj.size, "size", positive=True)
         else:
+            if not isinstance(obj.size, tuple):
+                raise ValueError("size must be a tuple of three components")
             vals = _finite_vector(obj.size, 3, "size (three components)")
             if any(v <= 0 for v in vals):
                 raise ValueError("size must be positive")
         _number(obj.mass, "mass", positive=True)
-        position = _finite_vector(obj.position, 3, "position")
+        _finite_vector(obj.position, 3, "position")
         if obj.static is not True and obj.static is not False:
             raise ValueError("static must be bool")
         _number(obj.friction, "friction", nonnegative=True)
@@ -193,7 +205,7 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
     if spec.object_ids != _EXPECTED_IDS:
         raise ValueError("objects must use canonical order")
     for name, value in (("frame_range", spec.frame_range), ("intervention_window", spec.intervention_window)):
-        if isinstance(value, (str, bytes)) or not isinstance(value, Sequence) or len(value) != 2 or any(isinstance(v, bool) or not isinstance(v, int) for v in value):
+        if not isinstance(value, tuple) or len(value) != 2 or any(isinstance(v, bool) or not isinstance(v, int) for v in value):
             raise ValueError(f"{name} must contain integer endpoints")
     start, end = spec.frame_range
     if any(isinstance(v, bool) or not isinstance(v, int) for v in (spec.frame_rate, spec.step_rate)):
@@ -209,8 +221,8 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
         raise ValueError("intervention window invalid")
     if isinstance(spec.seed, bool) or not isinstance(spec.seed, int) or spec.seed != 0:
         raise ValueError("seed must be 0")
-    gravity = _finite_vector(spec.gravity, 3, "gravity")
-    if isinstance(spec.scene_bounds, (str, bytes)) or not isinstance(spec.scene_bounds, Sequence) or len(spec.scene_bounds) != 2:
+    _finite_vector(spec.gravity, 3, "gravity")
+    if not isinstance(spec.scene_bounds, tuple) or len(spec.scene_bounds) != 2 or any(not isinstance(v, tuple) for v in spec.scene_bounds):
         raise ValueError("scene bounds must contain two vectors")
     bounds = tuple(_finite_vector(v, 3, "scene bounds") for v in spec.scene_bounds)
     if any(a >= b for a, b in zip(bounds[0], bounds[1])):

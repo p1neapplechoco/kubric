@@ -229,3 +229,28 @@ def test_target_position_must_match_path_start():
     )
     with pytest.raises(ValueError, match="target|path_start"):
         demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, objects=objects))
+
+
+@pytest.mark.parametrize("field, value", [
+    ("gravity", [0, 0, 0]), ("gravity", {0, 1, 2}),
+    ("gravity", (x for x in (0, 0, 0))),
+])
+def test_mutable_or_one_shot_vectors_are_rejected(field, value):
+    with pytest.raises(ValueError, match="tuple|gravity"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, **{field: value}))
+
+
+def test_mutable_object_containers_are_rejected():
+    with pytest.raises(TypeError, match="tuple|objects"):
+        demo_spec.validate_demo_spec(dataclasses.replace(demo_spec.FORKED_RACK_SPEC, objects=list(demo_spec.FORKED_RACK_SPEC.objects)))
+    with pytest.raises(ValueError, match="tuple|position"):
+        demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", position=[0.25, 0.60, 0.22]))
+
+
+def test_valid_spec_hash_is_repeatable():
+    assert demo_spec.spec_sha256(demo_spec.FORKED_RACK_SPEC) == demo_spec.spec_sha256(demo_spec.FORKED_RACK_SPEC)
+
+
+def test_huge_numeric_values_raise_value_error():
+    with pytest.raises(ValueError, match="mass"):
+        demo_spec.validate_demo_spec(_replace_object(demo_spec.FORKED_RACK_SPEC, "breaker", mass=10**1000))
