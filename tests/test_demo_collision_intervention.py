@@ -243,7 +243,7 @@ def test_build_demo_inputs_uses_shared_forked_rack_spec():
   spec = demo.FORKED_RACK_SPEC
   objects = {item.object_id: item for item in scene.objects}
 
-  assert tuple(sorted(objects)) == spec.object_ids
+  assert tuple(item.object_id for item in scene.objects) == spec.object_ids
   assert len(objects) == 11
   assert factual_path.shape == (200, 7)
   np.testing.assert_array_equal(factual_path[0, :3], spec.path_start)
