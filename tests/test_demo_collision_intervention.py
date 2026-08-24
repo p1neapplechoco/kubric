@@ -459,8 +459,30 @@ def test_removed_branch_has_no_post_removal_dynamic_chain(generated_demo):
       for record in removed.contacts
   )
   assert not demo.dynamic_contacts(tuple(
-      record for record in removed.contacts if record.step >= 40
+      record for record in removed.contacts if record.step >= start
   ))
+
+
+def test_removed_branch_rejects_post_removal_floor_target_contact(generated_demo):
+  start, _ = generated_demo.intervention_window
+  floor_target_contact = demo.ContactRecord(
+      step=start,
+      object_a="floor",
+      object_b="target",
+      position=(0.0, 0.0, 0.0),
+      normal=(0.0, 0.0, 1.0),
+      normal_force=1.0,
+      contact_distance=-0.01,
+  )
+  removed = dataclasses.replace(
+      generated_demo.removed,
+      contacts=generated_demo.removed.contacts + (floor_target_contact,),
+  )
+
+  with pytest.raises(RuntimeError, match="post-removal target contact"):
+    demo._validate_removed_branch(
+        removed, generated_demo.normal, generated_demo.intervention
+    )
 
 
 def test_generate_demo_rejects_a_corrupted_removed_prefix(

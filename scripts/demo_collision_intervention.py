@@ -38,7 +38,6 @@ from scripts.trajectory_demo_spec import (
 _OUTPUT_DIR = Path("output/demo_collision_intervention")
 _DEMO_SPEC = FORKED_RACK_SPEC
 _DEMO_SEED = _DEMO_SPEC.seed
-_NUM_STEPS = _DEMO_SPEC.num_steps
 _BUNDLE_BRANCHES = ("normal", "trajectory_changed", "target_removed")
 
 
@@ -465,6 +464,17 @@ def _validate_removed_branch(
   if post_removal:
     raise RuntimeError(
         f"removed branch contains a post-removal dynamic contact: {post_removal!r}"
+    )
+  post_removal_target_contacts = tuple(
+      record
+      for record in removed.contacts
+      if record.step >= removed_step
+      and target_id in (record.object_a, record.object_b)
+  )
+  if post_removal_target_contacts:
+    raise RuntimeError(
+        "removed branch contains a post-removal target contact: "
+        f"{post_removal_target_contacts!r}"
     )
   if (
       removed.metadata.get("trust_model") != "demo_only_removal_v1"
