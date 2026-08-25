@@ -18,6 +18,7 @@ table below is the human-facing map of those boundaries.
 | `interventions/trajectory.py` | NumPy/SciPy construction, validation, comparison, and named perturbation recipes through `build_path()`, `validate_path()`, `max_position_deviation()`, and `perturb_path()`. | Recipes are heuristic candidates until a physics rollout and QC establish the requested effect. |
 | `interventions/logging.py` | Immutable NumPy state/contact logs, stable state-vector slices, serialization, hashing, and publication; it imports no Bullet or Kubric backend. | Immutability and hashes protect internal consistency, not simulator or producer origin. |
 | `interventions/graph_extraction.py` | Pure aggregation, temporal graphs, graph deltas, reachability, affected sets, and packaged ground truth over supplied logs/states. | The result is not causal proof beyond the completeness and authenticity of its inputs. |
+| `interventions/scene_graph.py` | Pure per-step contact, proximity, and approach/recede relation graphs plus oracle propagation trees through `build_relation_series()`, `contact_activation_steps()`, and `propagation_tree()`. | Contact edges inherit only the log's authority; proximity gaps are centre-distance readings, exact for spheres and conservative for boxes. |
 | `interventions/tagging.py` | `derive_tags()` creates deterministic metadata from validated ground truth and explicit role/stability inputs. | Tags summarize supplied metadata and do not independently verify physics or causality. |
 | `interventions/kinematic_simulator.py` | `KinematicSimulator` wraps Kubric/PyBullet for mass-carrying prescribed paths; the package exposes this backend lazily. | Private Bullet snapshots remain bound to the creating simulator, physics client, and backend lifetime. |
 | `interventions/twin_runner.py` | Creates fresh worlds for the canonical factual/counterfactual pair, checks prefixes/provenance, derives truth, and reads/writes paired artifacts. | Canonically generated pairs record provenance; caller-supplied logs remain `caller_trusted_unattested_logs_v1`. |
@@ -30,6 +31,7 @@ table below is the human-facing map of those boundaries.
 | `scripts/demo_collision_intervention.py` | Builds the canonical inputs and atomically publishes three digest-bound replay branches. | Normal/changed use the public paired pipeline; removed is `demo_only_removal_v1`, not a dataset recipe or attested pair. |
 | `scripts/render_demo_branches_blender.py` | Preflights spec/summary/array contracts and renders logged colliders with procedural Blender appearance. | Pixels and decoration do not change or independently attest the logged physics. |
 | `scripts/compose_intervention_demo.py` | Validates exact summary/event/media contracts and atomically composes the synchronized comparison with FFmpeg. | Composition neither reruns physics nor attests the source producer. |
+| `scripts/render_scene_graph_video.py` | Renders each branch's published replay as a frame-by-frame relation-graph animation and a whole-replay still, laid out in true simulated x/y. | Rendering reads the published bundle and never reruns physics; the causal overlay restates the bundled oracle rather than proving it. |
 
 Unless a field says otherwise, positions and sizes are in metres, time is in
 seconds, mass is in kilograms, and velocities use metres/second or
@@ -226,6 +228,43 @@ fresh implementation-head suite reported 922 passed in 66.50 seconds.
 | `trajectory_changed_blender.mp4` | `ef052fb4f7b760f7067546c9e264238ea1bf7e2b7b816ae2fa25ba53cd2ddaef` |
 | `target_removed_blender.mp4` | `1cd5187e8bbd505f82e2a5eee0076457e389e8e2f837441dc25b7d1c1ae01cd9` |
 | `trajectory_intervention_demo.mp4` | `40323ab0ec96992305365326ce7eb9ad03d9f143c63c175a52b14996d94e54be` |
+
+### Scene-graph relation views
+
+The rendered branch videos show bodies moving; they do not show the relations
+that make the chain causal. `scripts/render_scene_graph_video.py` reads the same
+published bundle and re-reads each branch as an evolving scene graph:
+
+```bash
+python -m scripts.render_scene_graph_video \
+  --states-dir output/demo_collision_intervention
+```
+
+Each branch produces a 200-frame, 1280x720, H.264/yuv420p, CFR-24 animation plus
+a whole-replay still in `output/demo_collision_intervention/scene_graphs/`, so
+the graphs stay frame-aligned with the 24 fps Blender replays. Nodes sit at true
+simulated x/y: a translucent disc marks each body's real collision footprint and
+a smaller solid disc carries the graph node, because nearly touching balls would
+otherwise hide every centre-to-centre edge beneath their own geometry.
+
+Three relation layers are drawn per step. A **contact** edge appears only where
+the log records a contact, with width scaled by normal force. A **proximity**
+edge appears while the surface gap stays within `--near-margin` (0.12 m by
+default), dashed while the endpoints close and dotted while they separate. A
+**causal overlay** panel restates the bundled oracle propagation tree and lights
+each hop at the step its contact actually occurs, so the factual and
+counterfactual branches can be compared against the same ground truth.
+
+This layering matters because logged contacts are sparse: the canonical bundle
+records contacts on only 5 steps of `normal`, 15 of `trajectory_changed`, and
+none at all of `target_removed`. Proximity relations keep the resting rack's
+9–11 structural adjacencies visible across all 200 frames, so the animation
+shows the scene's standing structure and not just its four collision instants.
+
+Contacts against `floor` are reported as a grounded badge on the object rather
+than an edge, since a ground plane is within reach of everything and would
+otherwise link to every node. Rendering is deterministic: independent runs
+produce byte-identical MP4 and PNG output.
 
 ### Demo-only removal trust boundary
 

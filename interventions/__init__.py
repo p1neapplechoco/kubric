@@ -1,8 +1,8 @@
 """Stable public exports for counterfactual trajectory interventions.
 
 Purpose: expose the supported backend-neutral intervention API from one package.
-Public API: schemas, trajectories, logs, graph extraction, tags, and lazily loaded
-simulator/twin-runner entry points listed in ``__all__``.
+Public API: schemas, trajectories, logs, graph extraction, scene-graph relations,
+tags, and lazily loaded simulator/twin-runner entry points listed in ``__all__``.
 Dependencies: eager exports use the standard library and NumPy-facing modules;
 Kubric and PyBullet backends are imported only when a lazy export is requested.
 Trust boundary: this namespace defines stable access paths, but does not add
@@ -31,6 +31,19 @@ from interventions.graph_extraction import (
     graph_delta,
     state_affected,
     temporal_reachability,
+)
+from interventions.scene_graph import (
+    CONTACT_RELATION,
+    PROXIMITY_RELATION,
+    RELATION_KINDS,
+    CausalEdge,
+    NodeState,
+    RelationEdge,
+    RelationSeries,
+    SceneGraphFrame,
+    build_relation_series,
+    contact_activation_steps,
+    propagation_tree,
 )
 from interventions.logging import (
     ANGULAR_VELOCITY_SLICE,
@@ -102,7 +115,9 @@ def __dir__():
 __all__ = [
     "ANGULAR_VELOCITY_SLICE",
     "AggregatedContactStep",
+    "CONTACT_RELATION",
     "CameraConfig",
+    "CausalEdge",
     "ContactLogger",
     "ContactRecord",
     "GraphEdgeDelta",
@@ -112,17 +127,25 @@ __all__ = [
     "KinematicDragSimulator",
     "LINEAR_VELOCITY_SLICE",
     "KinematicSimulator",
+    "NodeState",
     "ObjectConfig",
+    "PROXIMITY_RELATION",
     "POSITION_SLICE",
     "QUATERNION_SLICE",
     "RECIPE_PROFILE_SEMANTICS",
+    "RELATION_KINDS",
+    "RelationEdge",
+    "RelationSeries",
     "STATE_INDEX",
     "SceneConfig",
+    "SceneGraphFrame",
     "SimulationLog",
     "TemporalEdge",
     "TemporalGraph",
     "aggregate_contact_steps",
     "build_path",
+    "build_relation_series",
+    "contact_activation_steps",
     "contact_log_to_temporal_graph",
     "derive_tags",
     "extract_ground_truth",
@@ -131,6 +154,7 @@ __all__ = [
     "graph_delta",
     "max_position_deviation",
     "perturb_path",
+    "propagation_tree",
     "read_paired_artifact",
     "read_simulation_log",
     "state_affected",

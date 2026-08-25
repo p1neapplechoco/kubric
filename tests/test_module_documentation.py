@@ -16,6 +16,7 @@ _MODULE_PATHS = (
     "interventions/graph_extraction.py",
     "interventions/kinematic_simulator.py",
     "interventions/logging.py",
+    "interventions/scene_graph.py",
     "interventions/schema.py",
     "interventions/tagging.py",
     "interventions/trajectory.py",
@@ -27,6 +28,7 @@ _MODULE_PATHS = (
     "scripts/demo_collision_intervention.py",
     "scripts/render_demo_branches_blender.py",
     "scripts/compose_intervention_demo.py",
+    "scripts/render_scene_graph_video.py",
 )
 _CONTRACT_HEADINGS = (
     "Purpose:",
@@ -54,6 +56,12 @@ _REQUIRED_ENTRIES = {
         "compose_intervention_demo",
         "main",
     ),
+    "scripts/render_scene_graph_video.py": (
+        "BranchBundle",
+        "load_demo_bundle",
+        "render_scene_graph_media",
+        "main",
+    ),
 }
 _EXACT_MAIN_DOCSTRINGS = {
     "scripts/generate_dataset.py": (
@@ -70,6 +78,9 @@ _EXACT_MAIN_DOCSTRINGS = {
     ),
     "scripts/compose_intervention_demo.py": (
         "Validates CLI inputs, composes the comparison atomically, and returns zero."
+    ),
+    "scripts/render_scene_graph_video.py": (
+        "Renders per-branch scene-graph media atomically and returns zero."
     ),
 }
 
