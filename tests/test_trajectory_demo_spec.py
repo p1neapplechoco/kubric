@@ -107,6 +107,8 @@ def test_invalid_object_mutants_rejected(object_id, changes, pattern):
     ({"target_id": "missing_target"}, "target"), ({"intervention_window": (-1, 160)}, "window"),
     ({"seed": -1}, "seed"), ({"frame_range": (0, 21)}, "200"),
     ({"frame_range": (0, 8), "step_rate": 25}, "integral"),
+    ({"frame_range": (-1, 19)}, "nonnegative"),
+    ({"frame_range": (0, 3), "frame_rate": 3, "step_rate": 200}, "divisible"),
 ])
 def test_invalid_scene_mutants_rejected(changes, pattern):
     with pytest.raises((TypeError, ValueError), match=pattern):

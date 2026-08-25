@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
@@ -34,6 +35,7 @@ from interventions import (
     Intervention,
     KinematicSimulator,
     ObjectConfig,
+    QUATERNION_SLICE,
     SceneConfig,
     SimulationLog,
     extract_pair_ground_truth,
@@ -120,6 +122,14 @@ class RemovedBranch:
       raise ValueError("states must have shape {!r}".format(expected_states))
     if not np.isfinite(states).all():
       raise ValueError("states must contain only finite values")
+    for index, quaternion in enumerate(
+        states[:, :, QUATERNION_SLICE].reshape((-1, 4))
+    ):
+      norm = math.hypot(*(float(component) for component in quaternion))
+      if abs(norm - 1.0) > 1e-6:
+        raise ValueError(
+            f"states quaternion {index} must be unit-normalized"
+        )
 
     untyped_presence = np.asarray(self.presence)
     if untyped_presence.dtype.kind != "b":
@@ -453,6 +463,16 @@ def _validate_removed_branch(
       normal.states[:removed_step, target_index],
   ):
     raise RuntimeError("removed branch target prefix differs from normal")
+  expected_non_target = np.broadcast_to(
+      removed.states[removed_step - 1, non_target_indices],
+      removed.states[removed_step:, non_target_indices].shape,
+  )
+  if not np.array_equal(
+      removed.states[removed_step:, non_target_indices], expected_non_target
+  ):
+    raise RuntimeError(
+        "removed branch non-target states changed during post-removal tail"
+    )
 
   expected_presence = np.ones_like(removed.presence, dtype=np.bool_)
   expected_presence[removed_step:, target_index] = False

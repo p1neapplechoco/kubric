@@ -208,6 +208,7 @@ def _validate_contact_summary(
 
 def _validate_graph_records(graph_delta: Mapping[str, Any]) -> None:
   owners: dict[tuple[str, str, int, int], str] = {}
+  canonical_ids = set(FORKED_RACK_SPEC.object_ids)
   for bucket in ("added", "removed", "changed"):
     records = graph_delta[bucket]
     if not isinstance(records, list):
@@ -224,6 +225,8 @@ def _validate_graph_records(graph_delta: Mapping[str, Any]) -> None:
         raise ValueError(f"{name} missing required fields {missing!r}")
       object_a = _require_nonempty_string(record["object_a"], f"{name}.object_a")
       object_b = _require_nonempty_string(record["object_b"], f"{name}.object_b")
+      if object_a not in canonical_ids or object_b not in canonical_ids:
+        raise ValueError(f"{name} endpoints must name canonical object_ids")
       if object_a >= object_b:
         raise ValueError(
             f"{name} endpoints must be distinct and canonically ordered"
@@ -232,6 +235,11 @@ def _validate_graph_records(graph_delta: Mapping[str, Any]) -> None:
       end = _require_integer(record["end_step"], f"{name}.end_step")
       if end <= start:
         raise ValueError(f"{name} steps must satisfy start_step < end_step")
+      if end > FORKED_RACK_SPEC.num_steps:
+        raise ValueError(
+            f"{name} steps must lie within replay bounds "
+            f"[0, {FORKED_RACK_SPEC.num_steps}]"
+        )
       identity = (object_a, object_b, start, end)
       previous = owners.get(identity)
       if previous is not None:
@@ -261,6 +269,13 @@ def _validate_ground_truth(value: Any) -> dict[str, Any]:
   soft = _require_string_list(
       truth["soft_affected"], "ground_truth.soft_affected"
   )
+  ball_ids = set(FORKED_RACK_SPEC.ball_ids)
+  for name, identifiers in (
+      ("ground_truth.hard_affected", hard),
+      ("ground_truth.soft_affected", soft),
+  ):
+    if not set(identifiers).issubset(ball_ids):
+      raise ValueError(f"{name} must name canonical ball object_ids")
   if set(hard).intersection(soft):
     raise ValueError("ground_truth hard_affected and soft_affected must be disjoint")
   paths = _require_object(
@@ -273,7 +288,14 @@ def _validate_ground_truth(value: Any) -> dict[str, Any]:
     items = _require_string_list(
         path, f"ground_truth.propagation_path[{affected!r}]"
     )
-    if not items or items[-1] != affected:
+    allowed_path_ids = ball_ids | {FORKED_RACK_SPEC.target_id}
+    if not set(items).issubset(allowed_path_ids):
+      raise ValueError(
+          "ground_truth propagation path items must name canonical object_ids"
+      )
+    if not items or items[0] != FORKED_RACK_SPEC.target_id:
+      raise ValueError("ground_truth propagation paths must start at target")
+    if items[-1] != affected:
       raise ValueError(
           "ground_truth propagation paths must be nonempty and end at their key"
       )

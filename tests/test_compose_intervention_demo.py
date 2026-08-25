@@ -213,6 +213,89 @@ def test_load_summary_rejects_stale_demo_spec(compositor, tmp_path):
     ("mutation", "message"),
     (
         (
+            lambda value: value["ground_truth"]["graph_delta"][
+                "changed"
+            ].append({
+                "object_a": "ghost",
+                "object_b": "zz_ghost",
+                "start_step": 50,
+                "end_step": 51,
+            }),
+            "canonical object_ids",
+        ),
+        (
+            lambda value: value["ground_truth"]["graph_delta"]["added"][
+                0
+            ].__setitem__("end_step", 201),
+            "replay bounds",
+        ),
+        (
+            lambda value: (
+                value["ground_truth"]["hard_affected"].__setitem__(
+                    0, "ghost"
+                ),
+                value["ground_truth"]["propagation_path"].__setitem__(
+                    "ghost", ["target", "ghost"]
+                ),
+                value["ground_truth"]["propagation_path"].pop("breaker"),
+            ),
+            "hard_affected.*canonical ball object_ids",
+        ),
+        (
+            lambda value: value["ground_truth"]["soft_affected"].append(
+                "ghost"
+            ),
+            "soft_affected.*canonical ball object_ids",
+        ),
+        (
+            lambda value: (
+                value["ground_truth"]["hard_affected"].__setitem__(
+                    0, "floor"
+                ),
+                value["ground_truth"]["propagation_path"].__setitem__(
+                    "floor", ["target", "floor"]
+                ),
+                value["ground_truth"]["propagation_path"].pop("breaker"),
+            ),
+            "hard_affected.*canonical ball object_ids",
+        ),
+        (
+            lambda value: value["ground_truth"]["soft_affected"].append(
+                "target"
+            ),
+            "soft_affected.*canonical ball object_ids",
+        ),
+        (
+            lambda value: value["ground_truth"]["propagation_path"][
+                "breaker"
+            ].__setitem__(0, "rack_01"),
+            "start at target",
+        ),
+        (
+            lambda value: value["ground_truth"]["propagation_path"][
+                "rack_03"
+            ].__setitem__(1, "ghost"),
+            "path.*canonical object_ids",
+        ),
+    ),
+)
+def test_load_summary_rejects_noncanonical_ground_truth_contract(
+    compositor, tmp_path, mutation, message
+):
+  payload = _summary()
+  mutation(payload)
+  (tmp_path / "summary.json").write_text(
+      json.dumps(payload), encoding="utf-8"
+  )
+
+  with pytest.raises(ValueError, match=message):
+    compositor._load_summary(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
             lambda value: value.__setitem__(
                 "object_ids", list(reversed(value["object_ids"]))
             ),

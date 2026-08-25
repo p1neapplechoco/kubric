@@ -480,6 +480,31 @@ def test_removed_branch_has_no_post_removal_dynamic_chain(generated_demo):
   ))
 
 
+def test_removed_branch_rejects_nonunit_state_quaternion(generated_demo):
+  start, _ = generated_demo.intervention_window
+  states = np.array(generated_demo.removed.states, copy=True)
+  breaker = generated_demo.removed.object_ids.index("breaker")
+  states[start, breaker, 3:7] = 0.0
+
+  with pytest.raises(ValueError, match="quaternion.*unit-normalized"):
+    dataclasses.replace(generated_demo.removed, states=states)
+
+
+def test_removed_branch_rejects_post_removal_live_object_motion(
+    generated_demo,
+):
+  start, _ = generated_demo.intervention_window
+  states = np.array(generated_demo.removed.states, copy=True)
+  breaker = generated_demo.removed.object_ids.index("breaker")
+  states[start:, breaker, 0] += 1.0
+  corrupted = dataclasses.replace(generated_demo.removed, states=states)
+
+  with pytest.raises(RuntimeError, match="non-target.*post-removal"):
+    demo._validate_removed_branch(
+        corrupted, generated_demo.normal, generated_demo.intervention
+    )
+
+
 def test_removed_branch_rejects_post_removal_floor_target_contact(generated_demo):
   start, _ = generated_demo.intervention_window
   floor_target_contact = demo.ContactRecord(

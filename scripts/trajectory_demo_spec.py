@@ -223,10 +223,14 @@ def validate_demo_spec(spec: DemoSceneSpec) -> None:
     start, end = spec.frame_range
     if any(isinstance(v, bool) or not isinstance(v, int) for v in (spec.frame_rate, spec.step_rate)):
         raise ValueError("frame rates must be integers")
-    if end <= start or spec.frame_rate <= 0 or spec.step_rate <= 0:
-        raise ValueError("frame rates and span must be positive")
-    if (end - start) * spec.step_rate % spec.frame_rate:
-        raise ValueError("physics steps must be integral")
+    if start < 0 or end <= start:
+        raise ValueError("frame range must be nonnegative with a positive span")
+    if spec.frame_rate <= 0 or spec.step_rate <= 0:
+        raise ValueError("frame rates must be positive")
+    if spec.step_rate % spec.frame_rate:
+        raise ValueError(
+            "step_rate must be divisible by frame_rate for integral physics steps"
+        )
     if spec.num_steps != 200:
         raise ValueError("spec must have 200 steps")
     win_start, win_end = spec.intervention_window
