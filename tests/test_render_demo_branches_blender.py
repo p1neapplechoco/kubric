@@ -193,6 +193,47 @@ def test_load_replay_requires_boolean_presence(tmp_path):
     render_script._load_replay(tmp_path, "normal")
 
 
+@pytest.mark.parametrize("branch", ("normal", "trajectory_changed"))
+def test_load_replay_requires_all_objects_present_in_paired_branches(
+    tmp_path, branch
+):
+  states = _synthetic_states()
+  presence = np.ones(states.shape[:2], dtype=np.bool_)
+  presence[40, _OBJECT_IDS.index("breaker")] = False
+  _write_bundle(
+      tmp_path, branch=branch, states=states, presence=presence
+  )
+
+  with pytest.raises(ValueError, match="keep every object present"):
+    render_script._load_replay(tmp_path, branch)
+
+
+@pytest.mark.parametrize(
+    ("object_id", "value", "message"),
+    (
+        ("target", True, "target presence.*false"),
+        ("breaker", False, "non-target object present"),
+    ),
+)
+def test_load_replay_requires_exact_target_removed_presence_mask(
+    tmp_path, object_id, value, message
+):
+  states = _synthetic_states()
+  presence = np.ones(states.shape[:2], dtype=np.bool_)
+  target = _OBJECT_IDS.index("target")
+  presence[40:, target] = False
+  presence[40, _OBJECT_IDS.index(object_id)] = value
+  _write_bundle(
+      tmp_path,
+      branch="target_removed",
+      states=states,
+      presence=presence,
+  )
+
+  with pytest.raises(ValueError, match=message):
+    render_script._load_replay(tmp_path, "target_removed")
+
+
 @pytest.mark.parametrize(
     "states",
     (

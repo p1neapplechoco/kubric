@@ -294,6 +294,37 @@ def _validate_demo_spec_identity(value: Any) -> Mapping[str, Any]:
   return value
 
 
+def _validate_presence_contract(
+    presence: np.ndarray, branch: str, intervention_start: int
+) -> None:
+  """Rejects any presence mask outside the canonical branch semantics."""
+  prefix_end = min(intervention_start, len(presence))
+  if not presence[:prefix_end].all():
+    raise ValueError(
+        f"replay {branch!r} has false pre-intervention presence"
+    )
+  if branch in ("normal", "trajectory_changed"):
+    if not presence.all():
+      raise ValueError(f"replay {branch!r} must keep every object present")
+    return
+
+  target_index = _CANONICAL_OBJECT_IDS.index(_DEMO_SPEC.target_id)
+  non_target_indices = tuple(
+      index
+      for index, object_id in enumerate(_CANONICAL_OBJECT_IDS)
+      if object_id != _DEMO_SPEC.target_id
+  )
+  if not presence[:, non_target_indices].all():
+    raise ValueError(
+        "replay 'target_removed' must keep every non-target object present"
+    )
+  if presence[intervention_start:, target_index].any():
+    raise ValueError(
+        "replay 'target_removed' target presence must be false from "
+        "intervention_start"
+    )
+
+
 def _load_replay(states_dir: Path, branch: str) -> Replay:
   """Loads and validates one branch's states, presence mask, and metadata."""
   if branch not in _ALLOWED_BRANCHES:
@@ -349,6 +380,7 @@ def _load_replay(states_dir: Path, branch: str) -> Replay:
         f"{presence_path} presence has shape {presence.shape}; expected "
         f"{expected_presence_shape} to match the states frame/object count"
     )
+  _validate_presence_contract(presence, branch, intervention_start)
 
   return Replay(
       branch=branch,
@@ -399,10 +431,9 @@ def _validate_synchronized_replays(replays: Sequence[Replay]) -> None:
 
   for replay in replays:
     intervention_start = replay.summary["intervention_start"]
-    if not replay.presence[:intervention_start].all():
-      raise ValueError(
-          f"replay {replay.branch!r} has false pre-intervention presence"
-      )
+    _validate_presence_contract(
+        replay.presence, replay.branch, intervention_start
+    )
 
   for replay in replays[1:]:
     if replay.object_ids != reference.object_ids:
