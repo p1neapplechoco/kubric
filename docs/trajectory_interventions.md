@@ -409,7 +409,27 @@ quality must be measured again at the intended scale before baseline training.
 
 ### Smoke-results status (not a final claim)
 
-This document intentionally publishes no post-hardening smoke counts or pass-rate
-numbers. Release handoff should add results only from a fresh run against the
-exact reviewed commit and record its config digest, seed, attempt budget, QC
-reason distribution, category/hop distribution, and visual spot-check outcome.
+A fresh post-hardening multi-object smoke batch was run at commit `421fddc` with
+config SHA-256
+`7f86690ea4ec8236bef6c31e6a079de021a749f94b95b189dfd2b40fc5740700`
+and master seed `1701`. The deterministic run first exhausted a 120-attempt
+budget with 37 accepted candidates, then resumed to 200 attempts without
+resampling. It completed with 70 accepted candidates and a balanced 50-instance
+selection in 41 measured seconds. The selected split contains 40 train, 5
+validation, and 5 test instances across 41 topology signatures, with no
+topology group crossing split boundaries.
+
+All 70 accepted artifacts passed the public paired-artifact reader. A
+six-example trajectory audit covered contact-changed and mixed outcomes across
+hop buckets `1`, `2`, and `3+`; common prefixes remained aligned and observed
+divergence began inside the intervention windows. The run did not produce any
+`state_only`, `contact_added`, `contact_removed`, or `null_effect` primary
+category. Its 50-instance selection contains 47 `mixed_contact_delta` and 3
+`contact_changed` examples, so it is measured smoke evidence rather than a
+training-ready category distribution.
+
+The full command history, QC distribution, recipe yields, throughput, storage,
+hashes, and visual-audit sample list are recorded in
+[`notes/session-logs/2026-08-25-milestone-f-smoke-batch.md`](../notes/session-logs/2026-08-25-milestone-f-smoke-batch.md).
+Generated datasets, audit plots, branch renders, and the synchronized
+multi-object comparison MP4 remain ignored artifacts and must not be staged.

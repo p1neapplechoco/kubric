@@ -4,6 +4,7 @@
 *.bullet
 .vscode/settings.json
 output/*
+outputs/
 docs/_build
 .idea
 **/.ipynb_checkpoints
