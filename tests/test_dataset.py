@@ -46,6 +46,8 @@ from interventions.schema import (
 
 
 _LOG_IDS = ("ball", "floor", "target")
+# Recorded from configs/scene_ranges.yaml before cylinder and capsule existed.
+_PINNED_PHYSICS_ONLY_INSTANCE_ID = "instance_88f9f9c114de4d5473b9"
 
 
 def _ranges(expected="null", magnitude=(0.0, 0.0), object_count=(1, 1)):
@@ -296,6 +298,30 @@ def test_repository_ranges_sample_only_non_null_interventions():
   specs = tuple(sample_instance_spec(loaded, 20260811, index) for index in range(64))
   assert {spec.expected_effect for spec in specs} == {"non_null"}
   assert all(spec.intervention.magnitude > 0 for spec in specs)
+
+
+def test_physics_only_instance_id_is_unchanged_by_shape_extension():
+  config = Path(__file__).resolve().parents[1] / "configs" / "scene_ranges.yaml"
+  loaded = load_ranges(config)
+  spec = sample_instance_spec(loaded, 20260811, 0)
+
+  assert "visual_scene" not in spec.to_dict()
+  assert spec.instance_id == sample_instance_spec(loaded, 20260811, 0).instance_id
+  # Pinned before cylinder and capsule existed; a change here means the physics
+  # sampling stream moved and every previously generated dataset is orphaned.
+  assert spec.instance_id == _PINNED_PHYSICS_ONLY_INSTANCE_ID
+
+
+def test_target_shape_must_be_a_supported_target_shape(tmp_path):
+  ranges = _ranges()
+  ranges["target"] = dict(ranges["target"])
+  ranges["target"]["shape"] = "capsule"
+  import yaml
+
+  config = tmp_path / "ranges.yaml"
+  config.write_text(yaml.safe_dump(ranges, sort_keys=True), encoding="utf-8")
+  with pytest.raises(ValueError, match="target shape must be cube or sphere"):
+    sample_instance_spec(load_ranges(config), 1234, 0)
 
 
 def _factual_sweep_reaches_initial_dynamic_volume(spec):

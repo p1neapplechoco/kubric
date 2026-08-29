@@ -41,10 +41,12 @@ from interventions.logging import (
     SimulationLog,
 )
 from interventions.schema import (
+    TARGET_SHAPES,
     GroundTruth,
     Intervention,
     ObjectConfig,
     SceneConfig,
+    shape_half_extents,
     to_jsonable,
 )
 from interventions.trajectory import build_path
@@ -469,6 +471,8 @@ def sample_instance_spec(
       target_size,
   )
   target_shape = target_ranges.get("shape", "cube")
+  if target_shape not in TARGET_SHAPES:
+    raise ValueError("target shape must be cube or sphere")
   target = ObjectConfig(
       "target", target_shape, size=target_size, mass=0.0, static=True,
       position=target_position,
@@ -488,17 +492,19 @@ def sample_instance_spec(
   restitution_range = _unit_pair(object_ranges, "restitution")
   x_range = _pair(object_ranges, "x")
   y_range = _pair(object_ranges, "y")
-  placed = [(target.position, target.size)]
+  placed = [(target.position, shape_half_extents(target.shape, target.size))]
   dynamic_objects = []
   for object_index in range(object_count):
     shape = str(_choice(rng, object_ranges.get("shapes"), "objects.shapes"))
     size = _sample_float(rng, object_size_range)
     position = None
+    extent = shape_half_extents(shape, (size, size, size))
     for _ in range(512):
+      # The Z coordinate rests the object on the floor, so it follows the shape's
+      # own half-extent rather than the sampled size.
       candidate = (
-          _sample_float(rng, x_range), _sample_float(rng, y_range), size
+          _sample_float(rng, x_range), _sample_float(rng, y_range), extent[2]
       )
-      extent = (size, size, size)
       if np.any(np.asarray(candidate) - extent < bounds[0]) or np.any(
           np.asarray(candidate) + extent > bounds[1]
       ):
@@ -518,7 +524,7 @@ def sample_instance_spec(
         metadata={"role": "dynamic"},
     )
     dynamic_objects.append(item)
-    placed.append((item.position, item.size))
+    placed.append((item.position, extent))
 
   scene_seed = derive_seed(master, attempt, "scene")
   scene_config = SceneConfig(
@@ -774,7 +780,7 @@ def _rotation_extent(size: Sequence[float], quaternion: Sequence[float]) -> np.n
 def _object_extent(item: ObjectConfig, quaternion: Sequence[float]) -> np.ndarray:
   if item.shape == "sphere":
     return np.full(3, item.size[0], dtype=np.float64)
-  return _rotation_extent(item.size, quaternion)
+  return _rotation_extent(shape_half_extents(item.shape, item.size), quaternion)
 
 
 def _target_incident(edges: Iterable[Mapping[str, Any]], target_id: str) -> bool:

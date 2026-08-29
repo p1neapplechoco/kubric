@@ -417,7 +417,6 @@ def test_scene_primitive_camera_and_physics_properties_are_mapped(monkeypatch):
         ("dynamic_target", "static"),
         ("fractional_window", "integer"),
         ("window_outside", "window"),
-        ("nonuniform_sphere", "uniform"),
         ("conflicting_logical_id", "logical_id"),
         ("angular_target", "angular"),
     ],
@@ -439,8 +438,6 @@ def test_validation_rejects_unsupported_or_inconsistent_inputs(case, message):
     intervention = _intervention(magnitude=0, time_window=(1.5, 9))
   elif case == "window_outside":
     intervention = _intervention(magnitude=0, time_window=(1, 11))
-  elif case == "nonuniform_sphere":
-    config = _scene(target, _object("ball", shape="sphere", size=(1, 2, 1)))
   elif case == "conflicting_logical_id":
     config = _scene(_object("target", static=True, metadata={"logical_id": "wrong"}))
   elif case == "angular_target":
@@ -448,6 +445,11 @@ def test_validation_rejects_unsupported_or_inconsistent_inputs(case, message):
 
   with pytest.raises((TypeError, ValueError), match=message):
     generate_paired_instance(config, target_id, intervention, 0)
+
+
+def test_nonuniform_sphere_is_rejected_before_a_scene_can_be_built():
+  with pytest.raises(ValueError, match="radi"):
+    _object("ball", shape="sphere", size=(1, 2, 1))
 
 
 @pytest.mark.parametrize(

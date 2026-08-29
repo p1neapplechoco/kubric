@@ -2,7 +2,8 @@
 
 Purpose: define immutable experiment values and deterministic JSON conversion.
 Public API: ObjectConfig, CameraConfig, SceneConfig, Intervention,
-GraphEdgeDelta, GroundTruth, constants, and to_jsonable().
+GraphEdgeDelta, GroundTruth, constants, to_jsonable(), shape_half_extents(),
+half_extents(), and oriented_aabb().
 Dependencies: Python's standard library only, so validation and JSON preparation
 never import Kubric, a renderer, or a simulator backend.
 Trust boundary: validation enforces backend-neutral shape, numeric, and JSON-safe
@@ -22,7 +23,9 @@ from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 
 
 SCHEMA_VERSION = "1.0"
-SUPPORTED_SHAPES = frozenset(("cube", "sphere"))
+SUPPORTED_SHAPES = frozenset(("cube", "sphere", "cylinder", "capsule"))
+TARGET_SHAPES = frozenset(("cube", "sphere"))
+_RADIAL_SHAPES = frozenset(("sphere", "cylinder", "capsule"))
 INTERVENTION_RECIPES = frozenset(
     (
         "remove_collision",
@@ -202,6 +205,12 @@ class ObjectConfig(_SchemaMixin):
 
   Quaternion components use WXYZ order. Non-zero quaternion inputs are normalized,
   while scalar sizes are expanded to an XYZ tuple.
+
+  ``size`` is interpreted per shape, always as a local half-extent:
+  cube ``(half_x, half_y, half_z)``; sphere ``(radius, radius, radius)``;
+  cylinder ``(radius, radius, half_height)``; capsule
+  ``(radius, radius, cylinder_half_height)``, whose total Z half-extent is
+  ``cylinder_half_height + radius``.
   """
 
   object_id: str
@@ -234,6 +243,10 @@ class ObjectConfig(_SchemaMixin):
       size = _vector(self.size, 3, "size")
     if any(component <= 0.0 for component in size):
       raise ValueError("size components must be positive")
+    if shape in _RADIAL_SHAPES and size[0] != size[1]:
+      raise ValueError("{} requires equal X and Y radii".format(shape))
+    if shape == "sphere" and size[1] != size[2]:
+      raise ValueError("sphere requires equal radii on every axis")
     object.__setattr__(self, "size", size)
 
     mass = _real(self.mass, "mass")
@@ -282,6 +295,67 @@ class ObjectConfig(_SchemaMixin):
   def initial_quaternion(self) -> Tuple[float, float, float, float]:
     """Alias emphasizing that ``quaternion`` describes the initial state."""
     return self.quaternion
+
+
+def shape_half_extents(
+    shape: str, size: Sequence[float]
+) -> Tuple[float, float, float]:
+  """Returns the local, unrotated half-extents implied by ``shape`` and ``size``."""
+  if shape not in SUPPORTED_SHAPES:
+    raise ValueError("unsupported shape: {!r}".format(shape))
+  extents = _vector(size, 3, "size")
+  if shape == "capsule":
+    return (extents[0], extents[1], extents[2] + extents[0])
+  return extents
+
+
+def half_extents(config: ObjectConfig) -> Tuple[float, float, float]:
+  """Returns the local, unrotated half-extents of ``config``."""
+  if not isinstance(config, ObjectConfig):
+    raise TypeError("config must be an ObjectConfig")
+  return shape_half_extents(config.shape, config.size)
+
+
+def _rotate(
+    quaternion: Sequence[float], vector: Sequence[float]
+) -> Tuple[float, float, float]:
+  """Rotates ``vector`` by a unit WXYZ ``quaternion`` using plain arithmetic."""
+  w, x, y, z = (float(component) for component in quaternion)
+  vx, vy, vz = (float(component) for component in vector)
+  return (
+      vx * (1 - 2 * (y * y + z * z)) + vy * 2 * (x * y - z * w)
+      + vz * 2 * (x * z + y * w),
+      vx * 2 * (x * y + z * w) + vy * (1 - 2 * (x * x + z * z))
+      + vz * 2 * (y * z - x * w),
+      vx * 2 * (x * z - y * w) + vy * 2 * (y * z + x * w)
+      + vz * (1 - 2 * (x * x + y * y)),
+  )
+
+
+def oriented_aabb(
+    config: ObjectConfig,
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+  """Returns the world-space bounds of ``config`` after applying its rotation.
+
+  The box is a conservative bound for the radial shapes, whose rotated silhouette
+  is smaller than the rotated box around them.
+  """
+  extents = half_extents(config)
+  corners = [
+      _rotate(config.quaternion, (sx * extents[0], sy * extents[1], sz * extents[2]))
+      for sx in (-1.0, 1.0)
+      for sy in (-1.0, 1.0)
+      for sz in (-1.0, 1.0)
+  ]
+  lower = tuple(
+      min(corner[axis] for corner in corners) + config.position[axis]
+      for axis in range(3)
+  )
+  upper = tuple(
+      max(corner[axis] for corner in corners) + config.position[axis]
+      for axis in range(3)
+  )
+  return lower, upper
 
 
 @dataclass(frozen=True)

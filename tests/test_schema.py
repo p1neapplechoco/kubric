@@ -1,6 +1,7 @@
 """Tests for immutable intervention artifact schemas."""
 
 import json
+import math
 from dataclasses import dataclass, FrozenInstanceError
 from fractions import Fraction
 
@@ -515,3 +516,55 @@ def test_to_jsonable_handles_nested_numpy_values_and_sorted_sets():
   }
   with pytest.raises(TypeError):
     to_jsonable(object())
+
+
+def test_supported_shapes_include_cylinder_and_capsule():
+  assert schema_module.SUPPORTED_SHAPES == frozenset(
+      ("cube", "sphere", "cylinder", "capsule"))
+  assert schema_module.TARGET_SHAPES == frozenset(("cube", "sphere"))
+
+
+@pytest.mark.parametrize(
+    ("shape", "size", "expected"),
+    (
+        ("cube", (0.2, 0.3, 0.4), (0.2, 0.3, 0.4)),
+        ("sphere", 0.25, (0.25, 0.25, 0.25)),
+        ("cylinder", (0.2, 0.2, 0.5), (0.2, 0.2, 0.5)),
+        ("capsule", (0.2, 0.2, 0.5), (0.2, 0.2, 0.7)),
+    ),
+)
+def test_half_extents_follow_documented_size_semantics(shape, size, expected):
+  config = ObjectConfig(object_id="a", shape=shape, size=size)
+  assert schema_module.half_extents(config) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("shape", ("sphere", "cylinder", "capsule"))
+def test_radial_shapes_require_equal_x_and_y(shape):
+  with pytest.raises(ValueError, match="radi"):
+    ObjectConfig(object_id="a", shape=shape, size=(0.2, 0.3, 0.4))
+
+
+def test_sphere_requires_a_fully_uniform_size():
+  with pytest.raises(ValueError, match="radi"):
+    ObjectConfig(object_id="a", shape="sphere", size=(0.2, 0.2, 0.4))
+
+
+def test_oriented_aabb_accounts_for_yaw():
+  config = ObjectConfig(
+      object_id="a",
+      shape="cube",
+      size=(0.5, 0.1, 0.2),
+      position=(1.0, 2.0, 3.0),
+      quaternion=(math.cos(math.pi / 4), 0.0, 0.0, math.sin(math.pi / 4)))
+  lower, upper = schema_module.oriented_aabb(config)
+  assert lower == pytest.approx((0.9, 1.5, 2.8))
+  assert upper == pytest.approx((1.1, 2.5, 3.2))
+
+
+def test_oriented_aabb_of_an_unrotated_capsule_includes_its_caps():
+  config = ObjectConfig(
+      object_id="a", shape="capsule", size=(0.2, 0.2, 0.5),
+      position=(0.0, 0.0, 1.0))
+  lower, upper = schema_module.oriented_aabb(config)
+  assert lower == pytest.approx((-0.2, -0.2, 0.3))
+  assert upper == pytest.approx((0.2, 0.2, 1.7))
