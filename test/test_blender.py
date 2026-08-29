@@ -147,6 +147,77 @@ def test_blender_samples_per_pixel_init(tmp_path):
     assert renderer.blender_scene.cycles.samples == 256
 
 
+def test_blender_cylinder_has_expected_dimensions(tmp_path):
+    scene = core.Scene(resolution=(16, 16))
+    renderer = blender.Blender(scene, tmp_path)
+    cylinder = core.Cylinder(scale=(0.25, 0.25, 0.75), position=(0, 0, 0))
+    scene.add(cylinder)
+
+    blender_obj = cylinder.linked_objects[renderer]
+    bpy.context.view_layer.update()  # dimensions are cached until the depsgraph runs
+    np.testing.assert_allclose(blender_obj.dimensions, (0.5, 0.5, 1.5), atol=1e-5)
+
+
+def test_blender_capsule_dimensions_include_caps(tmp_path):
+    scene = core.Scene(resolution=(16, 16))
+    renderer = blender.Blender(scene, tmp_path)
+    # 2 * 0.5 cylindrical section plus a 0.25 radius cap at each end.
+    capsule = core.Capsule(scale=(0.25, 0.25, 0.5), position=(0, 0, 0))
+    scene.add(capsule)
+
+    blender_obj = capsule.linked_objects[renderer]
+    np.testing.assert_allclose(blender_obj.dimensions, (0.5, 0.5, 1.5), atol=1e-5)
+
+
+def test_blender_capsule_mesh_is_closed_and_deterministic(tmp_path):
+    scene = core.Scene(resolution=(16, 16))
+    renderer = blender.Blender(scene, tmp_path)
+    first = core.Capsule(scale=(0.25, 0.25, 0.5))
+    second = core.Capsule(scale=(0.25, 0.25, 0.5))
+    scene.add(first)
+    scene.add(second)
+
+    first_vertices, first_faces = blender_utils.get_vertices_and_faces(
+        first.linked_objects[renderer])
+    second_vertices, second_faces = blender_utils.get_vertices_and_faces(
+        second.linked_objects[renderer])
+    np.testing.assert_array_equal(first_vertices, second_vertices)
+    np.testing.assert_array_equal(first_faces, second_faces)
+
+    # A closed surface uses every edge exactly twice, so a hole or a duplicated
+    # interior face from a botched join would show up here.
+    edge_counts = {}
+    for face in first_faces:
+        for index, vertex in enumerate(face):
+            edge = frozenset((vertex, face[(index + 1) % len(face)]))
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+    assert set(edge_counts.values()) == {2}
+
+
+def test_blender_cylinder_tracks_material(tmp_path):
+    scene = core.Scene(resolution=(16, 16))
+    renderer = blender.Blender(scene, tmp_path)
+    material = core.PrincipledBSDFMaterial(color=core.Color(1.0, 0.0, 0.0, 1.0))
+    cylinder = core.Cylinder(scale=(0.2, 0.2, 0.2), material=material)
+    scene.add(cylinder)
+
+    blender_obj = cylinder.linked_objects[renderer]
+    assert blender_obj.active_material is not None
+    assert blender_obj.active_material is material.linked_objects[renderer]
+
+
+def test_blender_capsule_tracks_material(tmp_path):
+    scene = core.Scene(resolution=(16, 16))
+    renderer = blender.Blender(scene, tmp_path)
+    material = core.PrincipledBSDFMaterial(color=core.Color(0.0, 1.0, 0.0, 1.0))
+    capsule = core.Capsule(scale=(0.2, 0.2, 0.2), material=material)
+    scene.add(capsule)
+
+    blender_obj = capsule.linked_objects[renderer]
+    assert blender_obj.active_material is not None
+    assert blender_obj.active_material is material.linked_objects[renderer]
+
+
 def test_get_render_layers_from_exr_uses_uppercase_cryptomatte_channels(monkeypatch):
     captured_channels = []
 

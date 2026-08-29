@@ -490,6 +490,42 @@ class Blender(core.View):
         obj.observe(KeyframeSetter(sphere, "scale"), "scale", type="keyframe")
         return sphere
 
+    @add_asset.register(core.Cylinder)
+    @blender_utils.prepare_blender_object
+    def _add_asset(self, obj: core.Cylinder):
+        bpy.ops.mesh.primitive_cylinder_add(vertices=64, radius=1.0, depth=2.0)
+        bpy.ops.object.shade_smooth()
+        cylinder = bpy.context.active_object
+
+        register_object3d_setters(obj, cylinder)
+        obj.observe(
+            AttributeSetter(
+                cylinder, "active_material", converter=self._convert_to_blender_object
+            ),
+            "material",
+        )
+        obj.observe(AttributeSetter(cylinder, "scale"), "scale")
+        obj.observe(KeyframeSetter(cylinder, "scale"), "scale", type="keyframe")
+        return cylinder
+
+    @add_asset.register(core.Capsule)
+    @blender_utils.prepare_blender_object
+    def _add_asset(self, obj: core.Capsule):
+        # The capsule mesh is baked at its realized size, because its Z extent is
+        # half_height + radius and therefore cannot be reached by scaling a unit
+        # mesh. Object scale stays at 1 and "scale" is deliberately not observed;
+        # the intervention pipeline never animates object scale.
+        capsule = blender_utils.build_capsule_mesh(obj.scale, name=obj.uid)
+
+        register_object3d_setters(obj, capsule)
+        obj.observe(
+            AttributeSetter(
+                capsule, "active_material", converter=self._convert_to_blender_object
+            ),
+            "material",
+        )
+        return capsule
+
     @add_asset.register(core.FileBasedObject)
     @blender_utils.prepare_blender_object
     def _add_asset(self, obj: core.FileBasedObject):
