@@ -1,11 +1,13 @@
 """Cross-platform durability and advisory-locking primitives.
 
-Purpose: provide the two filesystem primitives the publication paths depend on --
-flushing a directory entry and taking an exclusive advisory lock -- with one
-implementation per platform, so that ``interventions.logging``,
-``interventions.dataset``, and ``interventions.twin_runner`` cannot drift apart.
+Purpose: provide the filesystem primitives the publication paths depend on --
+flushing a directory entry, taking an exclusive advisory lock, and renaming a
+staged payload into place -- with one implementation per platform, so that
+``interventions.logging``, ``interventions.dataset``, and
+``interventions.twin_runner`` cannot drift apart.
 
-Public API: fsync_directory(), exclusive_lock(), DIRECTORY_FSYNC_SUPPORTED.
+Public API: fsync_directory(), exclusive_lock(), publish_rename(),
+publish_replace(), DIRECTORY_FSYNC_SUPPORTED, PUBLISH_RETRY_DELAYS.
 
 Dependencies: standard library only. POSIX uses ``fcntl``; Windows uses ``msvcrt``.
 Neither backend is imported at call time, so importing this module is always safe.
@@ -45,6 +47,13 @@ _LOCK_POLL_SECONDS = 0.01
 # on a directory fails with PermissionError, and no CRT handle exposes the entry.
 DIRECTORY_FSYNC_SUPPORTED = not _WINDOWS
 
+# Windows denies a rename while any other process holds an open handle anywhere in
+# the tree, which real-time virus scanners and search indexers routinely do for a
+# few milliseconds after files are created. The failure is indistinguishable from
+# a real permission error by errno alone, so the budget is deliberately short: it
+# absorbs a scanner but still surfaces a genuinely unwritable destination quickly.
+PUBLISH_RETRY_DELAYS = (0.01, 0.02, 0.05, 0.1, 0.25) if _WINDOWS else ()
+
 
 def fsync_directory(directory: Path) -> None:
   """Flush a directory entry to stable storage where the platform allows it.
@@ -63,6 +72,35 @@ def fsync_directory(directory: Path) -> None:
     os.fsync(descriptor)
   finally:
     os.close(descriptor)
+
+
+def _publish(operation: str, source, destination) -> None:
+  for delay in PUBLISH_RETRY_DELAYS:
+    try:
+      getattr(os, operation)(source, destination)
+      return
+    except PermissionError:
+      time.sleep(delay)
+  getattr(os, operation)(source, destination)
+
+
+def publish_rename(source, destination) -> None:
+  """Renames ``source`` onto a destination that must not already exist.
+
+  Behaves exactly like ``os.rename`` apart from retrying the transient Windows
+  sharing violation described on PUBLISH_RETRY_DELAYS. The final attempt is
+  unguarded, so a persistent failure propagates its original exception.
+  """
+  _publish("rename", source, destination)
+
+
+def publish_replace(source, destination) -> None:
+  """Atomically replaces ``destination`` with ``source``.
+
+  Behaves exactly like ``os.replace`` apart from the retry described on
+  publish_rename.
+  """
+  _publish("replace", source, destination)
 
 
 def _acquire(descriptor: int, blocking: bool) -> None:

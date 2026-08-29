@@ -606,7 +606,9 @@ def write_simulation_log(
         temporary_generation = None
       else:
         try:
-          os.rename(str(temporary_generation), str(final_generation))
+          _portability.publish_rename(
+              str(temporary_generation), str(final_generation)
+          )
         except OSError:
           if not final_generation.exists():
             raise
@@ -618,7 +620,7 @@ def write_simulation_log(
       temporary_manifest = _write_temp(
           target, ".manifest.", manifest_payload
       )
-      os.replace(str(temporary_manifest), str(manifest_path))
+      _portability.publish_replace(str(temporary_manifest), str(manifest_path))
       temporary_manifest = None
       _fsync_directory(target)
     finally:

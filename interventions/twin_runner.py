@@ -1464,12 +1464,12 @@ def _publish_pair_generation(
         generations = root_staging / _PAIR_GENERATIONS
         generations.mkdir()
         final_generation = generations / generation
-        os.rename(staged_generation, final_generation)
+        _portability.publish_rename(staged_generation, final_generation)
         _fsync_directory(final_generation)
         _fsync_directory(generations)
         _write_bytes(root_staging / _PAIR_MANIFEST, manifest_payload)
         _fsync_directory(root_staging)
-        os.rename(root_staging, target)
+        _portability.publish_rename(root_staging, target)
         _fsync_directory(target)
         _fsync_directory(target.parent)
       finally:
@@ -1484,12 +1484,12 @@ def _publish_pair_generation(
       _verify_equal_generation(final_generation, staged_generation)
       shutil.rmtree(staged_generation)
     else:
-      os.rename(staged_generation, final_generation)
+      _portability.publish_rename(staged_generation, final_generation)
     _fsync_directory(final_generation)
     _fsync_directory(generations)
     temporary_manifest = _write_temp(target, ".manifest-", manifest_payload)
     try:
-      os.replace(temporary_manifest, target / _PAIR_MANIFEST)
+      _portability.publish_replace(temporary_manifest, target / _PAIR_MANIFEST)
       temporary_manifest = None
       _fsync_directory(target)
     finally:

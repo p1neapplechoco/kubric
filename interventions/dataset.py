@@ -1298,7 +1298,7 @@ def _write_atomic(path: Path, payload: bytes) -> None:
     os.fsync(stream.fileno())
     temporary = Path(stream.name)
   try:
-    os.replace(temporary, path)
+    _portability.publish_replace(temporary, path)
     _fsync_directory(path.parent)
   finally:
     try:
@@ -1459,7 +1459,7 @@ def _publish_instance(
         staging / "instance_manifest.json", _canonical_bytes(instance_manifest)
     )
     _fsync_directory(staging)
-    os.rename(staging, destination)
+    _portability.publish_rename(staging, destination)
     _fsync_directory(instances)
   except BaseException:
     if staging.exists():
@@ -1786,7 +1786,7 @@ def _initialize_dataset_root(
     _write_once(staging / "config.yaml", snapshot)
     _write_once(staging / "run.json", _canonical_bytes(run_payload))
     _fsync_directory(staging)
-    os.rename(staging, root)
+    _portability.publish_rename(staging, root)
     _fsync_directory(root.parent)
   except BaseException:
     if staging.exists():

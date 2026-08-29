@@ -109,7 +109,7 @@ This must print all seven layers: `backward_flow`, `depth`, `forward_flow`,
 
 ## Platform differences that the code accounts for
 
-`interventions/_portability.py` isolates the two filesystem primitives that
+`interventions/_portability.py` isolates the filesystem primitives that
 differ between POSIX and Windows, so the publication paths in
 `interventions/logging.py`, `interventions/dataset.py`, and
 `interventions/twin_runner.py` share one implementation.
@@ -124,6 +124,16 @@ differ between POSIX and Windows, so the publication paths in
 - **Advisory locking.** POSIX uses `fcntl.flock`. Windows uses
   `msvcrt.locking`, which has no blocking mode that waits indefinitely, so
   contention is handled by polling.
+- **Publication renames.** Windows refuses to rename a directory while any other
+  process holds an open handle anywhere beneath it, which real-time virus
+  scanners and the search indexer routinely do for a few milliseconds after files
+  are written. Left unhandled this surfaced as a random
+  `PermissionError: [WinError 5] Access is denied` from `os.rename` in roughly
+  one to four tests per full-suite run, always in a different test. Publishers
+  therefore call `publish_rename` and `publish_replace`, which retry on the
+  delays in `PUBLISH_RETRY_DELAYS` and then make one final unguarded attempt, so
+  a genuinely unwritable destination still raises its original exception.
+  `PUBLISH_RETRY_DELAYS` is empty on POSIX, where `EACCES` is never transient.
 
 ## Test baseline
 
@@ -131,9 +141,9 @@ differ between POSIX and Windows, so the publication paths in
 & $py -m pytest tests/ test/ -q
 ```
 
-Expected on Windows: **8 failed, 1005 passed, 7 skipped**. All eight failures are
-pre-existing platform gaps in demo tooling that the render pipeline does not use,
-and none of them touch a module under active development:
+Expected on Windows: **8 failed, 7 skipped**, everything else passing. All eight
+failures are pre-existing platform gaps in demo tooling that the render pipeline
+does not use, and none of them touch a module under active development:
 
 | Tests | Cause |
 | --- | --- |
