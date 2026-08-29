@@ -951,6 +951,8 @@ def _render_animation_mp4(
 
   renderer.set_exr_output_path(None)
   blender_scene.use_nodes = False
+  # Blender otherwise appends the rendered frame range to the movie filename.
+  blender_scene.render.use_file_extension = False
   blender_scene.render.filepath = str(output)
   blender_scene.render.image_settings.file_format = "FFMPEG"
   blender_scene.render.ffmpeg.format = "MPEG4"

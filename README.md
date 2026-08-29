@@ -26,6 +26,9 @@ For factual/counterfactual trajectory rollouts, dataset generation, artifact
 semantics, and the isolated `thesis` environment workflow, see the
 [trajectory interventions guide](docs/trajectory_interventions.md).
 
+For the supported primitive-shape gallery and the three rendered intervention
+branches, see the [object-shape demos guide](docs/object_shape_demos.md).
+
 Assuming you have docker installed, to generate the data above simply execute:
 ```
 git clone https://github.com/google-research/kubric.git

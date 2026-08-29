@@ -14,6 +14,7 @@ _MODULE_PATHS = (
     "interventions/__init__.py",
     "interventions/_portability.py",
     "interventions/appearance.py",
+    "interventions/appearance_sampling.py",
     "interventions/dataset.py",
     "interventions/graph_extraction.py",
     "interventions/kinematic_simulator.py",
