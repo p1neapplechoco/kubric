@@ -18,6 +18,7 @@ _MODULE_PATHS = (
     "interventions/graph_extraction.py",
     "interventions/kinematic_simulator.py",
     "interventions/logging.py",
+    "interventions/materials.py",
     "interventions/schema.py",
     "interventions/tagging.py",
     "interventions/trajectory.py",

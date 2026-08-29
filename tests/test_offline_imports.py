@@ -30,12 +30,16 @@ import interventions
 from interventions.appearance import MaterialSpec, TextureSpec, VisualObjectSpec
 from interventions.graph_extraction import TemporalGraph, extract_ground_truth
 from interventions.logging import ContactRecord, SimulationLog
+from interventions.materials import FAMILY_PRIORS, coupled_physics, proxy_volume
 from interventions.schema import GroundTruth, SceneConfig
 from interventions.tagging import derive_tags
 from interventions.trajectory import build_path, validate_path
 
 assert TextureSpec(kind="solid", colors=((0.0, 0.0, 0.0, 1.0),)).kind == "solid"
 assert MaterialSpec is not None and VisualObjectSpec is not None
+assert FAMILY_PRIORS["metal"].density == (55.0, 100.0)
+assert proxy_volume("cube", (0.5, 0.5, 0.5)) == 1.0
+assert coupled_physics is not None
 assert interventions.TemporalGraph is TemporalGraph
 assert interventions.extract_ground_truth is extract_ground_truth
 assert interventions.ContactRecord is ContactRecord
