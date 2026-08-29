@@ -12,6 +12,8 @@ pandas
 pypng
 pyquaternion
 python-Levenshtein
+PyYAML
+scipy
 scikit-learn
 tensorflow
 tensorflow-datasets>=4.1.0

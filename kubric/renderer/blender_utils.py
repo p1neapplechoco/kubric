@@ -395,6 +395,83 @@ def apply_transformations(
         )
 
 
+_CAPSULE_SEGMENTS = 32
+_CAPSULE_RINGS = 8
+
+
+def build_capsule_mesh(scale: ArrayLike, name: str = "capsule") -> bpy.types.Object:
+    """Builds a closed, triangulated capsule aligned with the local Z axis.
+
+    The mesh is baked at its realized size instead of being unit-sized and then
+    scaled, because a capsule's Z extent is ``half_height + radius`` and so is not
+    a linear function of Blender's object scale. Vertices are generated from
+    closed-form trigonometry rather than from operators, so two capsules with the
+    same scale always produce byte-identical geometry.
+
+    Args:
+      scale: kubric scale as (radius, radius, cylinder_half_height).
+      name: name for the created mesh datablock and object.
+
+    Returns:
+      The created Blender object. It is not linked into any collection.
+    """
+    radius = float(scale[0])
+    half_height = float(scale[2])
+
+    # Profile rings from the bottom cap up to the top cap. The two rings at the
+    # equator radius form the cylindrical section.
+    rings = []
+    for step in range(1, _CAPSULE_RINGS + 1):
+        theta = 0.5 * np.pi * step / _CAPSULE_RINGS
+        rings.append(
+            (radius * np.sin(theta), -half_height - radius * np.cos(theta)))
+    for step in range(_CAPSULE_RINGS, 0, -1):
+        theta = 0.5 * np.pi * step / _CAPSULE_RINGS
+        rings.append(
+            (radius * np.sin(theta), half_height + radius * np.cos(theta)))
+
+    vertices = [(0.0, 0.0, -half_height - radius)]
+    for ring_radius, z in rings:
+        for segment in range(_CAPSULE_SEGMENTS):
+            phi = 2.0 * np.pi * segment / _CAPSULE_SEGMENTS
+            vertices.append(
+                (ring_radius * np.cos(phi), ring_radius * np.sin(phi), z))
+    vertices.append((0.0, 0.0, half_height + radius))
+
+    bottom_pole = 0
+    top_pole = len(vertices) - 1
+
+    def vertex_of(ring, segment):
+        return 1 + ring * _CAPSULE_SEGMENTS + segment % _CAPSULE_SEGMENTS
+
+    # Winding is chosen so that every face normal points away from the axis.
+    faces = []
+    for segment in range(_CAPSULE_SEGMENTS):
+        faces.append(
+            (bottom_pole, vertex_of(0, segment + 1), vertex_of(0, segment)))
+    for ring in range(len(rings) - 1):
+        for segment in range(_CAPSULE_SEGMENTS):
+            lower_a = vertex_of(ring, segment)
+            lower_b = vertex_of(ring, segment + 1)
+            upper_b = vertex_of(ring + 1, segment + 1)
+            upper_a = vertex_of(ring + 1, segment)
+            faces.append((lower_a, lower_b, upper_b))
+            faces.append((lower_a, upper_b, upper_a))
+    last_ring = len(rings) - 1
+    for segment in range(_CAPSULE_SEGMENTS):
+        faces.append(
+            (top_pole, vertex_of(last_ring, segment),
+             vertex_of(last_ring, segment + 1)))
+
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(vertices, [], faces)
+    mesh.validate()
+    for polygon in mesh.polygons:
+        polygon.use_smooth = True
+    mesh.update()
+    return bpy.data.objects.new(name, mesh)
+
+
 def get_vertices_and_faces(obj: bpy.types.Object) -> Tuple[np.ndarray, np.ndarray]:
     """Get arrays of vertices and faces for a given blender mesh object.
 

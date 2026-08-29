@@ -271,6 +271,65 @@ class Sphere(PhysicalObject):
     return (-1, -1, -1), (1, 1, 1)
 
 
+def _validate_uniform_radial_scale(shape_name, proposal):
+  """Rejects scales that would imply an elliptical cross-section.
+
+  PyBullet's cylinder and capsule collision shapes take a single radius, so an
+  elliptical mesh would silently disagree with the body being simulated.
+  """
+  scale = proposal["value"]
+  if not np.isclose(scale[0], scale[1]):
+    raise tl.TraitError(
+        f"{shape_name} requires equal X and Y radii ({scale})")
+  return scale
+
+
+class Cylinder(PhysicalObject):
+  """A cylinder whose axis is the local Z axis.
+
+  ``scale`` is (radius, radius, half_height).
+  """
+
+  @tl.default("bounds")
+  def _get_bounds_default(self):
+    return (-1, -1, -1), (1, 1, 1)
+
+  @tl.validate("scale")
+  def _valid_radial_scale(self, proposal):
+    return _validate_uniform_radial_scale("cylinder", proposal)
+
+
+class Capsule(PhysicalObject):
+  """A capsule whose axis is the local Z axis.
+
+  ``scale`` is (radius, radius, cylinder_half_height); the total local half-extent
+  along Z is cylinder_half_height + radius, because of the hemispherical caps.
+  """
+
+  @tl.default("bounds")
+  def _get_bounds_default(self):
+    return (-1, -1, -1), (1, 1, 1)
+
+  @tl.validate("scale")
+  def _valid_radial_scale(self, proposal):
+    return _validate_uniform_radial_scale("capsule", proposal)
+
+  @property
+  def bbox_3d(self):
+    """3D bounding box as an array of 8 corners (shape = [8, 3]).
+
+    Overridden because the caps extend the local Z half-extent by one radius
+    beyond what scaling ``bounds`` alone would give.
+    """
+    radius = float(self.scale[0])
+    extents = np.array(
+        [radius, radius, float(self.scale[2]) + radius], dtype=np.float32)
+    corners = itertools.product(*[(-extent, extent) for extent in extents])
+    obj_orientation = pyquat.Quaternion(*self.quaternion)
+    rotated_bbox_points = [obj_orientation.rotate(np.array(x)) for x in corners]
+    return np.array([self.position + x for x in rotated_bbox_points])
+
+
 class FileBasedObject(PhysicalObject):
   asset_id = tl.Unicode()
 
