@@ -17,6 +17,7 @@
 import kubric as kb
 from kubric.simulator.pybullet import PyBullet as KubricSimulator
 import numpy as np
+import pytest
 
 
 def test_basic_simulator():
@@ -50,3 +51,49 @@ def test_simulator_in_loop():
     scene.add(cube)
     simulator.run()
     np.testing.assert_allclose(cube.position[1], -0.5 * 10, atol=0.1)
+
+
+def test_simulator_adds_cylinder_with_expected_extents():
+  scene = kb.Scene(frame_start=0, frame_end=1)
+  simulator = KubricSimulator(scene)
+  cylinder = kb.Cylinder(scale=(0.25, 0.25, 0.75), position=(0, 0, 5),
+                         static=False)
+  scene.add(cylinder)
+
+  body_id = cylinder.linked_objects[simulator]
+  aabb_min, aabb_max = simulator._physics_client.getAABB(body_id)
+  assert aabb_max[2] - aabb_min[2] == pytest.approx(1.5, abs=1e-2)
+  assert aabb_max[0] - aabb_min[0] == pytest.approx(0.5, abs=1e-2)
+
+
+def test_simulator_adds_capsule_with_cap_extents():
+  scene = kb.Scene(frame_start=0, frame_end=1)
+  simulator = KubricSimulator(scene)
+  # height 2 * 0.5 for the cylindrical section, plus a 0.25 radius cap at each end.
+  capsule = kb.Capsule(scale=(0.25, 0.25, 0.5), position=(0, 0, 5), static=False)
+  scene.add(capsule)
+
+  body_id = capsule.linked_objects[simulator]
+  aabb_min, aabb_max = simulator._physics_client.getAABB(body_id)
+  assert aabb_max[2] - aabb_min[2] == pytest.approx(1.5, abs=1e-2)
+  assert aabb_max[0] - aabb_min[0] == pytest.approx(0.5, abs=1e-2)
+
+
+def test_simulator_cylinder_falls_under_gravity():
+  scene = kb.Scene(gravity=(0, 0, -10), frame_start=0, frame_end=24)
+  simulator = KubricSimulator(scene)
+  cylinder = kb.Cylinder(scale=(0.25, 0.25, 0.25), position=(0, 0, 0), mass=1.0)
+  scene.add(cylinder)
+
+  simulator.run()
+  np.testing.assert_allclose(cylinder.position[2], -0.5 * 10, atol=0.1)
+
+
+def test_simulator_capsule_falls_under_gravity():
+  scene = kb.Scene(gravity=(0, 0, -10), frame_start=0, frame_end=24)
+  simulator = KubricSimulator(scene)
+  capsule = kb.Capsule(scale=(0.25, 0.25, 0.25), position=(0, 0, 0), mass=1.0)
+  scene.add(capsule)
+
+  simulator.run()
+  np.testing.assert_allclose(capsule.position[2], -0.5 * 10, atol=0.1)

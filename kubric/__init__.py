@@ -50,6 +50,8 @@ from kubric.core.objects import Object3D
 from kubric.core.objects import PhysicalObject
 from kubric.core.objects import Sphere
 from kubric.core.objects import Cube
+from kubric.core.objects import Cylinder
+from kubric.core.objects import Capsule
 from kubric.core.objects import FileBasedObject
 
 from kubric.kubric_typing import AddAssetFunction

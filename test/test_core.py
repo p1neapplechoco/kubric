@@ -248,6 +248,45 @@ def test_object_aabbox_translation_and_scale():
   assert np.all(upper == (2, 4, 3.5))
 
 
+def test_cylinder_default_bounds_and_aabbox():
+  cylinder = objects.Cylinder(scale=(0.5, 0.5, 1.5))
+  assert np.all(cylinder.bounds[0] == (-1, -1, -1))
+  assert np.all(cylinder.bounds[1] == (1, 1, 1))
+  lower, upper = cylinder.aabbox
+  assert_allclose(lower, (-0.5, -0.5, -1.5), atol=1e-6)
+  assert_allclose(upper, (0.5, 0.5, 1.5), atol=1e-6)
+
+
+def test_capsule_aabbox_includes_hemispherical_caps():
+  capsule = objects.Capsule(scale=(0.5, 0.5, 1.0))
+  lower, upper = capsule.aabbox
+  assert_allclose(lower, (-0.5, -0.5, -1.5), atol=1e-6)
+  assert_allclose(upper, (0.5, 0.5, 1.5), atol=1e-6)
+
+
+def test_capsule_aabbox_follows_rotation():
+  # A quarter turn about Y maps the capsule axis from local Z onto world X.
+  half = np.sqrt(0.5)
+  capsule = objects.Capsule(scale=(0.5, 0.5, 1.0), quaternion=(half, 0, half, 0))
+  lower, upper = capsule.aabbox
+  assert_allclose(lower, (-1.5, -0.5, -0.5), atol=1e-6)
+  assert_allclose(upper, (1.5, 0.5, 0.5), atol=1e-6)
+
+
+def test_cylinder_and_capsule_reject_non_uniform_radii():
+  with pytest.raises(TraitError):
+    objects.Cylinder(scale=(0.5, 0.7, 1.0))
+  with pytest.raises(TraitError):
+    objects.Capsule(scale=(0.5, 0.7, 1.0))
+
+
+def test_cylinder_and_capsule_are_exported_from_kubric():
+  import kubric as kb
+
+  assert kb.Cylinder is objects.Cylinder
+  assert kb.Capsule is objects.Capsule
+
+
 def test_object_aabbox_rotation():
   cube = objects.Cube(look_at=(1, 1, 0))  # 45 degree rotation around z
   lower, upper = cube.aabbox

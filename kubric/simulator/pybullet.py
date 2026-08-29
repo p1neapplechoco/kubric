@@ -151,6 +151,56 @@ class PyBullet(core.View):
 
     return sphere_idx
 
+  @add_asset.register(core.Cylinder)
+  def _add_object(self, obj: core.Cylinder) -> Optional[int]:
+    radius = obj.scale[0]
+    assert radius == obj.scale[1], obj.scale  # only uniform radial scaling
+    collision_idx = self._physics_client.createCollisionShape(
+        pb.GEOM_CYLINDER, radius=radius, height=2 * obj.scale[2])
+    visual_idx = -1
+    mass = 0 if obj.static else obj.mass
+    # useMaximalCoordinates and contactProcessingThreshold are required to
+    # fix the sticky walls issue;
+    # see https://github.com/bulletphysics/bullet3/issues/3094
+    cylinder_idx = self._physics_client.createMultiBody(
+        mass,
+        collision_idx,
+        visual_idx,
+        obj.position,
+        wxyz2xyzw(obj.quaternion),
+        useMaximalCoordinates=True)
+    self._physics_client.changeDynamics(
+        cylinder_idx, -1, contactProcessingThreshold=0)
+    register_physical_object_setters(obj, cylinder_idx, self._physics_client)
+
+    return cylinder_idx
+
+  @add_asset.register(core.Capsule)
+  def _add_object(self, obj: core.Capsule) -> Optional[int]:
+    radius = obj.scale[0]
+    assert radius == obj.scale[1], obj.scale  # only uniform radial scaling
+    # GEOM_CAPSULE height is the cylindrical section only, so the total extent
+    # along the local Z axis is 2 * scale[2] + 2 * radius.
+    collision_idx = self._physics_client.createCollisionShape(
+        pb.GEOM_CAPSULE, radius=radius, height=2 * obj.scale[2])
+    visual_idx = -1
+    mass = 0 if obj.static else obj.mass
+    # useMaximalCoordinates and contactProcessingThreshold are required to
+    # fix the sticky walls issue;
+    # see https://github.com/bulletphysics/bullet3/issues/3094
+    capsule_idx = self._physics_client.createMultiBody(
+        mass,
+        collision_idx,
+        visual_idx,
+        obj.position,
+        wxyz2xyzw(obj.quaternion),
+        useMaximalCoordinates=True)
+    self._physics_client.changeDynamics(
+        capsule_idx, -1, contactProcessingThreshold=0)
+    register_physical_object_setters(obj, capsule_idx, self._physics_client)
+
+    return capsule_idx
+
   @add_asset.register(core.FileBasedObject)
   def _add_object(self, obj: core.FileBasedObject) -> Optional[int]:
     # TODO: support other file-formats
