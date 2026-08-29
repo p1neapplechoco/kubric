@@ -26,15 +26,27 @@ class RedirectStream(object):
       print("commands will have stdout directed to file")
   """
 
+  # On POSIX the process-wide C runtime is reachable as CDLL(None). Windows has no
+  # such handle, so the UCRT (and the legacy CRT, for older toolchains) is probed by
+  # name instead. Flushing is best-effort: failing to flush must never prevent the
+  # file descriptor from being restored in __exit__.
+  _C_RUNTIMES = ("ucrtbase", "msvcrt") if os.name == "nt" else (None,)
+
   @staticmethod
   def _flush_c_stream():
-    libc = ctypes.CDLL(None)
-    libc.fflush(None)
+    for name in RedirectStream._C_RUNTIMES:
+      try:
+        libc = ctypes.CDLL(name)
+        libc.fflush(None)
+      except (OSError, TypeError, AttributeError, ValueError):
+        continue
 
   def __init__(self, stream, filename=os.devnull, disabled=False):
     self.stream = stream
     self.filename = filename
     self.disabled = disabled
+    self.fd = None
+    self.dup_stream = None
 
   def __enter__(self):
     if self.disabled: return
@@ -50,12 +62,15 @@ class RedirectStream(object):
 
   def __exit__(self, _, value, traceback):
     if self.disabled: return
+    RedirectStream._flush_c_stream()  # best-effort; empties the C stream buffer
     try:
-      RedirectStream._flush_c_stream()  # ensures C stream buffer empty
-      os.dup2(self.dup_stream, self.stream.fileno())  # restores stream
-      os.close(self.dup_stream)
-      self.fd.close()
-    except:  # pylint: disable=bare-except
-      # TODO: redirect stream breaks in jupyter notebooks.
-      #       This try except is a hacky workaround
-      pass
+      if self.dup_stream is not None:
+        # Restoring the descriptor must happen even if flushing above did nothing,
+        # otherwise the caller is left with a stream pointing at a closed file.
+        os.dup2(self.dup_stream, self.stream.fileno())
+        os.close(self.dup_stream)
+        self.dup_stream = None
+    finally:
+      if self.fd is not None:
+        self.fd.close()
+        self.fd = None

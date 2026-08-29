@@ -28,12 +28,8 @@ from typing import Any, ClassVar, Optional, Tuple, Union
 
 import numpy as np
 
+from interventions import _portability
 from interventions.schema import SCHEMA_VERSION, to_jsonable
-
-try:
-  import fcntl
-except ImportError:  # pragma: no cover - exercised only off POSIX platforms.
-  fcntl = None
 
 
 POSITION_SLICE = slice(0, 3)
@@ -500,33 +496,13 @@ def _write_temp(directory: Path, prefix: str, payload: bytes) -> Path:
 
 
 def _fsync_directory(directory: Path) -> None:
-  flags = os.O_RDONLY
-  if hasattr(os, "O_DIRECTORY"):
-    flags |= os.O_DIRECTORY
-  file_descriptor = os.open(str(directory), flags)
-  try:
-    os.fsync(file_descriptor)
-  finally:
-    os.close(file_descriptor)
+  _portability.fsync_directory(directory)
 
 
 @contextmanager
 def _publisher_lock(directory: Path):
-  if fcntl is None:
-    raise RuntimeError(
-        "simulation-log publication requires advisory file locking"
-    )
-  file_descriptor = os.open(
-      str(directory / _LOCK_FILENAME), os.O_CREAT | os.O_RDWR, 0o600
-  )
-  try:
-    fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+  with _portability.exclusive_lock(directory / _LOCK_FILENAME):
     yield
-  finally:
-    try:
-      fcntl.flock(file_descriptor, fcntl.LOCK_UN)
-    finally:
-      os.close(file_descriptor)
 
 
 def _create_artifact_root(target: Path) -> None:

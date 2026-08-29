@@ -34,11 +34,7 @@ from typing import Any, Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-try:
-  import fcntl
-except ImportError:  # pragma: no cover - dataset generation targets POSIX workers.
-  fcntl = None
-
+from interventions import _portability
 from interventions.logging import (
     ANGULAR_VELOCITY_SLICE,
     LINEAR_VELOCITY_SLICE,
@@ -1240,36 +1236,20 @@ def assign_grouped_splits(
 
 
 def _fsync_directory(directory: Path) -> None:
-  flags = os.O_RDONLY
-  if hasattr(os, "O_DIRECTORY"):
-    flags |= os.O_DIRECTORY
-  descriptor = os.open(str(directory), flags)
-  try:
-    os.fsync(descriptor)
-  finally:
-    os.close(descriptor)
+  _portability.fsync_directory(directory)
 
 
 @contextmanager
 def _dataset_lock(root: Path):
-  if fcntl is None:
-    raise RuntimeError("dataset publication requires POSIX advisory locking")
   root.parent.mkdir(parents=True, exist_ok=True)
   lock_path = root.parent / ".{}.dataset.lock".format(root.name)
-  descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
   try:
-    try:
-      fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as error:
-      raise RuntimeError(
-          "dataset output is locked by another writer: {}".format(root)
-      ) from error
-    yield
-  finally:
-    try:
-      fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-      os.close(descriptor)
+    with _portability.exclusive_lock(lock_path, blocking=False):
+      yield
+  except BlockingIOError as error:
+    raise RuntimeError(
+        "dataset output is locked by another writer: {}".format(root)
+    ) from error
 
 
 def _write_once(path: Path, payload: bytes) -> None:

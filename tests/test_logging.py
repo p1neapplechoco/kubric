@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 import interventions.logging as logging_module
+from interventions import _portability
 from interventions.logging import (
     ANGULAR_VELOCITY_SLICE,
     LINEAR_VELOCITY_SLICE,
@@ -549,9 +550,14 @@ def test_write_simulation_log_publishes_generation_then_manifest_and_fsyncs(
   assert replacements[0][0].parent == directory
   assert replacements[0][0].name.startswith(".manifest.")
   assert publication_events == ["generation", "manifest"]
-  # Temporary generation, generations/, artifact root, and newly created
-  # artifact root's parent are all durably synchronized.
-  assert len(directory_fsyncs) >= 4
+  if _portability.DIRECTORY_FSYNC_SUPPORTED:
+    # Temporary generation, generations/, artifact root, and newly created
+    # artifact root's parent are all durably synchronized.
+    assert len(directory_fsyncs) >= 4
+  else:
+    # Windows cannot open a directory to flush it, so the publication ordering
+    # asserted above is the whole of the guarantee available there.
+    assert directory_fsyncs == []
 
 
 @pytest.mark.parametrize("failure_boundary", ["generation", "manifest"])

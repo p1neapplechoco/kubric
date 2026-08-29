@@ -28,11 +28,7 @@ import numpy as np
 
 import kubric as kb
 
-try:
-  import fcntl
-except ImportError:  # pragma: no cover - pair publication targets POSIX workers.
-  fcntl = None
-
+from interventions import _portability
 from interventions.graph_extraction import extract_ground_truth
 from interventions.kinematic_simulator import KinematicDragSimulator
 from interventions.logging import (
@@ -1299,33 +1295,15 @@ def _write_temp(directory: Path, prefix: str, payload: bytes) -> Path:
 
 
 def _fsync_directory(directory: Path) -> None:
-  flags = os.O_RDONLY
-  if hasattr(os, "O_DIRECTORY"):
-    flags |= os.O_DIRECTORY
-  descriptor = os.open(str(directory), flags)
-  try:
-    os.fsync(descriptor)
-  finally:
-    os.close(descriptor)
+  _portability.fsync_directory(directory)
 
 
 @contextmanager
 def _pair_publisher_lock(target: Path):
-  """Serializes pair-pointer updates by locking the artifact parent inode."""
-  if fcntl is None:
-    raise RuntimeError("paired artifact publication requires advisory locking")
-  flags = os.O_RDONLY
-  if hasattr(os, "O_DIRECTORY"):
-    flags |= os.O_DIRECTORY
-  descriptor = os.open(str(target.parent), flags)
-  try:
-    fcntl.flock(descriptor, fcntl.LOCK_EX)
+  """Serializes pair-pointer updates for one artifact target."""
+  lock_path = target.parent / ".{}.pair.lock".format(target.name)
+  with _portability.exclusive_lock(lock_path):
     yield
-  finally:
-    try:
-      fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-      os.close(descriptor)
 
 
 def _generation_file_records(directory: Path) -> Mapping[str, Mapping[str, Any]]:
