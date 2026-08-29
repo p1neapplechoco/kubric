@@ -27,12 +27,15 @@ class BackendBlocker(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, BackendBlocker())
 
 import interventions
+from interventions.appearance import MaterialSpec, TextureSpec, VisualObjectSpec
 from interventions.graph_extraction import TemporalGraph, extract_ground_truth
 from interventions.logging import ContactRecord, SimulationLog
 from interventions.schema import GroundTruth, SceneConfig
 from interventions.tagging import derive_tags
 from interventions.trajectory import build_path, validate_path
 
+assert TextureSpec(kind="solid", colors=((0.0, 0.0, 0.0, 1.0),)).kind == "solid"
+assert MaterialSpec is not None and VisualObjectSpec is not None
 assert interventions.TemporalGraph is TemporalGraph
 assert interventions.extract_ground_truth is extract_ground_truth
 assert interventions.ContactRecord is ContactRecord

@@ -13,6 +13,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 _MODULE_PATHS = (
     "interventions/__init__.py",
     "interventions/_portability.py",
+    "interventions/appearance.py",
     "interventions/dataset.py",
     "interventions/graph_extraction.py",
     "interventions/kinematic_simulator.py",
