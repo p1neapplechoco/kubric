@@ -2,8 +2,11 @@
 
 Purpose: define frozen, validated visual values and their canonical JSON form.
 Public API: APPEARANCE_SCHEMA_VERSION, TEXTURE_KINDS, MATERIAL_FAMILIES, SOURCE_KINDS,
-MATERIAL_MODES, COLOR_SPACES, IMAGE_ROLES, ImageReference, TextureSpec, MaterialSpec,
-AssetReference, and VisualObjectSpec.
+MATERIAL_MODES, COLOR_SPACES, IMAGE_ROLES, LIGHT_KINDS, BACKGROUND_KINDS, RENDER_DEVICES,
+RENDER_LAYERS, SMOKE_PROFILE, PRODUCTION_PROFILE, PROFILES_BY_NAME, ImageReference,
+TextureSpec, MaterialSpec, AssetReference, VisualObjectSpec, CameraRenderSpec, LightSpec,
+BackgroundSpec, RenderProfile, VisualSceneSpec, visual_scene_hash, render_profile_hash,
+validate_scene_correspondence, and frame_steps_for.
 Dependencies: Python's standard library and interventions.schema helpers only, so
 appearance never imports Kubric, Blender, or a simulator backend.
 Trust boundary: validation enforces value ranges, enum membership, and JSON safety;
@@ -12,11 +15,15 @@ it does not verify that a referenced asset or image exists or is authentic.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple
+from types import MappingProxyType
+from typing import Any, Mapping, Optional, Tuple
 
 from interventions.schema import (
+    SceneConfig,
     _integer,
     _nonempty_string,
     _real,
@@ -36,6 +43,19 @@ MATERIAL_FAMILIES = frozenset(
 SOURCE_KINDS = frozenset(("procedural", "kubasic", "gso"))
 MATERIAL_MODES = frozenset(("native", "override"))
 COLOR_SPACES = frozenset(("sRGB", "Non-Color"))
+LIGHT_KINDS = frozenset(("directional", "point", "spot", "rect_area"))
+BACKGROUND_KINDS = frozenset(("color", "hdri"))
+RENDER_DEVICES = frozenset(("CPU", "GPU"))
+
+RENDER_LAYERS = (
+    "rgba",
+    "segmentation",
+    "depth",
+    "normal",
+    "forward_flow",
+    "backward_flow",
+    "object_coordinates",
+)
 
 _COLOR_ROLES = frozenset(("base_color", "emission"))
 _NON_COLOR_ROLES = frozenset(("roughness", "metallic", "normal", "height"))
@@ -91,6 +111,29 @@ def _appearance_version(value: Any) -> str:
         "schema_version must be {!r}".format(APPEARANCE_SCHEMA_VERSION)
     )
   return APPEARANCE_SCHEMA_VERSION
+
+
+def _canonical_bytes(payload: Any) -> bytes:
+  """Serializes a JSON-safe payload to the repository's canonical byte form."""
+  return json.dumps(
+      payload,
+      sort_keys=True,
+      separators=(",", ":"),
+      ensure_ascii=False,
+      allow_nan=False,
+  ).encode("utf-8")
+
+
+def _points(value: Any, name: str) -> Tuple[Tuple[float, float, float], ...]:
+  if isinstance(value, (str, bytes)):
+    raise TypeError("{} must be a sequence of XYZ vectors".format(name))
+  points = tuple(
+      _vector(point, 3, "{}[{}]".format(name, index))
+      for index, point in enumerate(tuple(value))
+  )
+  if not points:
+    raise ValueError("{} must not be empty".format(name))
+  return points
 
 
 def _unit_quaternion(value: Any, name: str) -> Tuple[float, float, float, float]:
@@ -331,17 +374,406 @@ class VisualObjectSpec(_SchemaMixin):
     )
 
 
+@dataclass(frozen=True)
+class CameraRenderSpec(_SchemaMixin):
+  """A per-frame camera path plus the intrinsics needed to reproduce it.
+
+  ``positions`` and ``look_ats`` are indexed by output frame, so a static camera
+  is expressed as a repeated entry rather than as a separate mode.
+  """
+
+  positions: Tuple[Tuple[float, float, float], ...]
+  look_ats: Tuple[Tuple[float, float, float], ...]
+  focal_length: float
+  sensor_width: float
+  clipping_range: Tuple[float, float]
+  schema_version: str = APPEARANCE_SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    positions = _points(self.positions, "positions")
+    look_ats = _points(self.look_ats, "look_ats")
+    if len(look_ats) != len(positions):
+      raise ValueError("look_ats must have the same length as positions")
+    for index, (position, look_at) in enumerate(zip(positions, look_ats)):
+      if position == look_at:
+        raise ValueError(
+            "positions[{0}] and look_ats[{0}] must differ".format(index)
+        )
+
+    clipping_range = _vector(self.clipping_range, 2, "clipping_range")
+    if not 0.0 < clipping_range[0] < clipping_range[1]:
+      raise ValueError("clipping_range must satisfy 0 < near < far")
+
+    object.__setattr__(self, "positions", positions)
+    object.__setattr__(self, "look_ats", look_ats)
+    object.__setattr__(
+        self, "focal_length", _positive(self.focal_length, "focal_length")
+    )
+    object.__setattr__(
+        self, "sensor_width", _positive(self.sensor_width, "sensor_width")
+    )
+    object.__setattr__(self, "clipping_range", clipping_range)
+    object.__setattr__(
+        self, "schema_version", _appearance_version(self.schema_version)
+    )
+
+
+@dataclass(frozen=True)
+class LightSpec(_SchemaMixin):
+  """One light, carrying only the parameters its kind actually uses.
+
+  Parameters that do not apply to a kind must be ``None`` rather than a default,
+  so that two scenes differing only in an unused field cannot hash differently.
+  """
+
+  light_id: str
+  kind: str
+  position: Tuple[float, float, float]
+  look_at: Tuple[float, float, float]
+  color: Tuple[float, float, float, float]
+  intensity: float
+  width: Optional[float] = None
+  height: Optional[float] = None
+  spot_size: Optional[float] = None
+  spot_blend: Optional[float] = None
+  schema_version: str = APPEARANCE_SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    kind = _enum(self.kind, LIGHT_KINDS, "kind")
+
+    if kind == "rect_area":
+      if self.width is None or self.height is None:
+        raise ValueError("width and height are required for rect_area lights")
+      width = _positive(self.width, "width")
+      height = _positive(self.height, "height")
+    else:
+      if self.width is not None or self.height is not None:
+        raise ValueError("width and height apply only to rect_area lights")
+      width = None
+      height = None
+
+    if kind == "spot":
+      if self.spot_size is None or self.spot_blend is None:
+        raise ValueError("spot_size and spot_blend are required for spot lights")
+      spot_size = _real(self.spot_size, "spot_size")
+      if not 0.0 < spot_size <= math.pi:
+        raise ValueError("spot_size must lie in (0, pi]")
+      spot_blend = _unit(self.spot_blend, "spot_blend")
+    else:
+      if self.spot_size is not None or self.spot_blend is not None:
+        raise ValueError("spot_size and spot_blend apply only to spot lights")
+      spot_size = None
+      spot_blend = None
+
+    object.__setattr__(self, "light_id", _nonempty_string(self.light_id, "light_id"))
+    object.__setattr__(self, "kind", kind)
+    object.__setattr__(self, "position", _vector(self.position, 3, "position"))
+    object.__setattr__(self, "look_at", _vector(self.look_at, 3, "look_at"))
+    object.__setattr__(self, "color", _rgba(self.color, "color"))
+    object.__setattr__(self, "intensity", _positive(self.intensity, "intensity"))
+    object.__setattr__(self, "width", width)
+    object.__setattr__(self, "height", height)
+    object.__setattr__(self, "spot_size", spot_size)
+    object.__setattr__(self, "spot_blend", spot_blend)
+    object.__setattr__(
+        self, "schema_version", _appearance_version(self.schema_version)
+    )
+
+
+@dataclass(frozen=True)
+class BackgroundSpec(_SchemaMixin):
+  """A flat color or an HDRI environment, never both."""
+
+  kind: str
+  color: Optional[Tuple[float, float, float, float]] = None
+  hdri: Optional[ImageReference] = None
+  rotation: float = 0.0
+  strength: float = 1.0
+  exposure: float = 0.0
+  schema_version: str = APPEARANCE_SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    kind = _enum(self.kind, BACKGROUND_KINDS, "kind")
+    if self.hdri is not None and not isinstance(self.hdri, ImageReference):
+      raise TypeError("hdri must be an ImageReference or None")
+
+    if kind == "color":
+      if self.color is None or self.hdri is not None:
+        raise ValueError("color backgrounds require color and no hdri")
+      color = _rgba(self.color, "color")
+      hdri = None
+    else:
+      if self.hdri is None or self.color is not None:
+        raise ValueError("hdri backgrounds require hdri and no color")
+      if self.hdri.role != "base_color":
+        raise ValueError("hdri must use the base_color role")
+      color = None
+      hdri = self.hdri
+
+    exposure = _real(self.exposure, "exposure")
+    if not -10.0 <= exposure <= 10.0:
+      raise ValueError("exposure must lie in [-10, 10]")
+
+    object.__setattr__(self, "kind", kind)
+    object.__setattr__(self, "color", color)
+    object.__setattr__(self, "hdri", hdri)
+    object.__setattr__(self, "rotation", _unit(self.rotation, "rotation"))
+    object.__setattr__(self, "strength", _positive(self.strength, "strength"))
+    object.__setattr__(self, "exposure", exposure)
+    object.__setattr__(
+        self, "schema_version", _appearance_version(self.schema_version)
+    )
+
+
+@dataclass(frozen=True)
+class RenderProfile(_SchemaMixin):
+  """Renderer cost and output settings, independent of any particular scene."""
+
+  name: str
+  resolution: Tuple[int, int]
+  samples_per_pixel: int
+  adaptive_sampling: bool
+  use_denoising: bool
+  background_transparency: bool
+  layers: Tuple[str, ...] = RENDER_LAYERS
+  device: str = "CPU"
+  schema_version: str = APPEARANCE_SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    for name in ("adaptive_sampling", "use_denoising", "background_transparency"):
+      if not isinstance(getattr(self, name), bool):
+        raise TypeError("{} must be a bool".format(name))
+
+    if len(tuple(self.resolution)) != 2:
+      raise ValueError("resolution must contain width and height")
+    resolution = tuple(
+        _integer(value, "resolution[{}]".format(index))
+        for index, value in enumerate(self.resolution)
+    )
+    if any(value <= 0 for value in resolution):
+      raise ValueError("resolution components must be positive")
+
+    samples_per_pixel = _integer(self.samples_per_pixel, "samples_per_pixel")
+    if samples_per_pixel < 1:
+      raise ValueError("samples_per_pixel must be at least 1")
+
+    if isinstance(self.layers, (str, bytes)):
+      raise TypeError("layers must be a sequence of layer names")
+    layers = tuple(self.layers)
+    for layer in layers:
+      _enum(layer, frozenset(RENDER_LAYERS), "layers")
+    if not layers:
+      raise ValueError("layers must not be empty")
+    if len(set(layers)) != len(layers):
+      raise ValueError("layers must not repeat a name")
+    # Order follows RENDER_LAYERS so that two profiles requesting the same set of
+    # layers in a different order produce the same hash.
+    layers = tuple(layer for layer in RENDER_LAYERS if layer in set(layers))
+
+    object.__setattr__(self, "name", _nonempty_string(self.name, "name"))
+    object.__setattr__(self, "resolution", resolution)
+    object.__setattr__(self, "samples_per_pixel", samples_per_pixel)
+    object.__setattr__(self, "layers", layers)
+    object.__setattr__(self, "device", _enum(self.device, RENDER_DEVICES, "device"))
+    object.__setattr__(
+        self, "schema_version", _appearance_version(self.schema_version)
+    )
+
+
+@dataclass(frozen=True)
+class VisualSceneSpec(_SchemaMixin):
+  """Everything needed to render one simulated scene, minus the renderer settings.
+
+  ``frame_steps`` names the physics step each output frame samples, which is what
+  binds a rendered frame back to a row of the simulation log.
+  """
+
+  objects: Tuple[VisualObjectSpec, ...]
+  camera: CameraRenderSpec
+  lights: Tuple[LightSpec, ...]
+  background: BackgroundSpec
+  render_seed: int
+  frame_steps: Tuple[int, ...]
+  schema_version: str = APPEARANCE_SCHEMA_VERSION
+
+  def __post_init__(self) -> None:
+    if not isinstance(self.camera, CameraRenderSpec):
+      raise TypeError("camera must be a CameraRenderSpec")
+    if not isinstance(self.background, BackgroundSpec):
+      raise TypeError("background must be a BackgroundSpec")
+
+    if isinstance(self.objects, (str, bytes)):
+      raise TypeError("objects must be a sequence of VisualObjectSpec")
+    objects = tuple(self.objects)
+    for item in objects:
+      if not isinstance(item, VisualObjectSpec):
+        raise TypeError("objects must contain only VisualObjectSpec values")
+    if not objects:
+      raise ValueError("objects must not be empty")
+    object_ids = [item.object_id for item in objects]
+    if len(set(object_ids)) != len(object_ids):
+      raise ValueError("object_id values must be unique")
+    objects = tuple(sorted(objects, key=lambda item: item.object_id))
+
+    if isinstance(self.lights, (str, bytes)):
+      raise TypeError("lights must be a sequence of LightSpec")
+    lights = tuple(self.lights)
+    for light in lights:
+      if not isinstance(light, LightSpec):
+        raise TypeError("lights must contain only LightSpec values")
+    if not lights:
+      raise ValueError("lights must not be empty")
+    light_ids = [light.light_id for light in lights]
+    if len(set(light_ids)) != len(light_ids):
+      raise ValueError("light_id values must be unique")
+    lights = tuple(sorted(lights, key=lambda light: light.light_id))
+
+    if isinstance(self.frame_steps, (str, bytes)):
+      raise TypeError("frame_steps must be a sequence of integers")
+    frame_steps = tuple(
+        _integer(step, "frame_steps[{}]".format(index))
+        for index, step in enumerate(tuple(self.frame_steps))
+    )
+    if not frame_steps:
+      raise ValueError("frame_steps must not be empty")
+    if frame_steps[0] < 0:
+      raise ValueError("frame_steps must be nonnegative")
+    if any(later <= earlier
+           for earlier, later in zip(frame_steps, frame_steps[1:])):
+      raise ValueError("frame_steps must be strictly increasing")
+    if len(frame_steps) != len(self.camera.positions):
+      raise ValueError("frame_steps must have one entry per camera position")
+
+    render_seed = _integer(self.render_seed, "render_seed")
+    if render_seed < 0:
+      raise ValueError("render_seed must be nonnegative")
+
+    object.__setattr__(self, "objects", objects)
+    object.__setattr__(self, "lights", lights)
+    object.__setattr__(self, "frame_steps", frame_steps)
+    object.__setattr__(self, "render_seed", render_seed)
+    object.__setattr__(
+        self, "schema_version", _appearance_version(self.schema_version)
+    )
+
+
+def visual_scene_hash(spec: VisualSceneSpec) -> str:
+  """Returns the SHA-256 digest of a visual scene's canonical JSON form."""
+  if not isinstance(spec, VisualSceneSpec):
+    raise TypeError("spec must be a VisualSceneSpec")
+  return hashlib.sha256(_canonical_bytes(spec.to_dict())).hexdigest()
+
+
+def render_profile_hash(profile: RenderProfile) -> str:
+  """Returns the SHA-256 digest of a render profile's canonical JSON form."""
+  if not isinstance(profile, RenderProfile):
+    raise TypeError("profile must be a RenderProfile")
+  return hashlib.sha256(_canonical_bytes(profile.to_dict())).hexdigest()
+
+
+def frame_steps_for(scene: SceneConfig) -> Tuple[int, ...]:
+  """Returns the physics step sampled by each output frame of ``scene``."""
+  if not isinstance(scene, SceneConfig):
+    raise TypeError("scene must be a SceneConfig")
+  steps_per_frame = scene.step_rate // scene.frame_rate
+  start, end = scene.frame_range
+  return tuple((frame - start) * steps_per_frame for frame in range(start, end))
+
+
+def validate_scene_correspondence(
+    visual: VisualSceneSpec, scene: SceneConfig
+) -> None:
+  """Raises ``ValueError`` unless ``visual`` renders exactly ``scene``.
+
+  This is the guard that keeps rendered pixels attributable to logged physics: a
+  visual object with no simulated counterpart would be unexplained in the
+  annotations, and a simulated object with no visual counterpart would be invisible.
+  """
+  if not isinstance(visual, VisualSceneSpec):
+    raise TypeError("visual must be a VisualSceneSpec")
+  if not isinstance(scene, SceneConfig):
+    raise TypeError("scene must be a SceneConfig")
+
+  simulated = {item.object_id for item in scene.objects}
+  rendered = {item.object_id for item in visual.objects}
+  if simulated != rendered:
+    difference = sorted(simulated.symmetric_difference(rendered))
+    raise ValueError(
+        "visual and simulated object sets differ: {}".format(difference)
+    )
+
+  for item in visual.objects:
+    if item.collision_proxy_id not in simulated:
+      raise ValueError(
+          "collision_proxy_id {!r} names no simulated object".format(
+              item.collision_proxy_id
+          )
+      )
+
+  expected_steps = frame_steps_for(scene)
+  if visual.frame_steps != expected_steps:
+    raise ValueError(
+        "frame_steps {} do not match the scene frame range {}".format(
+            list(visual.frame_steps), list(expected_steps)
+        )
+    )
+
+
+SMOKE_PROFILE = RenderProfile(
+    name="smoke",
+    resolution=(64, 64),
+    samples_per_pixel=1,
+    adaptive_sampling=False,
+    use_denoising=False,
+    background_transparency=False,
+    layers=RENDER_LAYERS,
+    device="CPU",
+)
+
+PRODUCTION_PROFILE = RenderProfile(
+    name="production",
+    resolution=(256, 256),
+    samples_per_pixel=64,
+    adaptive_sampling=True,
+    use_denoising=True,
+    background_transparency=False,
+    layers=RENDER_LAYERS,
+    device="CPU",
+)
+
+PROFILES_BY_NAME: Mapping[str, RenderProfile] = MappingProxyType({
+    SMOKE_PROFILE.name: SMOKE_PROFILE,
+    PRODUCTION_PROFILE.name: PRODUCTION_PROFILE,
+})
+
+
 __all__ = [
     "APPEARANCE_SCHEMA_VERSION",
+    "BACKGROUND_KINDS",
     "COLOR_SPACES",
     "IMAGE_ROLES",
+    "LIGHT_KINDS",
     "MATERIAL_FAMILIES",
     "MATERIAL_MODES",
+    "PRODUCTION_PROFILE",
+    "PROFILES_BY_NAME",
+    "RENDER_DEVICES",
+    "RENDER_LAYERS",
+    "SMOKE_PROFILE",
     "SOURCE_KINDS",
     "TEXTURE_KINDS",
     "AssetReference",
+    "BackgroundSpec",
+    "CameraRenderSpec",
     "ImageReference",
+    "LightSpec",
     "MaterialSpec",
+    "RenderProfile",
     "TextureSpec",
     "VisualObjectSpec",
+    "VisualSceneSpec",
+    "frame_steps_for",
+    "render_profile_hash",
+    "validate_scene_correspondence",
+    "visual_scene_hash",
 ]
