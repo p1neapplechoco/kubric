@@ -14,14 +14,14 @@ branches:
 
 Then regenerate the synchronized comparison video
 `trajectory_intervention_demo.mp4`. If and only if the run succeeds, rewrite
-`render.md` into a thesis-conda-only guide that removes Docker instructions.
+`render_no_docker.md` into a thesis-conda-only guide that removes Docker instructions.
 
 ## Scope
 
 - Use existing CLI modules in `scripts/` without introducing a new wrapper.
 - Keep canonical branch semantics and synchronization guarantees unchanged.
 - Keep full-length rendering (no smoke truncation).
-- Update docs tightly coupled to this workflow (`render.md`, and nearby stale
+- Update docs tightly coupled to this workflow (`render_no_docker.md`, and nearby stale
   wording only when directly related).
 
 ## Non-Goals
@@ -74,9 +74,9 @@ The run succeeds only when all four outputs exist and are non-empty in
 - `target_removed_blender.mp4`
 - `trajectory_intervention_demo.mp4`
 
-## Documentation Rewrite Design (`render.md`)
+## Documentation Rewrite Design (`render_no_docker.md`)
 
-After successful run, rewrite `render.md` to:
+After successful run, rewrite `render_no_docker.md` to:
 
 - center on thesis Conda execution on Windows;
 - remove Docker installation/runtime guidance;
@@ -99,4 +99,3 @@ After successful run, rewrite `render.md` to:
 - Targeted regression checks for touched rendering workflow/tests:
   `tests/test_render_demo_branches_blender.py` (and any directly coupled tests
   if code edits require them).
-

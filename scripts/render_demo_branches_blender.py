@@ -831,6 +831,37 @@ def _encoder_backend(available_formats: Sequence[str]) -> str:
   return "blender" if "FFMPEG" in available_formats else "imageio"
 
 
+def _native_ffmpeg_movie_supported(bpy, blender_scene, output: Path) -> bool:
+  """Verifies this Blender build can actually mux an FFmpeg movie.
+
+  Some pip-distributed ``bpy`` wheels list ``FFMPEG`` in the image-format
+  enum without a functional muxer compiled in, so the enum alone is not a
+  reliable signal. Render one throwaway frame at the current output settings
+  and confirm Blender actually wrote a non-empty file before committing to
+  the full animation render.
+  """
+  probe_dir = Path(
+      tempfile.mkdtemp(prefix="kubric-ffmpeg-probe-", dir=str(output.parent))
+  )
+  saved_filepath = blender_scene.render.filepath
+  saved_frame_start = blender_scene.frame_start
+  saved_frame_end = blender_scene.frame_end
+  saved_frame_current = blender_scene.frame_current
+  try:
+    probe_output = probe_dir / "probe.mp4"
+    blender_scene.render.filepath = str(probe_output)
+    blender_scene.frame_start = saved_frame_current
+    blender_scene.frame_end = saved_frame_current
+    bpy.ops.render.render(animation=True)
+    return probe_output.is_file() and probe_output.stat().st_size >= 1
+  finally:
+    blender_scene.render.filepath = saved_filepath
+    blender_scene.frame_start = saved_frame_start
+    blender_scene.frame_end = saved_frame_end
+    blender_scene.frame_current = saved_frame_current
+    shutil.rmtree(probe_dir, ignore_errors=True)
+
+
 def _require_imageio_ffmpeg():
   """Imports the fallback encoder before any expensive Blender work."""
   try:
@@ -949,18 +980,37 @@ def _render_animation_mp4(
     _encode_mp4(output, frames_dict["rgba"], frame_rate)
     return
 
+  original_file_format = blender_scene.render.image_settings.file_format
+  original_use_file_extension = blender_scene.render.use_file_extension
+  original_use_nodes = blender_scene.use_nodes
+
   renderer.set_exr_output_path(None)
   blender_scene.use_nodes = False
   # Blender otherwise appends the rendered frame range to the movie filename.
   blender_scene.render.use_file_extension = False
-  blender_scene.render.filepath = str(output)
   blender_scene.render.image_settings.file_format = "FFMPEG"
   blender_scene.render.ffmpeg.format = "MPEG4"
   blender_scene.render.ffmpeg.codec = "H264"
   blender_scene.render.ffmpeg.constant_rate_factor = "MEDIUM"
   blender_scene.render.ffmpeg.ffmpeg_preset = "GOOD"
   blender_scene.render.ffmpeg.audio_codec = "NONE"
-  bpy.ops.render.render(animation=True)
+  if _native_ffmpeg_movie_supported(bpy, blender_scene, output):
+    blender_scene.render.filepath = str(output)
+    bpy.ops.render.render(animation=True)
+    if not output.is_file() or output.stat().st_size < 1:
+      raise RuntimeError(f"Blender did not produce the expected MP4: {output}")
+    return
+
+  # Some pip-distributed Blender builds list FFMPEG in the format enum
+  # without a functional muxer; fall back to the portable ImageIO encoder.
+  # Restore the still-image format and compositor node graph first: Blender's
+  # per-frame stills API rejects an animation-only format selection, and
+  # ``renderer.render()`` reads RGBA/EXR layers produced by the compositor.
+  blender_scene.render.image_settings.file_format = original_file_format
+  blender_scene.render.use_file_extension = original_use_file_extension
+  blender_scene.use_nodes = original_use_nodes
+  frames_dict = renderer.render(return_layers=("rgba",))
+  _encode_mp4(output, frames_dict["rgba"], frame_rate)
   if not output.is_file() or output.stat().st_size < 1:
     raise RuntimeError(f"Blender did not produce the expected MP4: {output}")
 
