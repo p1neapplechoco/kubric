@@ -107,35 +107,12 @@ scene += kb.PerspectiveCamera(name="camera", position=(3, -1, 4),
 scene += kb.Sphere(name="ball", scale=1, position=(0, 0, 1.0))
 ```
 
-### Step 3 — Keyframe animated properties
+### Step 3 — Create the renderer
 
-Use `keyframe_insert` to animate any property over time:
-
-```python
-# Frame 1: ball at z=1
-scene.objects["ball"].position = (0, 0, 1.0)
-scene.objects["ball"].keyframe_insert("position", frame=1)
-
-# Frame 60: ball at z=3
-scene.objects["ball"].position = (0, 0, 3.0)
-scene.objects["ball"].keyframe_insert("position", frame=60)
-```
-
-Camera paths are keyframed the same way:
-
-```python
-scene.camera.position = (3, -1, 4)
-scene.camera.look_at((0, 0, 1))
-scene.camera.keyframe_insert("position", frame=1)
-scene.camera.keyframe_insert("quaternion", frame=1)
-
-scene.camera.position = (-3, -1, 4)
-scene.camera.look_at((0, 0, 2))
-scene.camera.keyframe_insert("position", frame=60)
-scene.camera.keyframe_insert("quaternion", frame=60)
-```
-
-### Step 4 — Create the renderer
+> ⚠️ **Important:** The renderer must be created **before** inserting any keyframes.
+> Kubric uses a traitlets observer system — the renderer subscribes to scene events when it is
+> instantiated. Keyframes inserted before the renderer exists are never forwarded to Blender's
+> animation curves and will have no effect at render time.
 
 ```python
 from kubric.renderer.blender import Blender as KubricRenderer
@@ -159,6 +136,38 @@ renderer = KubricRenderer(
 | `background_transparency` | `False` | Renders alpha channel in background |
 | `motion_blur` | `None` | Enable motion blur (pass shutter duration in frames) |
 | `custom_scene` | `None` | Path to a `.blend` file to load as the base scene |
+
+### Step 4 — Keyframe animated properties
+
+Always keep a direct Python reference to the object you want to animate — `scene.assets`
+returns a tuple, not a dict, so there is no name-based lookup.
+
+```python
+ball = kb.Sphere(name="ball", scale=1, position=(0, 0, 1.0))
+scene += ball
+
+# renderer must already exist at this point (see Step 3)
+
+ball.position = (0, 0, 1.0)
+ball.keyframe_insert("position", frame=1)
+
+ball.position = (0, 0, 3.0)
+ball.keyframe_insert("position", frame=60)
+```
+
+Camera paths are keyframed the same way:
+
+```python
+scene.camera.position = (3, -1, 4)
+scene.camera.look_at((0, 0, 1))
+scene.camera.keyframe_insert("position", frame=1)
+scene.camera.keyframe_insert("quaternion", frame=1)
+
+scene.camera.position = (-3, -1, 4)
+scene.camera.look_at((0, 0, 2))
+scene.camera.keyframe_insert("position", frame=60)
+scene.camera.keyframe_insert("quaternion", frame=60)
+```
 
 ### Step 5 — Render all frames
 
@@ -279,25 +288,26 @@ scene.frame_rate  = 24
 
 # --- Populate scene
 scene += kb.Cube(name="floor", scale=(10, 10, 0.1), position=(0, 0, -0.1))
-scene += kb.Sphere(name="ball", scale=1, position=(0, 0, 1.0))
+ball = kb.Sphere(name="ball", scale=1, position=(0, 0, 1.0))
+scene += ball
 scene += kb.DirectionalLight(name="sun", position=(-1, -0.5, 3),
                               look_at=(0, 0, 0), intensity=1.5)
 scene += kb.PerspectiveCamera(name="camera", position=(3, -1, 4),
                                look_at=(0, 0, 1))
 
-# --- Animate the ball
-scene.objects["ball"].position = (0, 0, 1.0)
-scene.objects["ball"].keyframe_insert("position", frame=1)
-scene.objects["ball"].position = (0, 0, 3.0)
-scene.objects["ball"].keyframe_insert("position", frame=60)
-
-# --- Renderer
+# --- Renderer must be created BEFORE keyframes
 renderer = KubricRenderer(
     scene,
     scratch_dir="output_tmp",
     samples_per_pixel=64,
     use_denoising=True,
 )
+
+# --- Animate the ball (renderer is already attached)
+ball.position = (0, 0, 1.0)
+ball.keyframe_insert("position", frame=1)
+ball.position = (0, 0, 3.0)
+ball.keyframe_insert("position", frame=60)
 
 # --- Render all frames
 frames_dict = renderer.render(
@@ -326,6 +336,8 @@ os.system(
 | `ModuleNotFoundError: bpy` | Not running inside Blender Python | Run via `blender --background --python script.py` or use the Docker image |
 | Purple / missing textures | Texture paths unresolved | Pass `ignore_missing_textures=True` to `render()` or check asset paths |
 | Black frames | No lights in scene | Add at least one `DirectionalLight` or `PointLight` |
+| Animation keyframes have no effect (all frames identical) | Renderer created after `keyframe_insert` calls | Create `KubricRenderer` **before** any `keyframe_insert` — it must be attached to observe keyframe events |
+| `AttributeError: 'Scene' object has no attribute 'objects'` | `scene.objects` does not exist | Keep a direct Python variable reference to each asset; use `scene.assets` (returns a tuple) to iterate all assets |
 | Very slow rendering | High `samples_per_pixel` on CPU | Lower SPP, enable `adaptive_sampling=True`, or set `KUBRIC_USE_GPU=true` |
 | `scene.blend1` created instead of `scene.blend` | Blender auto-backup | Kubric deletes the old `.blend` before saving — ensure no file lock |
 | Frames out of order in ffmpeg | Wrong glob pattern | Use zero-padded filenames: `%05d` for 5-digit frame numbers |
