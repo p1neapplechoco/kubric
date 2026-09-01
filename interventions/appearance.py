@@ -6,7 +6,7 @@ MATERIAL_MODES, COLOR_SPACES, IMAGE_ROLES, LIGHT_KINDS, BACKGROUND_KINDS, RENDER
 RENDER_LAYERS, SMOKE_PROFILE, PRODUCTION_PROFILE, PROFILES_BY_NAME, ImageReference,
 TextureSpec, MaterialSpec, AssetReference, VisualObjectSpec, CameraRenderSpec, LightSpec,
 BackgroundSpec, RenderProfile, VisualSceneSpec, visual_scene_hash, render_profile_hash,
-validate_scene_correspondence, and frame_steps_for.
+validate_scene_correspondence, visual_scene_from_payload, and frame_steps_for.
 Dependencies: Python's standard library and interventions.schema helpers only, so
 appearance never imports Kubric, Blender, or a simulator backend.
 Trust boundary: validation enforces value ranges, enum membership, and JSON safety;
@@ -671,6 +671,65 @@ def render_profile_hash(profile: RenderProfile) -> str:
   return hashlib.sha256(_canonical_bytes(profile.to_dict())).hexdigest()
 
 
+def _image_from_payload(payload: Any) -> ImageReference:
+  return ImageReference(**dict(payload))
+
+
+def _texture_from_payload(payload: Any) -> TextureSpec:
+  values = dict(payload)
+  images = tuple(_image_from_payload(item) for item in values.pop("images", ()))
+  return TextureSpec(images=images, **values)
+
+
+def _material_from_payload(payload: Any) -> MaterialSpec:
+  values = dict(payload)
+  return MaterialSpec(texture=_texture_from_payload(values.pop("texture")), **values)
+
+
+def _visual_object_from_payload(payload: Any) -> VisualObjectSpec:
+  values = dict(payload)
+  asset_payload = values.pop("asset")
+  asset = None if asset_payload is None else AssetReference(**dict(asset_payload))
+  material = _material_from_payload(values.pop("material"))
+  return VisualObjectSpec(asset=asset, material=material, **values)
+
+
+def _background_from_payload(payload: Any) -> BackgroundSpec:
+  values = dict(payload)
+  hdri_payload = values.pop("hdri", None)
+  hdri = None if hdri_payload is None else _image_from_payload(hdri_payload)
+  return BackgroundSpec(hdri=hdri, **values)
+
+
+def visual_scene_from_payload(payload: Any) -> VisualSceneSpec:
+  """Rebuilds a :class:`VisualSceneSpec` from its ``to_dict`` JSON form.
+
+  Every nested value is re-validated by the same constructors that produced it,
+  so a payload edited after publication fails here instead of reaching a
+  renderer.  Round-tripping is exact: ``visual_scene_from_payload(spec.to_dict())
+  == spec``.
+  """
+  if not isinstance(payload, Mapping):
+    raise ValueError("visual scene payload is malformed")
+  try:
+    values = dict(payload)
+    objects = tuple(
+        _visual_object_from_payload(item) for item in values.pop("objects")
+    )
+    camera = CameraRenderSpec(**dict(values.pop("camera")))
+    lights = tuple(LightSpec(**dict(item)) for item in values.pop("lights"))
+    background = _background_from_payload(values.pop("background"))
+    return VisualSceneSpec(
+        objects=objects,
+        camera=camera,
+        lights=lights,
+        background=background,
+        **values,
+    )
+  except (AttributeError, KeyError, TypeError, ValueError) as error:
+    raise ValueError("visual scene payload is malformed") from error
+
+
 def frame_steps_for(scene: SceneConfig) -> Tuple[int, ...]:
   """Returns the physics step sampled by each output frame of ``scene``."""
   if not isinstance(scene, SceneConfig):
@@ -775,5 +834,6 @@ __all__ = [
     "frame_steps_for",
     "render_profile_hash",
     "validate_scene_correspondence",
+    "visual_scene_from_payload",
     "visual_scene_hash",
 ]

@@ -14,14 +14,17 @@ table below is the human-facing map of those boundaries.
 
 | Module | Purpose, public API, and dependencies | Trust boundary |
 | --- | --- | --- |
-| `interventions/schema.py` | Standard-library-only, backend-neutral validation and deterministic JSON conversion through the config/ground-truth dataclasses and `to_jsonable()`. | Shape and JSON safety are validated; physical feasibility, execution, and origin are not. |
+| `interventions/schema.py` | Standard-library-only, backend-neutral validation and deterministic JSON conversion through the config/ground-truth dataclasses, `to_jsonable()`, and `derive_seed()`. | Shape and JSON safety are validated; physical feasibility, execution, and origin are not. |
 | `interventions/trajectory.py` | NumPy/SciPy construction, validation, comparison, and named perturbation recipes through `build_path()`, `validate_path()`, `max_position_deviation()`, and `perturb_path()`. | Recipes are heuristic candidates until a physics rollout and QC establish the requested effect. |
 | `interventions/logging.py` | Immutable NumPy state/contact logs, stable state-vector slices, serialization, hashing, and publication; it imports no Bullet or Kubric backend. | Immutability and hashes protect internal consistency, not simulator or producer origin. |
 | `interventions/graph_extraction.py` | Pure aggregation, temporal graphs, graph deltas, reachability, affected sets, and packaged ground truth over supplied logs/states. | The result is not causal proof beyond the completeness and authenticity of its inputs. |
 | `interventions/tagging.py` | `derive_tags()` creates deterministic metadata from validated ground truth and explicit role/stability inputs. | Tags summarize supplied metadata and do not independently verify physics or causality. |
+| `interventions/appearance.py` | Standard-library-only immutable appearance schemas (`VisualSceneSpec` and its nested material/texture/light/camera/background records), `visual_scene_hash()`, `visual_scene_from_payload()`, `validate_scene_correspondence()`, and `frame_steps_for()`. | Values, enums, and JSON safety are validated; it does not prove an external asset exists or that a scene renders. |
+| `interventions/materials.py` | Shipped per-family visual and physical priors, `sample_material()`, and `coupled_physics()` linking a material family to mass and friction. | Priors are dataset-scale conventions, not physical measurements; clamping is recorded rather than hidden. |
+| `interventions/appearance_sampling.py` | `sample_visual_scene()` draws one `VisualSceneSpec` for a `SceneConfig` over the `APPEARANCE_DOMAINS` seed streams; NumPy plus the two modules above, never a renderer. | Sampling records every value it draws; it does not verify asset existence or physical feasibility. |
 | `interventions/kinematic_simulator.py` | `KinematicSimulator` wraps Kubric/PyBullet for mass-carrying prescribed paths; the package exposes this backend lazily. | Private Bullet snapshots remain bound to the creating simulator, physics client, and backend lifetime. |
-| `interventions/twin_runner.py` | Creates fresh worlds for the canonical factual/counterfactual pair, checks prefixes/provenance, derives truth, and reads/writes paired artifacts. | Canonically generated pairs record provenance; caller-supplied logs remain `caller_trusted_unattested_logs_v1`. |
-| `interventions/dataset.py` | Deterministic attempts, QC, journals, balancing, grouped splits, atomic publication, and resume through `run_batch()` and supporting APIs. | Resume requires the same run contract; journals/hashes protect consistency but do not authenticate the producer. |
+| `interventions/twin_runner.py` | Creates fresh worlds for the canonical factual/counterfactual pair, checks prefixes/provenance, derives truth, and reads/writes paired artifacts, including the pair's optional shared `VisualSceneSpec`. | Canonically generated pairs record provenance; caller-supplied logs remain `caller_trusted_unattested_logs_v1`. |
+| `interventions/dataset.py` | Deterministic attempts, QC, journals, balancing, grouped splits, atomic publication, and resume through `run_batch()` and supporting APIs; `sample_instance_appearance()` draws the one visual scene an accepted instance publishes. | Resume requires the same run contract; journals/hashes protect consistency but do not authenticate the producer. |
 | `interventions/__init__.py` | Stable public exports for schemas, trajectories, logs, graph extraction, tags, and lazy simulator/twin-runner entry points. | Re-exporting a value does not strengthen its provenance or attestation. |
 | `scripts/__init__.py` | Package marker for module-based CLI and demo entry points; it intentionally exports no callable API. | Import performs no validation, simulation, rendering, composition, or publication. |
 | `scripts/generate_dataset.py` | `main()` parses one resumable batch request and emits the stable `run_batch()` JSON status. | Sampling, QC, journaling, and publication trust remain those of `dataset.py`. |
@@ -328,6 +331,96 @@ excluded. Every candidate with the same signature is assigned to the same
 train/validation/test split. Fractions are therefore targets rather than exact
 counts, especially for small datasets or large topology groups.
 
+## Shared visual scenes
+
+A pair is a controlled comparison: the two branches must differ in the intervened
+physics and in nothing else. Appearance is therefore sampled **once per accepted
+instance** and published **once for the pair**, so the factual and counterfactual
+branches cannot disagree about how the scene looks — there is one record, and both
+branches read it.
+
+Appearance is opt-in. A range config without an `appearance:` section publishes
+physics-only pairs that are byte-identical to those produced before visual
+sampling existed; `configs/scene_ranges.yaml` is such a config.
+`configs/scene_ranges_visual.yaml` adds the section and exercises the visual path.
+
+```python
+from interventions import read_paired_artifact
+from interventions.appearance import visual_scene_hash, visual_scene_from_payload
+
+factual, counterfactual, truth, provenance = read_paired_artifact(instance_dir)
+print(provenance["trust_model"])        # caller_trusted_unattested_logs_v1
+print(provenance["visual_scene_hash"])  # digest of the one shared appearance
+scene = visual_scene_from_payload(provenance["visual_scene"])
+assert visual_scene_hash(scene) == provenance["visual_scene_hash"]
+```
+
+### Where it is sampled
+
+`run_batch()` calls `sample_instance_appearance(ranges, spec, seed, index)` only
+**after** `evaluate_qc()` accepts the candidate. Appearance work is never spent on
+a rejected rollout, and — because it is drawn after the physics is already
+decided — it cannot influence which candidates pass QC. The function returns
+`None` when the config has no `appearance:` section.
+
+Seeds come from `derive_seed(master_seed, attempt_index, domain)`, which now lives
+in `interventions/schema.py` (`interventions.dataset` re-exports it, so existing
+imports keep working). `sample_visual_scene()` opens one generator per entry in
+`APPEARANCE_DOMAINS` — `geometry`, `physics`, `appearance`, `texture`, `camera`,
+`lighting`, `background`, and `render`. Those domain names are disjoint from the
+physics domains (`sampling`, `environment`, `scene`, `instance`), so the SHA-256
+separation guarantees adding appearance perturbs no draw the physics sampler
+already made: the same seed and config produce the same instance ids and the same
+rollouts with or without an `appearance:` section.
+
+Because the seed is a pure function of the master seed and the attempt index,
+appearance is reproducible and resumable exactly like every other domain.
+Regenerating a batch republishes the same `visual_scene_hash` for every instance.
+
+### What lands in `pair.json`
+
+Two keys are added beside `scene_config`, and only as a pair:
+
+- `visual_scene` — the full `VisualSceneSpec.to_dict()` payload.
+- `visual_scene_hash` — the SHA-256 of that payload in canonical JSON form.
+
+`read_paired_artifact()` rejects a half-written record (one key without the
+other), a payload whose recomputed hash disagrees with the stored one, a payload
+that fails schema re-validation, and a payload that does not describe the
+simulated scene — `validate_scene_correspondence()` requires the visual scene to
+cover exactly the simulated object ids. Nothing appearance-related is stored per
+branch, so there is no per-branch field that could drift.
+
+**The trust model is unchanged.** Pair artifacts still report
+`caller_trusted_unattested_logs_v1`. Visual provenance is one more internally
+consistent, hash-checked payload; it attests no more about origin than the logs
+it accompanies do.
+
+### Static `environment` obstacles
+
+`objects.static_fraction` is an optional `[low, high]` range that promotes a share
+of the sampled free objects to static obstacles: `mass=0.0`, `static=True`,
+`metadata={"role": "environment"}`. They give the renderer fixed scene furniture
+and give the contact graph immovable nodes, and the topology signature already
+distinguishes the `environment` role from `dynamic` and `target`.
+
+Only objects clear of the corridor the target sweeps are eligible — the check
+reserves the target's half-extents plus the largest configured intervention
+magnitude, so a counterfactual path cannot be blocked by a body it can never move.
+The realized share therefore often falls below the drawn fraction, and a scene
+with no eligible object gets none.
+
+Designation draws from its own `environment` seed domain, so a config without
+`static_fraction` leaves both the result and the main sampling stream exactly as
+they were. Enabling it *does* change the sampled scene, and hence the instance ids,
+of every dataset generated from that config. That is why it is enabled in
+`configs/scene_ranges_visual.yaml` and left commented out in
+`configs/scene_ranges.yaml`, whose physics-only instance ids are pinned by test.
+
+For rendered evidence that both branches read the one shared record — three
+branches under a fixed camera, and a six-instance appearance gallery — see the
+[shared visual-scene demo](shared_visual_scene_demo.md).
+
 ## Artifact layout and public reader
 
 A dataset root is an append-only/resumable journal with this shape (hash directory
@@ -345,7 +438,8 @@ output/
     instance_manifest.json    # hashes every instance payload
     manifest.json             # atomic pointer to one paired generation
     generations/<pair_sha256>/
-      pair.json               # scene, intervention, seed, tags, thresholds
+      pair.json               # scene, intervention, seed, tags, thresholds,
+                              # and the pair's one shared visual scene + hash
       ground_truth.json
       factual/
         manifest.json
@@ -392,6 +486,13 @@ in-memory logs came from the simulator. Manifest hashes provide internal
 integrity and detect payload changes relative to the published pointer; they are
 not signatures and do not authenticate origin or prevent a producer from
 constructing and publishing a different internally consistent artifact.
+
+Recording a shared `VisualSceneSpec` does not change this. The reader verifies
+that the stored appearance hashes to its stored digest, re-validates against the
+appearance schema, and describes exactly the simulated objects; it cannot attest
+that any renderer was actually given that appearance. Trust in pixels is
+established by the renderer reporting the digest of what it fed to Blender, not by
+the artifact.
 
 For canonical oracle generation, use `generate_paired_instance()` directly or
 the dataset `run_batch()` path (the CLIs use the latter pipeline). Treat direct

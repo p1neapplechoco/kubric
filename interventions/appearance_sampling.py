@@ -5,7 +5,8 @@ Public API: APPEARANCE_DOMAINS, validate_appearance_ranges, sample_visual_scene,
 sample_object_geometry, sample_color, sample_texture, sample_camera, sample_lights,
 and sample_background.
 Dependencies: NumPy, interventions.appearance, interventions.materials, and
-interventions.schema; Kubric, Blender, and PyBullet are never imported.
+interventions.schema (for derive_seed and immutable range copies); Kubric,
+Blender, and PyBullet are never imported.
 Trust boundary: sampling realizes and records every value it draws; it does not
 validate that an external asset exists or that a scene is physically feasible.
 """
@@ -17,8 +18,8 @@ from typing import Any, Mapping, Sequence, Tuple
 
 import numpy as np
 
-from interventions import appearance, dataset, materials, schema
-from interventions.schema import to_jsonable
+from interventions import appearance, materials, schema
+from interventions.schema import derive_seed, to_jsonable
 
 APPEARANCE_DOMAINS = (
     "geometry",
@@ -33,7 +34,7 @@ APPEARANCE_DOMAINS = (
 
 
 def _freeze_ranges(ranges: Mapping[str, Any]) -> Mapping[str, Any]:
-  return dataset._freeze(to_jsonable(ranges))
+  return schema._freeze(to_jsonable(ranges))
 
 
 def _appearance_section(ranges: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -466,7 +467,7 @@ def sample_visual_scene(
   """Samples one immutable visual scene for a given scene config."""
   validated = validate_appearance_ranges(ranges)
   rngs = {
-      domain: np.random.default_rng(dataset.derive_seed(master_seed, index, domain))
+      domain: np.random.default_rng(derive_seed(master_seed, index, domain))
       for domain in APPEARANCE_DOMAINS
   }
   objects = []
@@ -491,7 +492,7 @@ def sample_visual_scene(
   camera = sample_camera(validated, rngs["camera"], scene_config)
   lights = sample_lights(validated, rngs["lighting"])
   background = sample_background(validated, rngs["background"])
-  render_seed = int(dataset.derive_seed(master_seed, index, "render") % (2 ** 31))
+  render_seed = int(derive_seed(master_seed, index, "render") % (2 ** 31))
   return appearance.VisualSceneSpec(
       objects=tuple(objects),
       camera=camera,

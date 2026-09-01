@@ -29,6 +29,10 @@ semantics, and the isolated `thesis` environment workflow, see the
 For the supported primitive-shape gallery and the three rendered intervention
 branches, see the [object-shape demos guide](docs/object_shape_demos.md).
 
+For the one appearance record a factual/counterfactual pair shares, and the
+rendered evidence that both branches read it, see the
+[shared visual-scene demo](docs/shared_visual_scene_demo.md).
+
 Assuming you have docker installed, to generate the data above simply execute:
 ```
 git clone https://github.com/google-research/kubric.git

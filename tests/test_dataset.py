@@ -999,7 +999,9 @@ def _patch_fast_batch(monkeypatch, *, fail_indices=(), truth_by_index=None):
 
   monkeypatch.setattr(dataset, "_recompute_candidate_evidence", fake_evidence)
 
-  def fake_publish(root, spec, factual, counterfactual, ground_truth=None):
+  def fake_publish(
+      root, spec, factual, counterfactual, ground_truth=None, visual_scene=None
+  ):
     artifact = root / "instances" / spec.instance_id
     if artifact.exists():
       return artifact

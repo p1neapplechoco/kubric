@@ -17,6 +17,13 @@ objects:
   # Concentrate free bodies around the target sweep while retaining lateral misses.
   x: [-1.4, 1.2]
   y: [-1.8, 1.8]
+  # Share of the sampled free objects that become static "environment" obstacles
+  # instead of dynamic bodies. Only objects clear of the target's swept corridor
+  # are eligible, so the realized share can fall below the drawn fraction.
+  # Left off here on purpose: enabling it changes the sampled scene and therefore
+  # the instance ids of every physics-only dataset generated from this config.
+  # See scene_ranges_visual.yaml, where it is enabled.
+  # static_fraction: [0.0, 0.5]
   floor_size: [4.5, 4.5, 0.25]
 
 # The target remains static in Kubric bookkeeping; push_mass is toggled per step.

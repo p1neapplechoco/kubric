@@ -2,8 +2,8 @@
 
 Purpose: define immutable experiment values and deterministic JSON conversion.
 Public API: ObjectConfig, CameraConfig, SceneConfig, Intervention,
-GraphEdgeDelta, GroundTruth, constants, to_jsonable(), shape_half_extents(),
-half_extents(), and oriented_aabb().
+GraphEdgeDelta, GroundTruth, constants, to_jsonable(), derive_seed(),
+shape_half_extents(), half_extents(), and oriented_aabb().
 Dependencies: Python's standard library only, so validation and JSON preparation
 never import Kubric, a renderer, or a simulator backend.
 Trust boundary: validation enforces backend-neutral shape, numeric, and JSON-safe
@@ -13,6 +13,7 @@ contracts; it does not prove physical feasibility, execution, or data origin.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import numbers
@@ -189,6 +190,27 @@ def _version(value: Any) -> str:
   if value != SCHEMA_VERSION:
     raise ValueError("schema_version must be {!r}".format(SCHEMA_VERSION))
   return SCHEMA_VERSION
+
+
+def derive_seed(master_seed: int, index: int, domain: str) -> int:
+  """Derives a reproducible unsigned 63-bit seed with SHA256 separation.
+
+  ``domain`` keeps independently sampled aspects of one attempt (scene, physics,
+  appearance, and so on) on statistically independent streams, so adding a domain
+  never perturbs the draws any other domain already makes.
+  """
+  master = _nonnegative_integer(master_seed, "master_seed")
+  attempt = _nonnegative_integer(index, "index")
+  domain = _nonempty_string(domain, "domain")
+  material = "{}\0{}\0{}".format(master, attempt, domain).encode("utf-8")
+  return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") & ((1 << 63) - 1)
+
+
+def _nonnegative_integer(value: Any, name: str) -> int:
+  result = _integer(value, name)
+  if result < 0:
+    raise ValueError("{} must be at least 0".format(name))
+  return result
 
 
 class _SchemaMixin:

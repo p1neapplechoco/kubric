@@ -28,10 +28,11 @@ sys.meta_path.insert(0, BackendBlocker())
 
 import interventions
 from interventions.appearance import MaterialSpec, TextureSpec, VisualObjectSpec
+from interventions.appearance_sampling import sample_visual_scene
 from interventions.graph_extraction import TemporalGraph, extract_ground_truth
 from interventions.logging import ContactRecord, SimulationLog
 from interventions.materials import FAMILY_PRIORS, coupled_physics, proxy_volume
-from interventions.schema import GroundTruth, SceneConfig
+from interventions.schema import GroundTruth, SceneConfig, derive_seed
 from interventions.tagging import derive_tags
 from interventions.trajectory import build_path, validate_path
 
@@ -40,6 +41,9 @@ assert MaterialSpec is not None and VisualObjectSpec is not None
 assert FAMILY_PRIORS["metal"].density == (55.0, 100.0)
 assert proxy_volume("cube", (0.5, 0.5, 0.5)) == 1.0
 assert coupled_physics is not None
+assert sample_visual_scene is not None
+assert derive_seed(7, 1, "appearance") == derive_seed(7, 1, "appearance")
+assert derive_seed(7, 1, "appearance") != derive_seed(7, 1, "scene")
 assert interventions.TemporalGraph is TemporalGraph
 assert interventions.extract_ground_truth is extract_ground_truth
 assert interventions.ContactRecord is ContactRecord
@@ -51,6 +55,7 @@ assert interventions.build_path is build_path
 assert interventions.validate_path is validate_path
 assert "interventions.kinematic_simulator" not in sys.modules
 assert "interventions.twin_runner" not in sys.modules
+assert "interventions.dataset" not in sys.modules
 assert "KinematicSimulator" in interventions.__all__
 assert "KinematicSimulator" in dir(interventions)
 assert "read_paired_artifact" in interventions.__all__
