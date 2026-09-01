@@ -13,7 +13,7 @@ Two artifacts are published under `output/demo_visual_scene_sampling/`:
 | `appearance_sampling_gallery.mp4` | 1440×808, 72 frames — six instances under one fixed viewpoint, so every visible difference comes from the sampler |
 
 Both were rendered with the pip `bpy` Blender in the `thesis` environment,
-following [`render.md`](../render.md).
+following [`render_no_docker.md`](../render_no_docker.md).
 
 ## What the three panels show
 
