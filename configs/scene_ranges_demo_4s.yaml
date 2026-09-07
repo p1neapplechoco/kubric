@@ -1,26 +1,25 @@
+# Four seconds of footage at 24 fps (96 frames, 960 physics steps) with appearance
+# sampling and static environment obstacles both switched on, so one run exercises
+# the whole pipeline end to end.
+
 scene:
   bounds: [[-5.0, -5.0, -1.0], [5.0, 5.0, 5.0]]
   gravity: [0.0, 0.0, -9.81]
-  frame_range: [0, 2]
+  frame_range: [0, 96]
   frame_rate: 24
   step_rate: 240
 
 objects:
-  count: [2, 5]
+  count: [4, 6]
   shapes: [cube, sphere]
   size: [0.12, 0.28]
   mass: [0.5, 2.0]
   friction: [0.05, 0.6]
   restitution: [0.0, 0.4]
-  # Freeze up to a third of the free bodies into static "environment" obstacles so
-  # rendered scenes contain clutter the target has to be perturbed around.
-  static_fraction: [0.0, 0.34]
+  # Roughly half the free bodies become static "environment" clutter.
+  static_fraction: [0.35, 0.55]
   x: [-1.4, 1.2]
   y: [-1.8, 1.8]
-  # Share of the sampled free objects that become static "environment" obstacles
-  # instead of dynamic bodies. Only objects clear of the target's swept corridor
-  # are eligible, so the realized share can fall below the drawn fraction.
-  static_fraction: [0.0, 0.5]
   floor_size: [4.5, 4.5, 0.25]
 
 target:
@@ -40,8 +39,9 @@ trajectory:
 intervention:
   recipes: [remove_collision, create_collision, retime, break_contact, maintain_contact]
   magnitude: [0.05, 0.30]
-  start_step: [1, 4]
-  duration_steps: [12, 16]
+  # Scaled to the 960-step duration so the window is visible in a 4 s clip.
+  start_step: [60, 90]
+  duration_steps: [180, 240]
   push_mass: [0.5, 2.0]
   expected_effects: [non_null]
 

@@ -14,6 +14,9 @@ objects:
   mass: [0.5, 2.0]
   friction: [0.05, 0.6]
   restitution: [0.0, 0.4]
+  # Share of free bodies frozen into static "environment" obstacles.  Kept at zero
+  # here so the physics-only dataset keeps its existing distribution.
+  static_fraction: [0.0, 0.0]
   # Concentrate free bodies around the target sweep while retaining lateral misses.
   x: [-1.4, 1.2]
   y: [-1.8, 1.8]

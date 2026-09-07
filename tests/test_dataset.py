@@ -406,6 +406,120 @@ def test_invalid_ranges_are_rejected():
     sample_instance_spec(ranges, 0, 0)
 
 
+def _free_objects(spec):
+  return tuple(spec.scene_config.objects[2:])
+
+
+def test_absent_static_fraction_leaves_every_free_object_dynamic():
+  ranges = _ranges(object_count=(4, 4))
+  assert "static_fraction" not in ranges["objects"]
+
+  spec = sample_instance_spec(ranges, 4242, 5)
+
+  assert all(
+      not item.static and item.metadata["role"] == "dynamic"
+      for item in _free_objects(spec)
+  )
+
+
+def test_zero_static_fraction_is_byte_identical_to_omitting_the_key():
+  baseline = sample_instance_spec(_ranges(object_count=(4, 4)), 4242, 5)
+  ranges = _ranges(object_count=(4, 4))
+  ranges["objects"]["static_fraction"] = [0.0, 0.0]
+
+  assert sample_instance_spec(ranges, 4242, 5).to_dict() == baseline.to_dict()
+
+
+def test_static_fraction_freezes_a_deterministic_share_into_environment_roles():
+  ranges = _ranges(object_count=(4, 4))
+  ranges["objects"]["static_fraction"] = [0.5, 0.5]
+
+  spec = sample_instance_spec(ranges, 4242, 5)
+  free = _free_objects(spec)
+  environment = tuple(item for item in free if item.static)
+
+  assert len(free) == 4
+  assert len(environment) == 2
+  for item in environment:
+    assert item.mass == 0.0
+    assert dict(item.metadata) == {"role": "environment"}
+  assert all(
+      item.metadata["role"] == "dynamic"
+      for item in free
+      if not item.static
+  )
+  repeated = sample_instance_spec(ranges, 4242, 5)
+  assert repeated.to_dict() == spec.to_dict()
+  assert [item.object_id for item in _free_objects(repeated) if item.static] == [
+      item.object_id for item in environment
+  ]
+
+
+def test_static_fraction_does_not_disturb_the_physics_sampling_stream():
+  baseline = sample_instance_spec(_ranges(object_count=(4, 4)), 4242, 5)
+  ranges = _ranges(object_count=(4, 4))
+  ranges["objects"]["static_fraction"] = [1.0, 1.0]
+
+  spec = sample_instance_spec(ranges, 4242, 5)
+
+  np.testing.assert_array_equal(spec.factual_path, baseline.factual_path)
+  assert spec.intervention.to_dict() == baseline.intervention.to_dict()
+  for item, reference in zip(_free_objects(spec), _free_objects(baseline)):
+    assert item.object_id == reference.object_id
+    assert item.shape == reference.shape
+    assert item.size == reference.size
+    assert item.position == reference.position
+
+
+def test_environment_objects_never_block_the_commanded_target_corridor():
+  ranges = _ranges(object_count=(5, 5))
+  ranges["objects"]["static_fraction"] = [1.0, 1.0]
+  ranges["target"]["displacement_x"] = [2.0, 2.0]
+
+  frozen = 0
+  for index in range(48):
+    spec = sample_instance_spec(ranges, 90210, index)
+    target = next(
+        item for item in spec.scene_config.objects
+        if item.object_id == spec.target_id
+    )
+    for item in _free_objects(spec):
+      if not item.static:
+        continue
+      frozen += 1
+      center = np.asarray(item.position)
+      extent = np.asarray(item.size)
+      validate_path(
+          spec.factual_path,
+          static_aabbs=((center - extent, center + extent),),
+          clearance=max(target.size),
+      )
+  assert frozen > 0
+
+
+def test_repository_visual_ranges_sample_environment_obstacles():
+  config = (
+      Path(__file__).resolve().parents[1] / "configs" / "scene_ranges_visual.yaml"
+  )
+  loaded = load_ranges(config)
+
+  specs = tuple(
+      sample_instance_spec(loaded, 20260811, index) for index in range(128)
+  )
+  frozen = sum(
+      sum(1 for item in _free_objects(spec) if item.static) for spec in specs
+  )
+  free = sum(len(_free_objects(spec)) for spec in specs)
+
+  assert 0 < frozen < free
+  assert all(
+      dict(item.metadata) == {"role": "environment"} and item.mass == 0.0
+      for spec in specs
+      for item in _free_objects(spec)
+      if item.static
+  )
+
+
 @pytest.mark.parametrize(
     ("case", "expected"),
     [
@@ -1801,3 +1915,76 @@ def test_real_two_branch_candidate_publishes_and_roundtrips(tmp_path):
   assert isinstance(truth, GroundTruth)
   assert provenance["target_id"] == "target"
   np.testing.assert_array_equal(factual.states, counterfactual.states)
+  assert "visual_scene" not in provenance
+  assert "visual_scene_hash" not in provenance
+
+
+def _appearance_enabled_ranges():
+  visual = load_ranges(
+      Path(__file__).resolve().parents[1] / "configs" / "scene_ranges_visual.yaml"
+  )
+  ranges = _ranges()
+  ranges["appearance"] = visual["appearance"]
+  return ranges
+
+
+def test_accepted_instance_publishes_one_shared_visual_scene(tmp_path):
+  from interventions import appearance, appearance_sampling
+
+  ranges = _appearance_enabled_ranges()
+  output = tmp_path / "visual"
+  result = run_batch(ranges, output, 44, 1, 1)
+
+  assert result["status"] == "complete"
+  instance_id = result["selected_ids"][0]
+  artifact = output / "instances" / instance_id
+  factual, counterfactual, _, provenance = read_paired_artifact(artifact)
+  spec = json.loads((artifact / "spec.json").read_text())
+
+  # Appearance is stored beside the shared scene_config, not per branch, so the
+  # factual and counterfactual renders cannot disagree about anything but motion.
+  assert "visual_scene" not in spec
+  assert provenance["visual_scene_hash"] == appearance.visual_scene_hash(
+      appearance_sampling.sample_visual_scene(
+          ranges,
+          sample_instance_spec(ranges, 44, spec["attempt_index"]).scene_config,
+          44,
+          spec["attempt_index"],
+      )
+  )
+  rendered = {item["object_id"] for item in provenance["visual_scene"]["objects"]}
+  assert rendered == {item["object_id"] for item in provenance["scene_config"]["objects"]}
+  assert set(factual.object_ids) | set(counterfactual.object_ids) <= rendered
+
+
+def test_rejected_attempts_never_sample_appearance(tmp_path, monkeypatch):
+  from interventions import appearance_sampling
+
+  calls = []
+  original = appearance_sampling.sample_visual_scene
+
+  def counted(ranges, scene_config, master_seed, index):
+    calls.append(index)
+    return original(ranges, scene_config, master_seed, index)
+
+  monkeypatch.setattr(appearance_sampling, "sample_visual_scene", counted)
+  output = tmp_path / "visual"
+  result = run_batch(_appearance_enabled_ranges(), output, 44, 1, 4)
+
+  assert result["status"] == "complete"
+  accepted = set()
+  for index, attempt_path in enumerate(sorted((output / "attempts").iterdir())):
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    if attempt["status"] == "accepted":
+      accepted.add(index)
+  assert calls
+  assert set(calls) == accepted
+
+
+def test_appearance_free_config_does_not_import_appearance_records(tmp_path):
+  result = run_batch(_ranges(), tmp_path / "plain", 44, 1, 1)
+  artifact = tmp_path / "plain" / "instances" / result["selected_ids"][0]
+
+  _, _, _, provenance = read_paired_artifact(artifact)
+
+  assert "visual_scene" not in provenance
