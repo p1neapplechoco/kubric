@@ -48,6 +48,35 @@ ls output
 
 Kubric employs **Blender 2.93** (see [here](https://github.com/google-research/kubric/blob/01a08d274234f32f2adc4f7d5666b39490f953ad/docker/Blender.Dockerfile#L48)), so if you want to inspect the generated `*.blend` scene file for interactive inspection (i.e. without needing to render the scene), please make sure you have installed the correct Blender version. 
 
+## Rendered demos
+
+A factual/counterfactual pair samples **one** `VisualSceneSpec` and both branches
+render from it, so the only thing that differs between them is the intervened
+physics. The clips below are the evidence, and live under
+`output/demo_visual_scene_sampling/`. GitHub links these rather than playing them
+inline; download or open them locally to view.
+
+| Clip | What it shows |
+| --- | --- |
+| [`shared_visual_scene_demo.mp4`](output/demo_visual_scene_sampling/shared_visual_scene_demo.mp4) | 1920×540 — factual, counterfactual, and a demo-only *target removed* branch side by side under one fixed camera. All three print the same appearance digest. |
+| [`appearance_sampling_gallery.mp4`](output/demo_visual_scene_sampling/appearance_sampling_gallery.mp4) | 1440×808 — six instances from one viewpoint, so every visible difference (shape, colour, material, texture, light rig, background) comes from the sampler. |
+
+The clips those two were composed from are in
+[`output/demo_visual_scene_sampling/videos/`](output/demo_visual_scene_sampling/videos):
+
+| Clip | What it shows |
+| --- | --- |
+| `instance_328084c006cc046734ee_{factual,counterfactual,target_removed}.mp4` | 640×540 — the three branches of a `break_contact` instance with two static `environment` obstacles, from its sampled camera path. |
+| `instance_66906312e95c3f15ce07_{factual,counterfactual,target_removed}.mp4` | The same for a `maintain_contact` instance, whose sampled appearance is a speckled floor with checker and glass objects. |
+| `*_shared_appearance.mp4` | Each instance's three branches composed side by side. |
+| `*_fixedcam_pair.mp4` | The `break_contact` branches re-rendered from the gallery viewpoint, so only the trajectory moves between panels. |
+| `instance_*_factual_fixedcam.mp4` | The six gallery tiles, before tiling. |
+
+Frame-by-frame, the factual and counterfactual clips are identical on frame 0 and
+differ in at most 1.73% of pixels at the peak, all of it around the intervened
+object. See the [shared visual-scene demo](docs/shared_visual_scene_demo.md) for
+the full measurement, the appearance digests, and the Cycles device notes.
+
 ## Requirements
 - A pipeline for conveniently generating video data. 
 - Physics simulation for automatically generating physical interactions between multiple objects.
