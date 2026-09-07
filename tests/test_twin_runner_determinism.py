@@ -2155,3 +2155,211 @@ def test_pair_reader_rejects_symlinked_generation_path_component(
 
   with pytest.raises(ValueError, match="symbolic|symlink|artifact path"):
     read_paired_artifact(destination)
+
+
+def _visual_scene(config, index=0):
+  from interventions import appearance_sampling, dataset
+
+  ranges = dataset.load_ranges(
+      Path(__file__).resolve().parents[1] / "configs" / "scene_ranges_visual.yaml"
+  )
+  return appearance_sampling.sample_visual_scene(ranges, config, 20260829, index)
+
+
+def _runner_module():
+  import interventions.twin_runner as runner
+
+  return runner
+
+
+def _visual_pair_scene():
+  return _scene(
+      _object("target", static=True),
+      camera=CameraConfig(
+          position=(4.0, 4.0, 3.0), look_at=(0.0, 0.0, 0.0), focal_length=35.0
+      ),
+  )
+
+
+def test_pair_artifact_shares_one_visual_scene_across_both_branches(tmp_path):
+  from interventions import appearance
+
+  config = _visual_pair_scene()
+  intervention = _intervention(magnitude=0)
+  factual, counterfactual = generate_paired_instance(
+      config, "target", intervention, 8
+  )
+  visual = _visual_scene(config)
+  destination = tmp_path / "pair"
+
+  write_paired_artifact(
+      destination,
+      config,
+      intervention,
+      8,
+      factual,
+      counterfactual,
+      visual_scene=visual,
+  )
+
+  generation, _ = _pair_generation(destination)
+  # The visual scene lives beside scene_config in the pair record, never inside a
+  # branch directory, so no per-branch appearance can exist to diverge.
+  assert not (generation / "factual" / "visual_scene.json").exists()
+  assert not (generation / "counterfactual" / "visual_scene.json").exists()
+  pair = json.loads((generation / "pair.json").read_text())
+  assert pair["visual_scene"] == visual.to_dict()
+  assert pair["visual_scene_hash"] == appearance.visual_scene_hash(visual)
+  assert pair["trust_model"] == "caller_trusted_unattested_logs_v1"
+
+  read_factual, read_counterfactual, _, provenance = read_paired_artifact(
+      destination
+  )
+  restored = _runner_module()._visual_scene_from_payload(
+      provenance["visual_scene"]
+  )
+  assert restored == visual
+  assert appearance.visual_scene_hash(restored) == pair["visual_scene_hash"]
+  # Every simulated body in either branch resolves to the same appearance record.
+  materials = {
+      item.object_id: item.material for item in restored.objects
+  }
+  for object_id in set(read_factual.object_ids) | set(
+      read_counterfactual.object_ids
+  ):
+    assert object_id in materials
+  assert restored.camera == visual.camera
+  assert restored.lights == visual.lights
+  assert restored.background == visual.background
+
+
+def test_visual_pair_regeneration_is_byte_identical(tmp_path):
+  config = _visual_pair_scene()
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+
+  payloads = []
+  for name in ("first", "second"):
+    destination = tmp_path / name
+    write_paired_artifact(
+        destination,
+        config,
+        intervention,
+        8,
+        *pair,
+        visual_scene=_visual_scene(config),
+    )
+    generation, _ = _pair_generation(destination)
+    payloads.append((generation / "pair.json").read_bytes())
+
+  assert payloads[0] == payloads[1]
+
+
+def test_pair_reader_rejects_tampered_visual_scene_hash(tmp_path):
+  config = _visual_pair_scene()
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+  destination = tmp_path / "pair"
+  write_paired_artifact(
+      destination, config, intervention, 8, *pair,
+      visual_scene=_visual_scene(config),
+  )
+  generation, _ = _pair_generation(destination)
+  payload = json.loads((generation / "pair.json").read_text())
+  payload["visual_scene_hash"] = "0" * 64
+  _replace_pair_payload(destination, payload)
+
+  with pytest.raises(ValueError, match="visual_scene_hash"):
+    read_paired_artifact(destination)
+
+
+def test_pair_reader_rejects_visual_scene_for_an_unsimulated_object(tmp_path):
+  from interventions import appearance
+
+  config = _visual_pair_scene()
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+  destination = tmp_path / "pair"
+  visual = _visual_scene(config)
+  write_paired_artifact(
+      destination, config, intervention, 8, *pair, visual_scene=visual
+  )
+  generation, _ = _pair_generation(destination)
+  payload = json.loads((generation / "pair.json").read_text())
+  for item in payload["visual_scene"]["objects"]:
+    item["object_id"] = "ghost"
+    item["collision_proxy_id"] = "ghost"
+  restored = _runner_module()._visual_scene_from_payload(payload["visual_scene"])
+  payload["visual_scene_hash"] = appearance.visual_scene_hash(restored)
+  _replace_pair_payload(destination, payload)
+
+  with pytest.raises(ValueError, match="does not render the pair scene_config"):
+    read_paired_artifact(destination)
+
+
+def test_pair_reader_rejects_malformed_visual_scene_provenance(tmp_path):
+  config = _visual_pair_scene()
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+  destination = tmp_path / "pair"
+  write_paired_artifact(
+      destination, config, intervention, 8, *pair,
+      visual_scene=_visual_scene(config),
+  )
+  generation, _ = _pair_generation(destination)
+  payload = json.loads((generation / "pair.json").read_text())
+  payload["visual_scene"]["objects"] = []
+  _replace_pair_payload(destination, payload)
+
+  with pytest.raises(ValueError, match="visual_scene provenance is malformed"):
+    read_paired_artifact(destination)
+
+
+@pytest.mark.parametrize("dropped", ["visual_scene", "visual_scene_hash"])
+def test_pair_reader_rejects_half_recorded_visual_provenance(dropped, tmp_path):
+  config = _visual_pair_scene()
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+  destination = tmp_path / "pair"
+  write_paired_artifact(
+      destination, config, intervention, 8, *pair,
+      visual_scene=_visual_scene(config),
+  )
+  generation, _ = _pair_generation(destination)
+  payload = json.loads((generation / "pair.json").read_text())
+  payload.pop(dropped)
+  _replace_pair_payload(destination, payload)
+
+  with pytest.raises(ValueError, match="missing or unexpected fields"):
+    read_paired_artifact(destination)
+
+
+def test_pair_writer_rejects_visual_scene_for_a_different_config(tmp_path):
+  config = _visual_pair_scene()
+  other = _scene(
+      _object("target", static=True),
+      _object("ball", position=(2.0, 0.0, 0.0)),
+      camera=CameraConfig(
+          position=(4.0, 4.0, 3.0), look_at=(0.0, 0.0, 0.0), focal_length=35.0
+      ),
+  )
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+
+  with pytest.raises(ValueError, match="object sets differ"):
+    write_paired_artifact(
+        tmp_path / "pair", config, intervention, 8, *pair,
+        visual_scene=_visual_scene(other),
+    )
+
+
+def test_pair_writer_rejects_a_non_spec_visual_scene(tmp_path):
+  config = _visual_pair_scene()
+  intervention = _intervention(magnitude=0)
+  pair = generate_paired_instance(config, "target", intervention, 8)
+
+  with pytest.raises(TypeError, match="VisualSceneSpec"):
+    write_paired_artifact(
+        tmp_path / "pair", config, intervention, 8, *pair,
+        visual_scene=_visual_scene(config).to_dict(),
+    )

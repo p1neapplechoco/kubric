@@ -5,8 +5,9 @@ examples, assign grouped splits, journal outcomes, and publish resumable dataset
 Public API: InstanceSpec, QCResult, CandidateSummary, load_ranges(), seed/spec
 helpers, candidate/QC helpers, balancing/split helpers, and run_batch().
 Dependencies: direct dependencies include NumPy, YAML, logging, schema,
-trajectory, and twin-runner APIs; graph/tag results arrive through validated pair
-ground truth, and each simulated candidate receives fresh Bullet clients.
+trajectory, appearance-sampling, and twin-runner APIs; graph/tag results arrive
+through validated pair ground truth, and each simulated candidate receives fresh
+Bullet clients.
 Trust boundary: attempt journals, hashes, QC, balance, splits, atomic publication,
 and resume checks protect internal consistency, not producer identity; resume
 accepts only a matching run contract and batch generation is single-worker.
@@ -27,14 +28,14 @@ import uuid
 from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from interventions import _portability
+from interventions import _portability, appearance, appearance_sampling
 from interventions.logging import (
     ANGULAR_VELOCITY_SLICE,
     LINEAR_VELOCITY_SLICE,
@@ -49,7 +50,7 @@ from interventions.schema import (
     shape_half_extents,
     to_jsonable,
 )
-from interventions.trajectory import build_path
+from interventions.trajectory import build_path, validate_path
 from interventions.twin_runner import (
     extract_pair_ground_truth,
     generate_paired_instance,
@@ -403,6 +404,61 @@ def _duration_steps(scene: Mapping[str, Any]) -> int:
   return result
 
 
+def _blocks_target_sweep(
+    item: ObjectConfig, path: np.ndarray, clearance: float
+) -> bool:
+  center = np.asarray(item.position, dtype=np.float64)
+  extent = np.asarray(
+      shape_half_extents(item.shape, item.size), dtype=np.float64
+  )
+  try:
+    validate_path(
+        path,
+        static_aabbs=((center - extent, center + extent),),
+        clearance=clearance,
+    )
+  except ValueError as error:
+    if "intersects a static AABB" in str(error):
+      return True
+    raise
+  return False
+
+
+def _assign_environment_roles(
+    object_ranges: Mapping[str, Any],
+    objects: Tuple[ObjectConfig, ...],
+    factual_path: np.ndarray,
+    clearance: float,
+    master_seed: int,
+    index: int,
+) -> Tuple[ObjectConfig, ...]:
+  """Freezes a sampled share of the free objects into static environment obstacles.
+
+  The choice draws from its own seed domain, so introducing ``static_fraction``
+  cannot shift the physics sampling stream of a config that omits it.
+  """
+  if "static_fraction" not in object_ranges:
+    return objects
+  fraction_range = _unit_pair(object_ranges, "static_fraction")
+  rng = np.random.default_rng(derive_seed(master_seed, index, "environment"))
+  quota = int(_sample_float(rng, fraction_range) * len(objects))
+  chosen = set()
+  for position in rng.permutation(len(objects)):
+    if len(chosen) >= quota:
+      break
+    # A frozen obstacle inside the commanded corridor would make the target sweep
+    # fail in both branches, so those candidates stay dynamic.
+    if _blocks_target_sweep(objects[int(position)], factual_path, clearance):
+      continue
+    chosen.add(int(position))
+  return tuple(
+      replace(item, static=True, mass=0.0, metadata={"role": "environment"})
+      if position in chosen
+      else item
+      for position, item in enumerate(objects)
+  )
+
+
 def sample_instance_spec(
     ranges: Mapping[str, Any], master_seed: int, index: int
 ) -> InstanceSpec:
@@ -526,17 +582,6 @@ def sample_instance_spec(
     dynamic_objects.append(item)
     placed.append((item.position, extent))
 
-  scene_seed = derive_seed(master, attempt, "scene")
-  scene_config = SceneConfig(
-      objects=(floor, target) + tuple(dynamic_objects),
-      seed=scene_seed,
-      scene_bounds=(tuple(bounds[0]), tuple(bounds[1])),
-      gravity=gravity,
-      frame_range=frame_range,
-      frame_rate=frame_rate,
-      step_rate=step_rate,
-  )
-
   displacement = np.asarray((
       _sample_float(rng, displacement_x_range),
       _sample_float(rng, displacement_y_range),
@@ -561,6 +606,21 @@ def sample_instance_spec(
   ))
   factual_path = build_path(
       waypoints, steps, method=str(trajectory_ranges.get("method", "linear"))
+  )
+
+  free_objects = _assign_environment_roles(
+      object_ranges, tuple(dynamic_objects), factual_path,
+      max(target.size), master, attempt,
+  )
+  scene_seed = derive_seed(master, attempt, "scene")
+  scene_config = SceneConfig(
+      objects=(floor, target) + free_objects,
+      seed=scene_seed,
+      scene_bounds=(tuple(bounds[0]), tuple(bounds[1])),
+      gravity=gravity,
+      frame_range=frame_range,
+      frame_rate=frame_rate,
+      step_rate=step_rate,
   )
 
   expected = str(_choice(
@@ -605,6 +665,23 @@ def sample_instance_spec(
   return InstanceSpec(
       attempt, instance_seed, instance_id, scene_config, "target", factual_path,
       intervention, expected, start,
+  )
+
+
+def _sample_visual_scene(
+    ranges: Mapping[str, Any], spec: InstanceSpec, master_seed: int
+) -> Optional[appearance.VisualSceneSpec]:
+  """Samples the single visual scene both branches of an accepted instance share.
+
+  ``sample_visual_scene`` derives its per-domain seeds from the same
+  ``(master_seed, attempt_index)`` coordinates as the physics domains, so a resumed
+  run reproduces the appearance of every instance it already published.
+  """
+  section = ranges.get("appearance")
+  if not isinstance(section, Mapping) or not section.get("enabled", False):
+    return None
+  return appearance_sampling.sample_visual_scene(
+      ranges, spec.scene_config, master_seed, spec.attempt_index
   )
 
 
@@ -1403,6 +1480,7 @@ def _publish_instance(
     factual: SimulationLog,
     counterfactual: SimulationLog,
     ground_truth: GroundTruth,
+    visual_scene: Optional[appearance.VisualSceneSpec] = None,
 ) -> Path:
   instances = root / "instances"
   instances.mkdir(parents=True, exist_ok=True)
@@ -1425,6 +1503,7 @@ def _publish_instance(
           spec.instance_seed,
           factual,
           counterfactual,
+          visual_scene=visual_scene,
       )
       _, _, expected_truth, expected_provenance = read_paired_artifact(
           reference
@@ -1449,6 +1528,7 @@ def _publish_instance(
         spec.instance_seed,
         factual,
         counterfactual,
+        visual_scene=visual_scene,
     )
     _write_once(staging / "spec.json", _canonical_bytes(spec.to_dict()))
     instance_manifest = {
@@ -1881,6 +1961,9 @@ def _run_batch_unlocked(
             "qc": qc.to_dict(),
         }
         if qc.accepted:
+          # Appearance is sampled only once QC has accepted the physics, so
+          # rejected attempts never pay for it.
+          visual_scene = _sample_visual_scene(ranges, spec, seed)
           depth, bucket = propagation_hop_depth(truth)
           artifact_relative = Path("instances") / spec.instance_id
           summary = CandidateSummary(
@@ -1893,7 +1976,7 @@ def _run_batch_unlocked(
               str(artifact_relative),
           )
           artifact = _publish_instance(
-              root, spec, factual, counterfactual, truth
+              root, spec, factual, counterfactual, truth, visual_scene
           )
           if artifact != root / artifact_relative:
             raise RuntimeError("instance publisher returned an unexpected path")

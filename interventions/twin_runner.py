@@ -4,8 +4,9 @@ Purpose: rebuild fresh worlds, run the canonical branch pair, verify shared-pref
 and provenance contracts, extract pair truth, and publish/read paired artifacts.
 Public API: generate_paired_instance(), extract_pair_ground_truth(),
 write_paired_artifact(), and read_paired_artifact().
-Dependencies: schemas, trajectories, logging/graph/tagging, and the lazily exposed
-Kubric/PyBullet simulator backend. ``ObjectConfig.size`` maps to Kubric ``scale``.
+Dependencies: schemas, appearance schemas, trajectories, logging/graph/tagging, and
+the lazily exposed Kubric/PyBullet simulator backend. ``ObjectConfig.size`` maps to
+Kubric ``scale``.
 Trust boundary: canonical generation uses fresh physics worlds and records
 provenance, while caller-supplied logs accepted by publication remain unattested
 (``caller_trusted_unattested_logs_v1``) even when internally consistent.
@@ -28,7 +29,7 @@ import numpy as np
 
 import kubric as kb
 
-from interventions import _portability
+from interventions import _portability, appearance
 from interventions.graph_extraction import extract_ground_truth
 from interventions.kinematic_simulator import KinematicDragSimulator
 from interventions.logging import (
@@ -63,6 +64,10 @@ _PERTURB_ATTEMPTS = 64
 _PAIR_MANIFEST = "manifest.json"
 _PAIR_GENERATIONS = "generations"
 PAIR_TRUST_MODEL = "caller_trusted_unattested_logs_v1"
+# One visual scene is recorded for the pair, never per branch, so that the factual
+# and counterfactual renders cannot drift apart in anything but the trajectory.
+_VISUAL_PAIR_KEYS = frozenset(("visual_scene", "visual_scene_hash"))
+_OPTIONAL_PAIR_KEYS = frozenset(("trust_model",)) | _VISUAL_PAIR_KEYS
 _EXTRACTION_THRESHOLDS = {
     "force_threshold": 0.0,
     "min_episode_impulse": 0.0,
@@ -1548,6 +1553,53 @@ def _intervention_from_payload(payload: Any) -> Intervention:
     raise ValueError("pair intervention provenance is malformed") from error
 
 
+def _image_from_payload(payload: Any) -> Optional[appearance.ImageReference]:
+  if payload is None:
+    return None
+  return appearance.ImageReference(**dict(payload))
+
+
+def _visual_object_from_payload(payload: Any) -> appearance.VisualObjectSpec:
+  values = dict(payload)
+  asset = values.pop("asset")
+  material = dict(values.pop("material"))
+  texture = dict(material.pop("texture"))
+  texture["images"] = tuple(
+      appearance.ImageReference(**dict(image))
+      for image in texture.get("images", ())
+  )
+  return appearance.VisualObjectSpec(
+      asset=None if asset is None else appearance.AssetReference(**dict(asset)),
+      material=appearance.MaterialSpec(
+          texture=appearance.TextureSpec(**texture), **material
+      ),
+      **values,
+  )
+
+
+def _visual_scene_from_payload(payload: Any) -> appearance.VisualSceneSpec:
+  if not isinstance(payload, Mapping):
+    raise ValueError("pair visual_scene provenance is malformed")
+  try:
+    values = dict(payload)
+    background = dict(values.pop("background"))
+    background["hdri"] = _image_from_payload(background.get("hdri"))
+    return appearance.VisualSceneSpec(
+        objects=tuple(
+            _visual_object_from_payload(item) for item in values.pop("objects")
+        ),
+        camera=appearance.CameraRenderSpec(**dict(values.pop("camera"))),
+        lights=tuple(
+            appearance.LightSpec(**dict(light))
+            for light in values.pop("lights")
+        ),
+        background=appearance.BackgroundSpec(**background),
+        **values,
+    )
+  except (KeyError, TypeError, ValueError) as error:
+    raise ValueError("pair visual_scene provenance is malformed") from error
+
+
 def _ground_truth_from_payload(payload: Mapping[str, Any]) -> GroundTruth:
   try:
     values = dict(payload)
@@ -1586,9 +1638,11 @@ def read_paired_artifact(
       "extraction_thresholds",
   }
   actual_pair_keys = set(pair_payload)
-  if actual_pair_keys not in (
-      expected_pair_keys,
-      expected_pair_keys | {"trust_model"},
+  optional_keys = actual_pair_keys - expected_pair_keys
+  if (
+      not expected_pair_keys <= actual_pair_keys
+      or not optional_keys <= _OPTIONAL_PAIR_KEYS
+      or len(optional_keys & _VISUAL_PAIR_KEYS) not in (0, len(_VISUAL_PAIR_KEYS))
   ):
     raise ValueError("pair.json has missing or unexpected fields")
   if (
@@ -1615,6 +1669,18 @@ def read_paired_artifact(
       _EXTRACTION_THRESHOLDS
   ):
     raise ValueError("pair.json extraction_thresholds are incomplete")
+  if _VISUAL_PAIR_KEYS <= actual_pair_keys:
+    visual_scene = _visual_scene_from_payload(pair_payload["visual_scene"])
+    if pair_payload["visual_scene_hash"] != appearance.visual_scene_hash(
+        visual_scene
+    ):
+      raise ValueError("pair.json visual_scene_hash does not match visual_scene")
+    try:
+      appearance.validate_scene_correspondence(visual_scene, scene_config)
+    except (TypeError, ValueError) as error:
+      raise ValueError(
+          "pair.json visual_scene does not render the pair scene_config"
+      ) from error
 
   factual = read_simulation_log(generation / "factual")
   counterfactual = read_simulation_log(generation / "counterfactual")
@@ -1657,6 +1723,7 @@ def write_paired_artifact(
     factual_log: SimulationLog,
     counterfactual_log: SimulationLog,
     *,
+    visual_scene: Optional[appearance.VisualSceneSpec] = None,
     overwrite: bool = False,
     **thresholds: Any,
 ) -> GroundTruth:
@@ -1667,9 +1734,16 @@ def write_paired_artifact(
   origin.  Manifest hashes detect post-publication changes only; they do not
   authenticate the original in-memory inputs.  Canonical oracle creation uses
   :func:`generate_paired_instance` or dataset ``run_batch``.
+
+  An optional ``visual_scene`` is recorded once for the pair, so both branches
+  render from the same camera, lighting, background, and per-object materials.
   """
   if not isinstance(overwrite, bool):
     raise TypeError("overwrite must be a bool")
+  if visual_scene is not None and not isinstance(
+      visual_scene, appearance.VisualSceneSpec
+  ):
+    raise TypeError("visual_scene must be a VisualSceneSpec")
   seed = _rng_seed(rng_seed)
   target = Path(directory)
   if _path_exists(target) and not overwrite:
@@ -1683,6 +1757,8 @@ def write_paired_artifact(
       counterfactual_log,
       rng_seed=seed,
   )
+  if visual_scene is not None:
+    appearance.validate_scene_correspondence(visual_scene, scene_config)
   normalized_inputs = _normalized_threshold_inputs(thresholds)
   truth = extract_pair_ground_truth(
       scene_config,
@@ -1712,6 +1788,11 @@ def write_paired_artifact(
       "tags": tags,
       "extraction_thresholds": normalized_thresholds,
   }
+  if visual_scene is not None:
+    pair_payload["visual_scene"] = visual_scene
+    pair_payload["visual_scene_hash"] = appearance.visual_scene_hash(
+        visual_scene
+    )
 
   target.parent.mkdir(parents=True, exist_ok=True)
   staged_generation = Path(
