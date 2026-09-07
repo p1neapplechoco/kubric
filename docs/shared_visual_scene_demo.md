@@ -13,9 +13,10 @@ Two artifacts are published under `output/demo_visual_scene_sampling/`:
 | `appearance_sampling_gallery.mp4` | 1440×808, 72 frames — six instances under one fixed viewpoint, so every visible difference comes from the sampler |
 
 Both were rendered with the pip `bpy` Blender in the `thesis` environment,
-following [`render_no_docker.md`](../render_no_docker.md), on the CPU — see
-[Cycles device selection](#cycles-device-selection) for why that is not the
-accident it looks like.
+following [`render_no_docker.md`](../render_no_docker.md), on the CPU — not by
+choice, but because setting `KUBRIC_USE_GPU` silently fails to reach the GPU.
+See [Cycles device selection](#cycles-device-selection); re-rendering them on
+the GPU would be about three and a half times faster.
 
 ## What the three panels show
 
@@ -150,23 +151,56 @@ selecting a backend must also do it *after* the renderer is constructed:
 Blender's constructor calls `clear_and_reset_blender_scene`, which calls
 `read_factory_settings` and discards preferences set beforehand.
 
-For this workload the CPU is the right choice anyway. One branch at 640×540,
-64 spp, 72 frames, measured back to back on the same machine, took **580 s on the
-i7-13850HX** against **1010 s on the RTX 3500 Ada via OPTIX** — the frames are
-small and the geometry is animated, so per-frame acceleration-structure rebuilds
-dominate and the RT cores never get enough work to pay for them. The two renders
-are otherwise equivalent: compared frame by frame, the peak difference is 9
-pixels, 0.00% of the image. A larger resolution or sample count should reverse
-the ordering, but that is untested here.
+For this workload the GPU is roughly three and a half times faster. One branch at
+640×540, 64 spp, 72 frames, timed per frame:
+
+| Device | Wall | Inside `render()` | Median frame |
+| --- | --- | --- | --- |
+| RTX 3500 Ada via OPTIX | **192 s** | 126 s | **1.75 s** |
+| i7-13850HX | **672 s** | 602 s | **6.18 s** |
+
+The wall-clock ratio (3.5×) is smaller than the in-render ratio (4.8×) because
+about 67 s of each run is device-independent: building the scene, decoding the
+per-frame EXRs, and encoding the mp4. The two renders are equivalent — compared
+frame by frame, the peak difference is 9 pixels, 0.00% of the image.
+
+An earlier version of this document reported the opposite, 1010 s on OPTIX
+against 580 s on the CPU, and explained it with per-frame acceleration-structure
+rebuilds. That measurement does not reproduce and the explanation was wrong. The
+likely contaminant is one-time OptiX kernel compilation: the machine's
+`OptixCache\optix7cache.db` was created by that very first OPTIX render, so it
+paid a cold-cache compile that every later run reads back. The per-frame numbers
+rule out the competing explanation, thermal throttling — on a laptop that would
+show as a run degrading under its own heat, and neither run does. Comparing the
+median of the first quarter of frames against the last: 1.69 s → 1.76 s on the
+GPU, 5.82 s → 6.22 s on the CPU.
+
+Two one-off costs are worth knowing about. The CPU's first frame takes 38.6 s
+against a 6.18 s median, which is Cycles building its CPU kernels and denoiser
+state; the GPU's first frame, against a warm cache, is 1.76 s and indistinguishable
+from its median. So a benchmark short enough for either warm-up to matter will
+mislead, which is how the original number happened.
+
+The per-frame teardown is real, it is just not decisive. Kubric renders one frame
+per `bpy.ops.render.render()` call (`kubric/renderer/blender.py:342`) and never
+sets `use_persistent_data`, so each frame re-syncs the scene and, on the GPU,
+re-uploads geometry and rebuilds the acceleration structure. That is visible as
+dedicated VRAM oscillating between 895 MB and 125 MB, and as GPU utilization
+that peaks near 30% rather than saturating. It costs the GPU headroom; it does
+not cost it the win.
 
 That the GPU path really engages the card was confirmed against the operating
 system rather than against the harness's own log line, by sampling
 `\GPU Process Memory(pid_*)\Dedicated Usage` and
 `\GPU Engine(pid_*)\Utilization Percentage` for the render process through two
 otherwise identical runs: the CPU run held 0.0 MB and 0.0 % on every sample,
-the OPTIX run 895 MB and 28.8–33.1 %. The utilization ceiling near 30 %, and the
-between-frame dips to 125–535 MB as the acceleration structure is freed and
-rebuilt, are the same effect the timings above report.
+the OPTIX run 895 MB and 28.8–33.1 %.
+
+`bench_device.py` in the demo directory produces these numbers. It wraps
+`render_visual_scene.py` rather than reimplementing it, hooking `_enable_gpu` to
+install Blender's `render_pre`/`render_post` handlers at a point
+`read_factory_settings` can no longer discard them, so what it times is exactly
+the scene that produces the clips above.
 
 ## Reproducing it
 
