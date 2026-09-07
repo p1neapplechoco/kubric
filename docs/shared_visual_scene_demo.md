@@ -159,6 +159,15 @@ are otherwise equivalent: compared frame by frame, the peak difference is 9
 pixels, 0.00% of the image. A larger resolution or sample count should reverse
 the ordering, but that is untested here.
 
+That the GPU path really engages the card was confirmed against the operating
+system rather than against the harness's own log line, by sampling
+`\GPU Process Memory(pid_*)\Dedicated Usage` and
+`\GPU Engine(pid_*)\Utilization Percentage` for the render process through two
+otherwise identical runs: the CPU run held 0.0 MB and 0.0 % on every sample,
+the OPTIX run 895 MB and 28.8–33.1 %. The utilization ceiling near 30 %, and the
+between-frame dips to 125–535 MB as the acceleration structure is freed and
+rebuilt, are the same effect the timings above report.
+
 ## Reproducing it
 
 The batch that backs these clips is generated from a copy of
