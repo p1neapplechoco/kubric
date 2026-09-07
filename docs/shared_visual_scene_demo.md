@@ -13,7 +13,9 @@ Two artifacts are published under `output/demo_visual_scene_sampling/`:
 | `appearance_sampling_gallery.mp4` | 1440×808, 72 frames — six instances under one fixed viewpoint, so every visible difference comes from the sampler |
 
 Both were rendered with the pip `bpy` Blender in the `thesis` environment,
-following [`render_no_docker.md`](../render_no_docker.md).
+following [`render_no_docker.md`](../render_no_docker.md), on the CPU — see
+[Cycles device selection](#cycles-device-selection) for why that is not the
+accident it looks like.
 
 ## What the three panels show
 
@@ -127,6 +129,35 @@ frame 29, rising to 2.27% by frame 60.
 Same camera in all six, so every visible difference — olive metal floor versus
 pink speckle versus purple marble, glass cubes versus lacquered spheres, warm
 versus cool light rigs — comes from `sample_visual_scene`.
+
+## Cycles device selection
+
+Setting `KUBRIC_USE_GPU=true` is **not** sufficient to render on the GPU, and the
+failure is silent. Kubric reads the variable and sets `scene.cycles.device` to
+`"GPU"` (`kubric/renderer/blender.py:127`), but it never sets
+`preferences.compute_device_type`, which is what actually selects the CUDA/OPTIX
+backend. A fresh pip `bpy` has no preferences file to supply one, so the backend
+stays `NONE`:
+
+```text
+compute_device_type: NONE
+  get_devices_for_type(NONE ) -> []
+  get_devices_for_type(OPTIX) -> ['NVIDIA RTX 3500 Ada Generation Laptop GPU', ...]
+```
+
+With an empty device list Cycles falls back to the CPU without warning. Anything
+selecting a backend must also do it *after* the renderer is constructed:
+Blender's constructor calls `clear_and_reset_blender_scene`, which calls
+`read_factory_settings` and discards preferences set beforehand.
+
+For this workload the CPU is the right choice anyway. One branch at 640×540,
+64 spp, 72 frames, measured back to back on the same machine, took **580 s on the
+i7-13850HX** against **1010 s on the RTX 3500 Ada via OPTIX** — the frames are
+small and the geometry is animated, so per-frame acceleration-structure rebuilds
+dominate and the RT cores never get enough work to pay for them. The two renders
+are otherwise equivalent: compared frame by frame, the peak difference is 9
+pixels, 0.00% of the image. A larger resolution or sample count should reverse
+the ordering, but that is untested here.
 
 ## Reproducing it
 
