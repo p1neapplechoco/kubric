@@ -340,6 +340,7 @@ def _build_scene(
   columns = {oid: index for index, oid in enumerate(log.object_ids)}
   for object_id, asset in assets.items():
     column = columns[object_id]
+    blender_obj = asset.linked_objects.get(renderer)
     for frame, step in enumerate(frame_steps):
       state = log.states[step, column]
       asset.position = state[POSITION_SLICE]
@@ -348,6 +349,12 @@ def _build_scene(
       asset.angular_velocity = state[ANGULAR_VELOCITY_SLICE]
       for member in ("position", "quaternion", "velocity", "angular_velocity"):
         asset.keyframe_insert(member, frame)
+      if blender_obj is not None:
+        is_hidden = bool(state[POSITION_SLICE][2] < -500.0)
+        blender_obj.hide_render = is_hidden
+        blender_obj.hide_viewport = is_hidden
+        blender_obj.keyframe_insert(data_path="hide_render", frame=frame)
+        blender_obj.keyframe_insert(data_path="hide_viewport", frame=frame)
   return kscene, renderer, assets, device_record
 
 
@@ -393,6 +400,7 @@ def _tracking(
   columns = {oid: index for index, oid in enumerate(log.object_ids)}
   states = np.full((frames, n, 13), np.nan, dtype=np.float32)
   presence = np.zeros((n,), dtype=bool)
+  frame_presence = np.zeros((frames, n), dtype=bool)
   image_positions = np.full((frames, n, 2), np.nan, dtype=np.float32)
   in_front = np.zeros((frames, n), dtype=bool)
   bboxes = np.full((frames, n, 4), np.nan, dtype=np.float32)
@@ -406,6 +414,16 @@ def _tracking(
     column = columns[object_id]
     for frame, step in enumerate(frame_steps):
       state = log.states[step, column]
+      if state[POSITION_SLICE][2] < -500.0:
+        # Object is removed from scene at this frame
+        frame_presence[frame, index] = False
+        states[frame, index] = np.nan
+        image_positions[frame, index] = np.nan
+        in_front[frame, index] = False
+        bboxes[frame, index] = np.nan
+        visibility[frame, index] = 0
+        continue
+      frame_presence[frame, index] = True
       states[frame, index] = state
       projected = kscene.camera.project_point(state[POSITION_SLICE], frame=rendered_frames[frame])
       image_positions[frame, index] = projected[:2]
@@ -424,6 +442,7 @@ def _tracking(
       "roles": np.array([spec.roles[oid] for oid in object_ids]),
       "segmentation_ids": np.arange(n, dtype=np.int32),
       "present": presence,
+      "frame_presence": frame_presence,
       "frames": np.asarray(rendered_frames, dtype=np.int32),
       "physics_steps": np.asarray(frame_steps, dtype=np.int32),
       "positions": states[..., POSITION_SLICE],

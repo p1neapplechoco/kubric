@@ -87,16 +87,35 @@ def test_branches_differ_only_as_specified(spec):
   factual = spec.scene
   counterfactual = spec.counterfactual_scene
   removed = spec.removed_scene
-  assert len(counterfactual.objects) == len(factual.objects)
-  for f_item, c_item in zip(factual.objects, counterfactual.objects):
-    if f_item.object_id == spec.subject_id:
-      assert c_item.linear_velocity == spec.counterfactual_velocity
-      assert c_item.linear_velocity != f_item.linear_velocity
-      assert c_item.position == f_item.position and c_item.quaternion == f_item.quaternion
-    else:
-      assert c_item == f_item
-  assert spec.subject_id not in {item.object_id for item in removed.objects}
-  assert len(removed.objects) == len(factual.objects) - 1
+  # All branches share the identical initial scene at t=0.
+  assert counterfactual == factual
+  assert removed == factual
+  # Simulation branches diverge only at intervention_step.
+  logs = vi.simulate_branches(spec)
+  f_log = logs["factual"]
+  c_log = logs["counterfactual"]
+  r_log = logs["subject_removed"]
+  intervention_step = int(c_log.metadata["intervention_step"])
+  assert intervention_step > 0
+  # Prior to intervention_step, states are identical.
+  np.testing.assert_allclose(
+      f_log.states[:intervention_step],
+      c_log.states[:intervention_step],
+      atol=1e-6,
+  )
+  np.testing.assert_allclose(
+      f_log.states[:intervention_step],
+      r_log.states[:intervention_step],
+      atol=1e-6,
+  )
+  # In subject_removed, after intervention_step, subject is removed (z < -500).
+  sub_col = f_log.object_ids.index(spec.subject_id)
+  assert (r_log.states[intervention_step:, sub_col, POSITION_SLICE][:, 2] < -500.0).all()
+  # In counterfactual, subject velocity changes at intervention_step.
+  assert not np.allclose(
+      f_log.states[intervention_step, sub_col, LINEAR_VELOCITY_SLICE],
+      c_log.states[intervention_step, sub_col, LINEAR_VELOCITY_SLICE],
+  )
 
 
 def test_simulation_log_shape_and_initial_velocity(spec):
@@ -139,13 +158,14 @@ def test_write_and_read_round_trip(generated, tmp_path):
     assert graph["branch"] == branch
     assert all(spec.floor_id not in (e["object_a"], e["object_b"]) for e in graph["edges"])
   removed = vi.read_branch_log(target, "subject_removed")
-  assert spec.subject_id not in removed.object_ids
+  assert spec.subject_id in removed.object_ids
+  assert int(removed.metadata["intervention_step"]) > 0
   payload = json.loads((target / "instance.json").read_text())
   assert payload["instance_id"] == spec.instance_id
 
 
 def test_motion_summary_labels_static_bodies(spec):
-  log = vi.simulate_scene(spec.removed_scene, spec.physics, "subject_removed")
-  summary = vi.motion_summary(log, spec.removed_scene)
-  assert set(summary) == {oid for oid in log.object_ids if oid != spec.floor_id}
-  assert all(info["label"] == "static" for info in summary.values())
+  logs = vi.simulate_branches(spec)
+  summary = vi.motion_summary(logs["subject_removed"], spec.scene)
+  non_subject_ids = [oid for oid in spec.object_ids if oid not in (spec.floor_id, spec.subject_id)]
+  assert all(summary[oid]["label"] == "static" for oid in non_subject_ids)

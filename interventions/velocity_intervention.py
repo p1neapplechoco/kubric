@@ -221,30 +221,18 @@ class VelocityInstanceSpec:
 
   @property
   def counterfactual_scene(self) -> SceneConfig:
-    """Factual scene with the subject's initial velocity replaced."""
-    objects = tuple(
-        dataclasses.replace(item, linear_velocity=self.counterfactual_velocity)
-        if item.object_id == self.subject_id else item
-        for item in self.scene.objects
-    )
-    return dataclasses.replace(self.scene, objects=objects)
+    """Initial scene for counterfactual (matches factual at t=0; velocity intervenes mid-video)."""
+    return self.scene
 
   @property
   def removed_scene(self) -> SceneConfig:
-    """Factual scene without the subject."""
-    objects = tuple(
-        item for item in self.scene.objects if item.object_id != self.subject_id
-    )
-    return dataclasses.replace(self.scene, objects=objects)
+    """Initial scene for subject_removed (matches factual at t=0; subject removed mid-video)."""
+    return self.scene
 
   def scene_for(self, branch: str) -> SceneConfig:
-    """Returns the :class:`SceneConfig` realized by ``branch``."""
-    if branch == "factual":
+    """Returns the initial :class:`SceneConfig` realized by ``branch`` at t=0."""
+    if branch in BRANCHES:
       return self.scene
-    if branch == "counterfactual":
-      return self.counterfactual_scene
-    if branch == "subject_removed":
-      return self.removed_scene
     raise ValueError("unknown branch: {!r}".format(branch))
 
   def to_dict(self) -> Mapping[str, Any]:
@@ -716,12 +704,15 @@ def _kubric_asset(item: ObjectConfig):
 def simulate_scene(
     scene: SceneConfig, physics: Mapping[str, Mapping[str, Any]], branch: str,
     scratch_dir: Optional[PathLike] = None,
+    subject_id: Optional[str] = None,
+    intervention_step: Optional[int] = None,
+    heading_change_rad: Optional[float] = None,
 ) -> SimulationLog:
   """Runs ``scene`` as free rigid bodies and returns a per-step :class:`SimulationLog`.
 
-  The subject's initial velocity is applied exactly once, before step 0. States
-  are recorded for every physics step (``steps_per_frame * frames + 1`` rows) so
-  the contact graph has full temporal resolution; renderers subsample by frame.
+  For ``factual``, the subject runs with its initial velocity throughout.
+  For ``counterfactual``, the subject's velocity heading is altered mid-video at ``intervention_step``.
+  For ``subject_removed``, the subject is removed mid-video at ``intervention_step`` before collision.
   """
   from kubric import core  # pylint: disable=import-outside-toplevel
   from kubric.simulator.pybullet import PyBullet  # pylint: disable=import-outside-toplevel
@@ -742,7 +733,9 @@ def simulate_scene(
     client.setTimeStep(1.0 / float(scene.step_rate))
     assets = []
     body_ids: Dict[int, str] = {}
-    for item in scene.objects:
+    subject_body = None
+    subject_col = None
+    for column, item in enumerate(scene.objects):
       asset = _kubric_asset(item)
       kscene.add(asset)
       body = int(asset.linked_objects[simulator])
@@ -762,6 +755,9 @@ def simulate_scene(
         )
       assets.append((item.object_id, body))
       body_ids[body] = item.object_id
+      if item.object_id == subject_id:
+        subject_body = body
+        subject_col = column
 
     logger = ContactLogger(body_ids, step_rate=float(scene.step_rate), force_epsilon=1e-6)
     states = np.zeros((total_steps + 1, len(assets), 13), dtype=np.float64)
@@ -777,16 +773,62 @@ def simulate_scene(
 
     snapshot(0)
     for step in range(1, total_steps + 1):
+      # Mid-video intervention at intervention_step
+      if intervention_step is not None and step == intervention_step and subject_body is not None:
+        if branch == "counterfactual":
+          cur_vel, cur_ang = client.getBaseVelocity(subject_body)
+          speed = math.hypot(cur_vel[0], cur_vel[1])
+          if speed > 1e-4 and heading_change_rad is not None:
+            heading = math.atan2(cur_vel[1], cur_vel[0])
+            new_heading = heading + heading_change_rad
+            new_vx = speed * math.cos(new_heading)
+            new_vy = speed * math.sin(new_heading)
+            spin = math.hypot(cur_ang[0], cur_ang[1])
+            new_ang = (
+                (-new_vy / speed * spin, new_vx / speed * spin, cur_ang[2])
+                if spin > 1e-4 else cur_ang
+            )
+            client.resetBaseVelocity(
+                subject_body, linearVelocity=(new_vx, new_vy, cur_vel[2]), angularVelocity=new_ang
+            )
+        elif branch == "subject_removed":
+          client.resetBasePositionAndOrientation(subject_body, [0.0, 0.0, -1000.0], [0.0, 0.0, 0.0, 1.0])
+          client.resetBaseVelocity(subject_body, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+
       client.stepSimulation()
-      logger.log(step, tuple(client.getContactPoints()))
+
+      contacts = client.getContactPoints()
+      if (
+          branch == "subject_removed"
+          and intervention_step is not None
+          and step >= intervention_step
+          and subject_body is not None
+      ):
+        client.resetBasePositionAndOrientation(subject_body, [0.0, 0.0, -1000.0], [0.0, 0.0, 0.0, 1.0])
+        client.resetBaseVelocity(subject_body, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+        contacts = tuple(
+            cp for cp in contacts
+            if cp[1] != subject_body and cp[2] != subject_body
+        )
+
+      logger.log(step, tuple(contacts))
       snapshot(step)
+
+      if (
+          branch == "subject_removed"
+          and intervention_step is not None
+          and step >= intervention_step
+          and subject_col is not None
+      ):
+        states[step, subject_col, POSITION_SLICE] = (0.0, 0.0, -1000.0)
+        states[step, subject_col, QUATERNION_SLICE] = (1.0, 0.0, 0.0, 0.0)
+        states[step, subject_col, LINEAR_VELOCITY_SLICE] = (0.0, 0.0, 0.0)
+        states[step, subject_col, ANGULAR_VELOCITY_SLICE] = (0.0, 0.0, 0.0)
   finally:
     try:
       client.disconnect()
     except Exception:  # pragma: no cover - best effort cleanup
       pass
-    # Bullet reuses client ids; make the wrapper's __del__ a no-op so it can never
-    # disconnect a *later* simulation that received the same id.
     client._client = -1  # pylint: disable=protected-access
     if owned_scratch:
       shutil.rmtree(scratch, ignore_errors=True)
@@ -803,15 +845,46 @@ def simulate_scene(
           "frame_rate": scene.frame_rate,
           "steps_per_frame": steps_per_frame,
           "simulator": "kubric.simulator.pybullet.PyBullet",
+          "intervention_step": intervention_step if intervention_step is not None else 0,
+          "intervention_frame": (intervention_step // steps_per_frame) if intervention_step is not None else 0,
       },
   )
 
 
 def simulate_branches(spec: VelocityInstanceSpec) -> Mapping[str, SimulationLog]:
-  """Simulates ``factual``, ``counterfactual`` and ``subject_removed``."""
+  """Simulates ``factual``, ``counterfactual`` (mid-video velocity change) and ``subject_removed`` (mid-video removal)."""
+  factual_log = simulate_scene(spec.scene, spec.physics, "factual", subject_id=spec.subject_id)
+
+  steps_per_frame = spec.scene.step_rate // spec.scene.frame_rate
+  total_steps = (spec.scene.frame_range[1] - spec.scene.frame_range[0]) * steps_per_frame
+  collision_steps = [
+      r.step for r in factual_log.contacts
+      if (r.object_a == spec.subject_id or r.object_b == spec.subject_id)
+      and r.object_a != spec.floor_id and r.object_b != spec.floor_id
+  ]
+  if collision_steps:
+    first_collision = min(collision_steps)
+    intervention_step = max(steps_per_frame, min(int(round(first_collision * 0.5)), first_collision - steps_per_frame))
+  else:
+    intervention_step = max(steps_per_frame, total_steps // 3)
+
+  heading_delta = float(spec.metadata.get("heading_change_rad", 0.4))
+  if abs(heading_delta) < 0.1:
+    heading_delta = 0.4
+
+  counterfactual_log = simulate_scene(
+      spec.scene, spec.physics, "counterfactual",
+      subject_id=spec.subject_id, intervention_step=intervention_step,
+      heading_change_rad=heading_delta,
+  )
+  removed_log = simulate_scene(
+      spec.scene, spec.physics, "subject_removed",
+      subject_id=spec.subject_id, intervention_step=intervention_step,
+  )
   return {
-      branch: simulate_scene(spec.scene_for(branch), spec.physics, branch)
-      for branch in BRANCHES
+      "factual": factual_log,
+      "counterfactual": counterfactual_log,
+      "subject_removed": removed_log,
   }
 
 
@@ -971,15 +1044,26 @@ def evaluate_qc(
     if bool(qc.get("keep_in_bounds", True)):
       lower, upper = spec.scene.scene_bounds
       positions = log.states[:, :, POSITION_SLICE]
-      if (positions < np.asarray(lower)).any() or (positions > np.asarray(upper)).any():
+      valid_pos = positions[positions[:, :, 2] > -500.0]
+      if len(valid_pos) > 0 and (
+          (valid_pos < np.asarray(lower)).any() or (valid_pos > np.asarray(upper)).any()
+      ):
         reasons.append("{}: a body left scene bounds".format(branch))
 
-  # The removed branch must be quiet: nothing else was actuated.
+  # The removed branch: subject is removed before collision; non-subject bodies must remain at rest.
   removed_motion = motion["subject_removed"]
-  removed_travel = max((info["travel"] for info in removed_motion.values()), default=0.0)
-  metrics["removed_max_travel"] = removed_travel
-  if removed_travel > 0.05:
-    reasons.append("subject_removed branch is not at rest ({:.3f} m)".format(removed_travel))
+  non_subject_travel = max(
+      (info["travel"] for oid, info in removed_motion.items() if oid != subject_id),
+      default=0.0,
+  )
+  metrics["removed_max_travel"] = non_subject_travel
+  if non_subject_travel > 0.05:
+    reasons.append("non-subject body moved in subject_removed branch ({:.3f} m)".format(non_subject_travel))
+
+  removed_touched = _touched_ids(removed, floor_id)
+  removed_struck = sorted(removed_touched[subject_id])
+  if removed_struck:
+    reasons.append("subject struck bodies before removal in subject_removed branch: {}".format(removed_struck))
 
   factual_graph = contact_log_to_temporal_graph(
       tuple(r for r in factual.contacts if floor_id not in (r.object_a, r.object_b)),
@@ -1010,8 +1094,9 @@ def extract_instance_ground_truth(
     spec: VelocityInstanceSpec, logs: Mapping[str, SimulationLog]
 ) -> GroundTruth:
   """Graph delta, affected objects and propagation paths (floor excluded)."""
+  intervention_step = int(logs["counterfactual"].metadata.get("intervention_step", 0))
   return extract_ground_truth(
-      logs["factual"], logs["counterfactual"], spec.subject_id, 0,
+      logs["factual"], logs["counterfactual"], spec.subject_id, intervention_step,
       exclude_nodes=(spec.floor_id,), force_threshold=1e-6,
   )
 
