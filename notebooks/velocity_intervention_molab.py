@@ -88,9 +88,8 @@ def _(mo):
     workdir = mo.ui.text(value="/tmp/kubric-work", label="Work directory", full_width=True)
     seed = mo.ui.number(value=0, start=0, stop=2**31 - 1, step=1, label="Master seed")
     count = mo.ui.number(value=8, start=1, stop=100000, step=1, label="Number of scenes")
-    workers = mo.ui.slider(start=1, stop=32, step=1, value=16, label="Parallel GPU workers (max throttle 96GB VRAM)")
-    resolution = mo.ui.dropdown(options=["128", "256", "384", "512"], value="256", label="Resolution")
-    samples = mo.ui.dropdown(options=["16", "32", "64", "128"], value="64", label="Cycles samples / pixel")
+    resolution = mo.ui.dropdown(options=["256", "384", "512", "768", "1024"], value="512", label="Resolution (primary quality & GPU scaling)")
+    samples = mo.ui.dropdown(options=["32", "64", "128", "256"], value="64", label="Cycles samples / pixel")
     require_gpu = mo.ui.checkbox(value=True, label="Require GPU rendering (fail instead of CPU fallback)")
     prefer_docker = mo.ui.checkbox(value=True, label="Prefer Docker when the daemon + NVIDIA runtime are available")
     hf_repo = mo.ui.text(value="", label="Hugging Face dataset repo id (user/name)", full_width=True)
@@ -100,15 +99,15 @@ def _(mo):
         mo.md("## 1. Settings"),
         mo.hstack([repo_url, repo_ref], widths=[3, 1]),
         workdir,
-        mo.hstack([seed, count, workers]),
-        mo.hstack([resolution, samples, require_gpu, prefer_docker]),
+        mo.hstack([seed, count, resolution, samples]),
+        mo.hstack([require_gpu, prefer_docker]),
         hf_repo,
         hf_token,
         hf_private,
     ])
     return (
         count, hf_private, hf_repo, hf_token, prefer_docker, repo_ref, repo_url,
-        require_gpu, resolution, samples, seed, workdir, workers,
+        require_gpu, resolution, samples, seed, workdir,
     )
 
 
@@ -463,13 +462,13 @@ def _(mo):
 
 
 @app.cell
-def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, time, work, workers):
+def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, time, work):
     mo.stop(not build_button.value, mo.md("_Press to generate._"))
     dataset_dir = work / "dataset"
     cmd = (
-        "{runner} scripts/build_velocity_dataset.py --output {out} --seed {seed} --count {count} --workers {workers} "
+        "{runner} scripts/build_velocity_dataset.py --output {out} --seed {seed} --count {count} "
         "--resolution {res} --samples {spp} --layers rgba segmentation depth {gpu}"
-    ).format(runner=runner, out=dataset_dir, seed=int(seed.value), count=int(count.value), workers=int(workers.value),
+    ).format(runner=runner, out=dataset_dir, seed=int(seed.value), count=int(count.value),
              res=resolution.value, spp=samples.value, gpu="--require-gpu --strict" if require_gpu.value else "")
     started = time.time()
     sh(cmd, cwd=repo_dir, stream=True, env={"PYTHONPATH": str(repo_dir), "TF_CPP_MIN_LOG_LEVEL": "3", "KUBRIC_USE_GPU": "true"})
