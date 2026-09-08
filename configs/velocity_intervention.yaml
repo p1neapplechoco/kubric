@@ -80,6 +80,7 @@ physics:
 qc:
   max_attempts: 24              # resamples per instance before giving up
   min_struck: 1                 # factual: subject must hit at least one body
+  min_counterfactual_struck: 1  # counterfactual: subject must hit at least one body
   min_untouched: 1              # factual: at least one body never touched
   require_rolling: true         # some body must roll (|ω| r ≈ |v|)
   require_sliding: true         # some body must slip on the floor

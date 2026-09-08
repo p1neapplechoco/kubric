@@ -851,6 +851,86 @@ def simulate_scene(
   )
 
 
+def _simulate_colliding_counterfactual(
+    spec: VelocityInstanceSpec,
+    factual_log: SimulationLog,
+    intervention_step: int,
+    rng: np.random.Generator,
+) -> SimulationLog:
+  """Finds a candidate heading change at ``intervention_step`` that prioritizes causing a collision."""
+  steps_per_frame = spec.scene.step_rate // spec.scene.frame_rate
+  total_steps = (spec.scene.frame_range[1] - spec.scene.frame_range[0]) * steps_per_frame
+  rem_time = (total_steps - intervention_step) / spec.scene.step_rate
+
+  sub_col = factual_log.object_ids.index(spec.subject_id)
+  sub_pos = factual_log.states[intervention_step, sub_col, POSITION_SLICE]
+  sub_vel = factual_log.states[intervention_step, sub_col, LINEAR_VELOCITY_SLICE]
+  sub_speed = math.hypot(sub_vel[0], sub_vel[1])
+  cur_heading = math.atan2(sub_vel[1], sub_vel[0])
+
+  f_touched = _touched_ids(factual_log, spec.floor_id).get(spec.subject_id, set())
+  by_id = {item.object_id: item for item in spec.scene.objects}
+  sub_item = by_id[spec.subject_id]
+  r_sub = _radial_extent(sub_item.shape, sub_item.size)
+
+  candidates = []
+  for oid in spec.object_ids:
+    if oid in (spec.subject_id, spec.floor_id):
+      continue
+    col = factual_log.object_ids.index(oid)
+    pos = factual_log.states[intervention_step, col, POSITION_SLICE]
+    item = by_id[oid]
+    r_obj = _radial_extent(item.shape, item.size)
+    r_contact = r_sub + r_obj
+
+    dx = pos[0] - sub_pos[0]
+    dy = pos[1] - sub_pos[1]
+    dist = math.hypot(dx, dy)
+    if dist <= r_contact or dist > sub_speed * rem_time * 0.95:
+      continue
+    angle = math.atan2(dy, dx)
+    delta = (angle - cur_heading + math.pi) % (2 * math.pi) - math.pi
+    if abs(delta) > math.pi / 2:  # must be in front
+      continue
+    if abs(delta) < 0.10:  # significant heading change
+      continue
+    span = math.asin(min(0.99, r_contact / dist))
+    is_novel = oid not in f_touched
+    candidates.append((is_novel, -abs(delta), delta, span, oid))
+
+  candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+
+  # Try simulating candidate targets to guarantee a counterfactual collision
+  for is_novel, _, delta, span, oid in candidates:
+    jitter = float(rng.uniform(-0.35 * span, 0.35 * span))
+    target_delta = delta + jitter
+    log = simulate_scene(
+        spec.scene, spec.physics, "counterfactual",
+        subject_id=spec.subject_id, intervention_step=intervention_step,
+        heading_change_rad=target_delta,
+    )
+    struck = _touched_ids(log, spec.floor_id).get(spec.subject_id, set())
+    if struck:
+      new_meta = dict(log.metadata)
+      new_meta["counterfactual_target_id"] = oid
+      new_meta["heading_change_rad"] = target_delta
+      return dataclasses.replace(log, metadata=new_meta)
+
+  # Fallback to metadata heading change if no candidate produced a collision
+  fallback_delta = float(spec.metadata.get("heading_change_rad", 0.4))
+  if abs(fallback_delta) < 0.1:
+    fallback_delta = 0.4
+  log = simulate_scene(
+      spec.scene, spec.physics, "counterfactual",
+      subject_id=spec.subject_id, intervention_step=intervention_step,
+      heading_change_rad=fallback_delta,
+  )
+  new_meta = dict(log.metadata)
+  new_meta["counterfactual_target_id"] = None
+  new_meta["heading_change_rad"] = fallback_delta
+  return dataclasses.replace(log, metadata=new_meta)
+
+
 def simulate_branches(spec: VelocityInstanceSpec) -> Mapping[str, SimulationLog]:
   """Simulates ``factual``, ``counterfactual`` (mid-video velocity change) and ``subject_removed`` (mid-video removal)."""
   factual_log = simulate_scene(spec.scene, spec.physics, "factual", subject_id=spec.subject_id)
@@ -868,14 +948,9 @@ def simulate_branches(spec: VelocityInstanceSpec) -> Mapping[str, SimulationLog]
   else:
     intervention_step = max(steps_per_frame, total_steps // 3)
 
-  heading_delta = float(spec.metadata.get("heading_change_rad", 0.4))
-  if abs(heading_delta) < 0.1:
-    heading_delta = 0.4
-
-  counterfactual_log = simulate_scene(
-      spec.scene, spec.physics, "counterfactual",
-      subject_id=spec.subject_id, intervention_step=intervention_step,
-      heading_change_rad=heading_delta,
+  rng = np.random.default_rng(derive_seed(spec.master_seed, spec.index, "cf_target"))
+  counterfactual_log = _simulate_colliding_counterfactual(
+      spec, factual_log, intervention_step, rng
   )
   removed_log = simulate_scene(
       spec.scene, spec.physics, "subject_removed",
@@ -1013,6 +1088,13 @@ def evaluate_qc(
     reasons.append("subject struck {} bodies (< {})".format(len(struck), qc.get("min_struck", 1)))
   if len(untouched) < int(qc.get("min_untouched", 0)):
     reasons.append("only {} untouched bodies".format(len(untouched)))
+
+  cf_touched = _touched_ids(counterfactual, floor_id)
+  cf_struck = sorted(cf_touched[subject_id])
+  metrics["counterfactual_struck"] = cf_struck
+  min_cf_struck = int(qc.get("min_counterfactual_struck", 1))
+  if len(cf_struck) < min_cf_struck:
+    reasons.append("counterfactual subject struck {} bodies (< {})".format(len(cf_struck), min_cf_struck))
 
   factual_motion = motion["factual"]
   labels = {label for info in factual_motion.values() for label in (info["label"],)}

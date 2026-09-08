@@ -116,6 +116,9 @@ def test_branches_differ_only_as_specified(spec):
       f_log.states[intervention_step, sub_col, LINEAR_VELOCITY_SLICE],
       c_log.states[intervention_step, sub_col, LINEAR_VELOCITY_SLICE],
   )
+  # Counterfactual subject collides with at least one body
+  cf_struck = vi._touched_ids(c_log, spec.floor_id).get(spec.subject_id, set())
+  assert len(cf_struck) >= 1
 
 
 def test_simulation_log_shape_and_initial_velocity(spec):
@@ -139,6 +142,7 @@ def test_generated_instance_passes_qc_with_mixed_motion(generated, ranges):
   assert any(info["sliding_fraction"] > 0.2 for info in motion.values())
   assert len(generated.qc.metrics["factual_struck"]) >= ranges["qc"]["min_struck"]
   assert len(generated.qc.metrics["factual_untouched"]) >= ranges["qc"]["min_untouched"]
+  assert len(generated.qc.metrics["counterfactual_struck"]) >= ranges["qc"]["min_counterfactual_struck"]
   # Nothing moves when the subject is removed.
   assert generated.qc.metrics["removed_max_travel"] < 0.05
   truth = generated.ground_truth
