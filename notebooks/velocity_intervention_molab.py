@@ -88,6 +88,7 @@ def _(mo):
     workdir = mo.ui.text(value="/tmp/kubric-work", label="Work directory", full_width=True)
     seed = mo.ui.number(value=0, start=0, stop=2**31 - 1, step=1, label="Master seed")
     count = mo.ui.number(value=8, start=1, stop=100000, step=1, label="Number of scenes")
+    workers = mo.ui.slider(start=1, stop=32, step=1, value=16, label="Parallel GPU workers (max throttle 96GB VRAM)")
     resolution = mo.ui.dropdown(options=["128", "256", "384", "512"], value="256", label="Resolution")
     samples = mo.ui.dropdown(options=["16", "32", "64", "128"], value="64", label="Cycles samples / pixel")
     require_gpu = mo.ui.checkbox(value=True, label="Require GPU rendering (fail instead of CPU fallback)")
@@ -99,15 +100,15 @@ def _(mo):
         mo.md("## 1. Settings"),
         mo.hstack([repo_url, repo_ref], widths=[3, 1]),
         workdir,
-        mo.hstack([seed, count, resolution, samples]),
-        mo.hstack([require_gpu, prefer_docker]),
+        mo.hstack([seed, count, workers]),
+        mo.hstack([resolution, samples, require_gpu, prefer_docker]),
         hf_repo,
         hf_token,
         hf_private,
     ])
     return (
         count, hf_private, hf_repo, hf_token, prefer_docker, repo_ref, repo_url,
-        require_gpu, resolution, samples, seed, workdir,
+        require_gpu, resolution, samples, seed, workdir, workers,
     )
 
 
@@ -215,6 +216,39 @@ def _(Path, clone_button, mo, repo_ref, repo_url, sh, workdir):
             sh("git clone {} {}".format(repo_url.value, repo_dir), stream=True)
             sh("git checkout {}".format(repo_ref.value), cwd=repo_dir, check=False)
     _, head = sh("git log --oneline -1", cwd=repo_dir)
+    # Auto-generate docker/KubricGPU.Dockerfile if missing in remote branch
+    dockerfile_path = repo_dir / "docker" / "KubricGPU.Dockerfile"
+    if not dockerfile_path.exists():
+        dockerfile_path.parent.mkdir(parents=True, exist_ok=True)
+        dockerfile_path.write_text(
+            "FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04\n"
+            "ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 TF_CPP_MIN_LOG_LEVEL=3 KUBRIC_USE_GPU=true NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics\n"
+            "RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common ca-certificates curl gnupg git ffmpeg \\\n"
+            "    && add-apt-repository -y ppa:deadsnakes/ppa \\\n"
+            "    && apt-get update && apt-get install -y --no-install-recommends \\\n"
+            "      python3.11 python3.11-dev python3.11-venv python3.11-distutils \\\n"
+            "      libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libgl1 libglu1-mesa \\\n"
+            "      libsm6 libice6 libxkbcommon0 libegl1 libgomp1 libopenexr-dev \\\n"
+            "    && rm -rf /var/lib/apt/lists/*\n"
+            "RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \\\n"
+            "    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \\\n"
+            "    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \\\n"
+            "    && python -m pip install --no-cache-dir --upgrade pip wheel setuptools\n"
+            "WORKDIR /kubric\n"
+            "COPY requirements_render.txt .\n"
+            "RUN python -m pip install --no-cache-dir -r requirements_render.txt\n"
+            "ENV PYTHONPATH=/kubric\n"
+            "CMD [\"python\", \"-c\", \"import bpy; print('bpy ready')\"]\n"
+        )
+    reqs_path = repo_dir / "requirements_render.txt"
+    if not reqs_path.exists():
+        reqs_path.write_text(
+            "bpy==4.2.0\nnumpy>=1.26,<3\npybullet==3.2.7\ntraitlets>=5.9,<6\npyquaternion>=0.9.9\n"
+            "etils[epath]>=1.5\nimageio>=2.31\nimageio-ffmpeg>=0.4.9\nOpenEXR>=3.2\nPillow>=10\n"
+            "bidict>=0.22\nPyYAML>=6\nscipy>=1.11\ntrimesh>=4\nmunch>=4\npypng>=0.20\n"
+            "tensorflow-cpu>=2.16,<2.22\npandas>=2\nscikit-learn>=1.3\nhuggingface_hub>=0.24\n"
+        )
+
     required = [
         "configs/velocity_intervention.yaml",
         "interventions/velocity_intervention.py",
@@ -429,13 +463,13 @@ def _(mo):
 
 
 @app.cell
-def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, time, work):
+def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, time, work, workers):
     mo.stop(not build_button.value, mo.md("_Press to generate._"))
     dataset_dir = work / "dataset"
     cmd = (
-        "{runner} scripts/build_velocity_dataset.py --output {out} --seed {seed} --count {count} "
+        "{runner} scripts/build_velocity_dataset.py --output {out} --seed {seed} --count {count} --workers {workers} "
         "--resolution {res} --samples {spp} --layers rgba segmentation depth {gpu}"
-    ).format(runner=runner, out=dataset_dir, seed=int(seed.value), count=int(count.value),
+    ).format(runner=runner, out=dataset_dir, seed=int(seed.value), count=int(count.value), workers=int(workers.value),
              res=resolution.value, spp=samples.value, gpu="--require-gpu --strict" if require_gpu.value else "")
     started = time.time()
     sh(cmd, cwd=repo_dir, stream=True, env={"PYTHONPATH": str(repo_dir), "TF_CPP_MIN_LOG_LEVEL": "3", "KUBRIC_USE_GPU": "true"})
