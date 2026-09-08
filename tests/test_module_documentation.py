@@ -24,6 +24,7 @@ _MODULE_PATHS = (
     "interventions/tagging.py",
     "interventions/trajectory.py",
     "interventions/twin_runner.py",
+    "interventions/velocity_intervention.py",
     "scripts/__init__.py",
     "scripts/generate_dataset.py",
     "scripts/generate_instance.py",
@@ -31,6 +32,9 @@ _MODULE_PATHS = (
     "scripts/demo_collision_intervention.py",
     "scripts/render_demo_branches_blender.py",
     "scripts/compose_intervention_demo.py",
+    "scripts/build_velocity_dataset.py",
+    "scripts/publish_velocity_dataset.py",
+    "scripts/render_velocity_intervention.py",
 )
 _CONTRACT_HEADINGS = (
     "Purpose:",
@@ -74,6 +78,15 @@ _EXACT_MAIN_DOCSTRINGS = {
     ),
     "scripts/compose_intervention_demo.py": (
         "Validates CLI inputs, composes the comparison atomically, and returns zero."
+    ),
+    "scripts/build_velocity_dataset.py": (
+        "Runs resumable batch generation and returns zero when the manifest is written."
+    ),
+    "scripts/render_velocity_intervention.py": (
+        "Renders the requested branches of each instance directory and returns zero."
+    ),
+    "scripts/publish_velocity_dataset.py": (
+        "Writes the dataset card, uploads the folder and prints the dataset URL."
     ),
 }
 

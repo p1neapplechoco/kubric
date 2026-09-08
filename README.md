@@ -33,6 +33,13 @@ For the one appearance record a factual/counterfactual pair shares, and the
 rendered evidence that both branches read it, see the
 [shared visual-scene demo](docs/shared_visual_scene_demo.md).
 
+For the free-rigid-body **velocity-intervention dataset** (fixed mass, one initial
+velocity, sampled materials, 4–6 bodies, rolling + sliding, static camera per clip,
+`factual` / `counterfactual` / `subject_removed` branches rendered on the GPU and
+published to Hugging Face from a marimo notebook), see
+[docs/velocity_intervention_dataset.md](docs/velocity_intervention_dataset.md) and
+`notebooks/velocity_intervention_molab.py`.
+
 Assuming you have docker installed, to generate the data above simply execute:
 ```
 git clone https://github.com/google-research/kubric.git

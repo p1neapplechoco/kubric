@@ -17,3 +17,6 @@ examples/KuBasic/Cone/*
 Dockerfile
 output_tmp/*
 .worktrees/
+
+# velocity-intervention render environment created by the molab notebook
+.venv-render/
