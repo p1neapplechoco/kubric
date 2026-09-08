@@ -24,13 +24,17 @@ _MODULE_PATHS = (
     "interventions/tagging.py",
     "interventions/trajectory.py",
     "interventions/twin_runner.py",
+    "interventions/velocity_scenes.py",
     "scripts/__init__.py",
     "scripts/generate_dataset.py",
     "scripts/generate_instance.py",
+    "scripts/generate_velocity_dataset.py",
     "scripts/trajectory_demo_spec.py",
     "scripts/demo_collision_intervention.py",
     "scripts/render_demo_branches_blender.py",
+    "scripts/render_velocity_scene.py",
     "scripts/compose_intervention_demo.py",
+    "scripts/upload_velocity_dataset.py",
 )
 _CONTRACT_HEADINGS = (
     "Purpose:",
@@ -58,6 +62,25 @@ _REQUIRED_ENTRIES = {
         "compose_intervention_demo",
         "main",
     ),
+    "scripts/render_velocity_scene.py": (
+        "enable_gpu",
+        "render_profile_from_ranges",
+        "render_branch",
+        "render_instance",
+        "main",
+    ),
+    "scripts/generate_velocity_dataset.py": (
+        "assign_split",
+        "generate_dataset",
+        "main",
+    ),
+    "scripts/upload_velocity_dataset.py": (
+        "resolve_token",
+        "build_split_index",
+        "build_dataset_card",
+        "upload_dataset",
+        "main",
+    ),
 }
 _EXACT_MAIN_DOCSTRINGS = {
     "scripts/generate_dataset.py": (
@@ -74,6 +97,15 @@ _EXACT_MAIN_DOCSTRINGS = {
     ),
     "scripts/compose_intervention_demo.py": (
         "Validates CLI inputs, composes the comparison atomically, and returns zero."
+    ),
+    "scripts/generate_velocity_dataset.py": (
+        "Runs resumable batch generation and returns its stable CLI exit status."
+    ),
+    "scripts/render_velocity_scene.py": (
+        "Renders one instance's requested branches and returns its CLI exit status."
+    ),
+    "scripts/upload_velocity_dataset.py": (
+        "Publishes one generated batch and returns its stable CLI exit status."
     ),
 }
 

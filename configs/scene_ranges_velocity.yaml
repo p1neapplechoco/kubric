@@ -1,0 +1,209 @@
+# Velocity-intervention scene ranges.
+#
+# This config drives `interventions/velocity_scenes.py`, not the kinematic-drag
+# pipeline in `interventions/dataset.py`. The difference is the whole point:
+# here every body is a free dynamic body, the only thing anyone ever sets is an
+# initial linear velocity on one subject, and the counterfactual replaces that
+# initial velocity instead of perturbing a prescribed path.
+#
+# Requested configuration, and where each piece lives:
+#   mass fixed                  -> objects.mass (a scalar, not a range)
+#   one direction, initial only -> subject.speed + subject.azimuth, angular zero
+#   material sampled            -> appearance.materials, coupled to friction
+#   4-6 objects, some hit       -> objects.count + objects.in_path_count
+#   sliding and rolling         -> objects.shapes + objects.require_both_shapes
+#   camera fixed per video      -> appearance.camera.motion: fixed
+
+scene:
+  bounds: [[-6.0, -6.0, -1.0], [6.0, 6.0, 6.0]]
+  gravity: [0.0, 0.0, -9.81]
+  # 48 frames at 24 fps = 2.0 s, simulated at 240 Hz -> 480 physics steps,
+  # 10 steps per rendered frame.
+  frame_range: [0, 48]
+  frame_rate: 24
+  step_rate: 240
+
+objects:
+  # Total movable bodies per scene, the subject included. 4-6 as requested.
+  count: [4, 6]
+  # Only cube and sphere are backed by a Bullet proxy in this pipeline. The mix
+  # is what produces both motion modes: cubes slide, spheres roll.
+  shapes: [cube, sphere]
+  shape_weights: {cube: 0.5, sphere: 0.5}
+  # Refuse a scene that cannot show both sliding and rolling.
+  require_both_shapes: true
+  size: [0.16, 0.30]
+  # Fixed mass, in kilograms. A scalar, deliberately: the material sampler is
+  # allowed to move friction and restitution but never mass.
+  mass: 1.0
+  # How many of the non-subject bodies are planted in the subject's corridor.
+  # The rest are bystanders that the subject cannot reach.
+  in_path_count: [2, 3]
+  # Where along the subject's travel direction a struck body sits, and how far
+  # off the centre line. The range is stratified across in_path_count slots, so
+  # the nearest body always sits inside the subject's stopping distance
+  # (v^2/2*mu*g, roughly 0.7-2.0 m for the sampled speeds and frictions).
+  #
+  # The upper bound is the stopping distance, not something beyond it. Measured
+  # over 24 seeds, an upper bound of 3.0 m puts the far slot past where the
+  # subject can still reach, so it is a bystander wearing an in-path label: mean
+  # 1.50 bodies struck, only 50% of scenes with more than one. At 2.0 m that is
+  # 1.82 and 77%, for 2 placement rejections in 24 instead of 0. Bodies that are
+  # deliberately never touched are what `bystander_*` is for; a slot that claims
+  # to be in the corridor should usually be reached.
+  along_path: [0.7, 2.0]
+  lateral_jitter: [-0.34, 0.34]
+  # A bystander must stay this far from the subject's swept corridor.
+  bystander_clearance: 1.1
+  bystander_x: [-2.8, 2.8]
+  bystander_y: [-2.8, 2.8]
+  # Extra gap enforced between any two bodies at t=0.
+  separation_margin: 0.06
+  placement_attempts: 512
+  floor_size: [5.0, 5.0, 0.25]
+  floor_friction: 0.45
+  floor_restitution: 0.05
+
+subject:
+  size: [0.18, 0.30]
+  # Distance behind the arena centre where the subject starts.
+  start_radius: [2.6, 3.4]
+  # Initial speed along the sampled direction, in m/s.
+  speed: [2.6, 4.4]
+  # Travel direction, as an azimuth in the ground plane. One direction only:
+  # the initial velocity is (speed*cos, speed*sin, 0) and angular velocity is 0.
+  azimuth: [0.0, 6.283185307179586]
+
+counterfactual:
+  # The new initial velocity. Same family of settings as the factual one: a
+  # single direction, applied once at t=0, with the old velocity discarded.
+  speed: [2.6, 4.4]
+  # The new direction is the factual azimuth turned by +/- this much, so the
+  # counterfactual is guaranteed to be a different intervention rather than a
+  # numerically identical rerun.
+  turn: [0.35, 1.40]
+  # Minimum |speed_cf - speed_f| when the turn happens to be small.
+  min_speed_delta: 0.0
+
+qc:
+  linear_velocity_ceiling: 60.0
+  angular_velocity_ceiling: 120.0
+  # The subject must actually hit something in the factual branch, otherwise the
+  # scene has no interaction to counterfactualise.
+  require_factual_contact: true
+  # The counterfactual must move at least one non-subject body by this much,
+  # otherwise the intervention is a null effect.
+  min_counterfactual_effect: 0.02
+  # Position/velocity/quaternion thresholds for the affected-set extraction.
+  position_epsilon: 0.001
+  velocity_epsilon: 0.001
+  quaternion_epsilon: 0.001
+  # Motion classification thresholds, applied over the whole rollout.
+  rolling_min_revolutions: 0.35
+  sliding_min_travel: 0.10
+
+split:
+  seed: 2301
+  fractions:
+    train: 0.8
+    val: 0.1
+    test: 0.1
+
+render:
+  # Consumed by scripts/render_velocity_scene.py.
+  resolution: [512, 384]
+  samples_per_pixel: 48
+  adaptive_sampling: true
+  use_denoising: true
+  background_transparency: false
+  device: GPU
+  layers: [rgba, segmentation, depth]
+  video_codec: libx264
+  video_crf: 18
+
+appearance:
+  enabled: true
+  schema_version: "1.0"
+  geometry:
+    shapes:
+      cube: 0.5
+      sphere: 0.5
+    size: [0.16, 0.30]
+    aspect_ratio: [0.8, 1.4]
+    orientation: upright_yaw
+  sources:
+    procedural: 1.0
+  colors:
+    strategies:
+      hsv: 0.6
+      palette: 0.3
+      neutral: 0.1
+    hue: [0.0, 1.0]
+    saturation: [0.25, 0.95]
+    value: [0.25, 0.95]
+    palette:
+      - [0.85, 0.23, 0.20, 1.0]
+      - [0.20, 0.45, 0.85, 1.0]
+      - [0.95, 0.78, 0.20, 1.0]
+      - [0.25, 0.65, 0.35, 1.0]
+      - [0.55, 0.30, 0.75, 1.0]
+    neutral_value: [0.15, 0.85]
+  textures:
+    scale: [1.0, 8.0]
+    detail: [1.0, 6.0]
+    roughness: [0.2, 0.8]
+    distortion: [0.0, 0.4]
+    rotation: [0.0, 1.0]
+    color_count: [1, 3]
+  materials:
+    # Glass is dropped: a transmissive subject is hard to segment and the mask
+    # layer is one of the published outputs.
+    families: [metal, rubber, plastic, ceramic, wood, stone]
+    weights: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  coupling:
+    # Friction and restitution follow the sampled family. Mass does not: it is
+    # pinned by objects.mass regardless of what the family density would imply.
+    mode: coupled
+    held_out: []
+  camera:
+    # Framing is checked against the real frustum of the sampled lens over the
+    # whole rollout, not against a fixed half-angle proxy. At the previous
+    # 6.0-8.5 m / 32-48 mm the required horizontal half-angle was about 0.5 and
+    # the widest lens offered 0.56 at 6 m but only 0.375 at 48 mm, so bodies on
+    # the far side of the arena fell outside the image. These ranges leave the
+    # whole action inside the frame with room to spare.
+    radius: [7.5, 11.0]
+    elevation: [0.30, 0.85]
+    azimuth: [0.0, 6.283185307179586]
+    focal_length: [22.0, 32.0]
+    sensor_width: 36.0
+    clipping_range: [0.1, 200.0]
+    # One viewpoint held for the whole clip, resampled per instance.
+    motion: fixed
+    linear_azimuth_delta: [-0.15, 0.15]
+    # Fraction of the half-frame kept empty around the outermost body.
+    frame_margin: 0.06
+  lighting:
+    rig: three_point
+    key:
+      position: [[2.5, -3.0, 4.0], [4.0, -1.5, 6.0]]
+      intensity: [90.0, 180.0]
+      color_temperature: [4500.0, 6800.0]
+      size: [1.0, 2.5]
+    fill:
+      position: [[-3.5, -2.0, 2.5], [-2.0, -0.5, 4.0]]
+      intensity: [30.0, 80.0]
+      color_temperature: [5200.0, 7200.0]
+      size: [1.5, 3.0]
+    rim:
+      position: [[-1.0, 3.5, 3.0], [1.5, 5.0, 5.0]]
+      intensity: [40.0, 110.0]
+      color_temperature: [6000.0, 8000.0]
+      size: [0.8, 2.0]
+  background:
+    kind: color
+    color_value: [0.08, 0.35]
+    color_saturation: [0.0, 0.15]
+    strength: [0.8, 1.4]
+    exposure: [-0.3, 0.3]
+    rotation: [0.0, 1.0]
