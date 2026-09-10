@@ -29,14 +29,16 @@ Trust boundary:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import os
 import shlex
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -87,7 +89,8 @@ def _render_subprocess(
     argv.append("--no-denoise")
   if require_gpu:
     argv.append("--require-gpu")
-  subprocess.run(argv, check=True)
+  env = dict(os.environ, PYTHONPATH=str(_REPO_ROOT))
+  subprocess.run(argv, check=True, env=env)
 
 
 def _rendered(instance_dir: Path, branches: Sequence[str]) -> bool:
@@ -160,8 +163,9 @@ def build_manifest(output: Path, splits: Mapping[str, float] = DEFAULT_SPLITS) -
 def build_dataset(
     output: Path, *, config: Path = DEFAULT_CONFIG, seed: int = 0, start: int = 0, count: int = 1,
     render: bool = True, render_command: Optional[Sequence[str]] = None, branches: Sequence[str] = vi.BRANCHES,
-    resolution: int = 512, samples: int = 64, layers: Sequence[str] = ("rgba", "segmentation", "depth"),
-    denoise: bool = True, require_gpu: bool = False, strict: bool = False, log=print,
+    resolution: int = 512, samples: int = 64,
+    layers: Sequence[str] = ("rgba", "segmentation", "depth", "forward_flow"),
+    denoise: bool = True, require_gpu: bool = False, strict: bool = False, workers: int = 1, log=print,
 ) -> List[Mapping[str, Any]]:
   """Generates (and renders) instances ``start .. start+count-1`` under ``output``."""
   ranges = vi.load_ranges(config)
@@ -171,7 +175,7 @@ def build_dataset(
   (output / "config.yaml").write_text(Path(config).read_text(encoding="utf-8"), encoding="utf-8")
   failures_path = output / "render_failures.jsonl"
 
-  for index in range(start, start + count):
+  def _generate_physics(index: int) -> None:
     instance_dir = instances_dir / instance_dirname(index)
     if not (instance_dir / vi.SPEC_FILENAME).exists():
       started = time.time()
@@ -184,24 +188,58 @@ def build_dataset(
     else:
       log("[physics] index={} already generated".format(index))
 
-    if render and not _rendered(instance_dir, branches):
+  # Phase 1: Physics simulation (parallel across CPU threads if workers > 1)
+  if workers > 1 and count > 1:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, count, 16)) as executor:
+      list(executor.map(_generate_physics, range(start, start + count)))
+  else:
+    for index in range(start, start + count):
+      _generate_physics(index)
+
+  # Phase 2: Blender Cycles GPU rendering (parallel across GPU workers for each video)
+  if render:
+    pending_tasks: List[Tuple[int, Path, str]] = []
+    for index in range(start, start + count):
+      instance_dir = instances_dir / instance_dirname(index)
+      for branch in branches:
+        if not (instance_dir / branch / "render_info.json").exists():
+          pending_tasks.append((index, instance_dir, branch))
+
+    def _render_video_task(task: Tuple[int, Path, str]) -> None:
+      index, instance_dir, branch = task
       started = time.time()
       try:
         if render_command:
-          _render_subprocess(render_command, instance_dir, branches, resolution, samples,
+          cmd = list(render_command)
+          _render_subprocess(cmd, instance_dir, [branch], resolution, samples,
+                             layers, denoise, require_gpu)
+        elif workers > 1:
+          cmd = [sys.executable, str(RENDER_SCRIPT)]
+          _render_subprocess(cmd, instance_dir, [branch], resolution, samples,
                              layers, denoise, require_gpu)
         else:
-          info = _render_inline(instance_dir, branches, dict(
+          info = _render_inline(instance_dir, [branch], dict(
               resolution=resolution, samples=samples, layers=layers, denoise=denoise))
           if require_gpu and any(rec["device"]["device"] != "GPU" for rec in info.values()):
             raise RuntimeError("GPU required but Cycles rendered on CPU")
-        log("[render] index={} branches={} {:.1f}s".format(index, list(branches), time.time() - started))
+        log("[render] index={} branch={} completed in {:.1f}s".format(index, branch, time.time() - started))
       except Exception as error:  # pylint: disable=broad-except
         with failures_path.open("a", encoding="utf-8") as handle:
-          handle.write(json.dumps({"index": index, "error": repr(error)}) + "\n")
-        log("[render] index={} FAILED: {!r}".format(index, error))
+          handle.write(json.dumps({"index": index, "branch": branch, "error": repr(error)}) + "\n")
+        log("[render] index={} branch={} FAILED: {!r}".format(index, branch, error))
         if strict:
           raise
+
+    if pending_tasks:
+      if workers > 1 and len(pending_tasks) > 1:
+        max_gpu_workers = min(workers, len(pending_tasks))
+        log("[render] rendering {} pending videos in parallel with {} workers...".format(
+            len(pending_tasks), max_gpu_workers))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_gpu_workers) as executor:
+          list(executor.map(_render_video_task, pending_tasks))
+      else:
+        for task in pending_tasks:
+          _render_video_task(task)
 
   return build_manifest(output)
 
@@ -213,6 +251,9 @@ def _parser() -> argparse.ArgumentParser:
   parser.add_argument("--seed", type=int, default=0)
   parser.add_argument("--start", type=int, default=0)
   parser.add_argument("--count", type=int, default=1)
+  parser.add_argument("--workers", type=int, default=1,
+                      help="parallel workers for video rendering and physics simulation "
+                           "(set to 2, 4, 8, 16+ to saturate GPU/CPU)")
   parser.add_argument("--no-render", action="store_true", help="physics artifacts only")
   parser.add_argument("--render-command", type=str, default=None,
                       help="command prefix that runs scripts/render_velocity_intervention.py "
@@ -222,7 +263,7 @@ def _parser() -> argparse.ArgumentParser:
   parser.add_argument("--resolution", type=int, default=512,
                       help="render resolution (primary control for image quality and GPU compute/memory scaling)")
   parser.add_argument("--samples", type=int, default=64)
-  parser.add_argument("--layers", nargs="*", default=["rgba", "segmentation", "depth"])
+  parser.add_argument("--layers", nargs="*", default=["rgba", "segmentation", "depth", "forward_flow"])
   parser.add_argument("--no-denoise", action="store_true")
   parser.add_argument("--require-gpu", action="store_true")
   parser.add_argument("--strict", action="store_true", help="abort on the first render failure")
@@ -243,6 +284,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
       render=not args.no_render, render_command=render_command, branches=args.branches,
       resolution=args.resolution, samples=args.samples, layers=args.layers,
       denoise=not args.no_denoise, require_gpu=args.require_gpu, strict=args.strict,
+      workers=args.workers,
   )
   print("[manifest] {} instances -> {}".format(len(rows), args.output / "manifest.jsonl"))
   return 0

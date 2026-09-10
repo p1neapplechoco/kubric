@@ -81,8 +81,11 @@ instances/<index>/
   qc.json                      QC metrics: rolling / sliding labels, struck & untouched objects
   <branch>/video.mp4           RGB clip ({frames} frames @ {frame_rate} fps)
   <branch>/mask.mp4            colourised instance segmentation preview
+  <branch>/depth.mp4           colourised depth map video preview
+  <branch>/flow.mp4            colourised optical flow video preview
   <branch>/segmentation.npz    uint8 [T,H,W] instance ids (0 = floor/background)
   <branch>/depth.npz           float16 [T,H,W] depth
+  <branch>/forward_flow.npz    float16 [T,H,W,2] optical flow
   <branch>/tracking.npz        per-frame poses, velocities, 2D projections, boxes, visibility, presence
   <branch>/graph.json          temporal contact graph (object-object episodes; floor episodes listed separately)
   <branch>/sim_log/            immutable per-physics-step states + contacts (manifest-hashed)

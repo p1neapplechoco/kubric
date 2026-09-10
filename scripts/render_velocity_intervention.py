@@ -5,10 +5,11 @@ Purpose:
   :func:`interventions.velocity_intervention.write_instance` into the dataset's
   visual outputs. For each branch the same visual scene and the same static
   camera are rebuilt with :mod:`kubric` primitives, object poses are keyframed
-  from the logged states, and Blender/Cycles renders RGB, segmentation and depth
-  (optionally optical flow). Outputs are ``video.mp4``, ``mask.mp4`` plus
-  ``segmentation.npz``, ``depth.npz``, ``tracking.npz`` (poses, velocities, 2D
-  projections, boxes, visibility, presence) and ``render_info.json``. Cycles is
+  from the logged states, and Blender/Cycles renders RGB, segmentation, depth
+  and optical flow. Outputs are ``video.mp4``, ``mask.mp4``, ``depth.mp4``,
+  ``flow.mp4`` plus ``segmentation.npz``, ``depth.npz``, ``forward_flow.npz``,
+  ``tracking.npz`` (poses, velocities, 2D projections, boxes, visibility, presence)
+  and ``render_info.json``. Cycles is
   pointed at a GPU backend (OptiX, then CUDA, HIP, oneAPI, Metal) when one is
   available and falls back to the CPU explicitly, recording the choice.
 
@@ -59,8 +60,8 @@ from interventions.logging import (  # noqa: E402  pylint: disable=wrong-import-
 )
 
 GPU_BACKENDS: Tuple[str, ...] = ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL")
-DEFAULT_LAYERS: Tuple[str, ...] = ("rgba", "segmentation", "depth")
-OPTIONAL_LAYERS: Tuple[str, ...] = ("forward_flow", "backward_flow", "normal")
+DEFAULT_LAYERS: Tuple[str, ...] = ("rgba", "segmentation", "depth", "forward_flow")
+OPTIONAL_LAYERS: Tuple[str, ...] = ("backward_flow", "normal")
 _MASK_PALETTE = np.array([
     [0, 0, 0], [230, 25, 75], [60, 180, 75], [255, 225, 25], [0, 130, 200],
     [245, 130, 48], [145, 30, 180], [70, 240, 240], [240, 50, 230], [210, 245, 60],
@@ -389,6 +390,87 @@ def _colorize_mask(segmentation: np.ndarray) -> np.ndarray:
   return _MASK_PALETTE[np.clip(ids, 0, len(_MASK_PALETTE) - 1)]
 
 
+def _viridis_lut() -> np.ndarray:
+  """Builds a smooth 256x3 Viridis colour lookup table in pure NumPy."""
+  anchors = np.array([
+      [68, 1, 84],
+      [72, 40, 120],
+      [62, 74, 137],
+      [49, 104, 142],
+      [38, 130, 142],
+      [31, 158, 137],
+      [53, 183, 121],
+      [109, 205, 89],
+      [253, 231, 37],
+  ], dtype=np.float32)
+  x = np.linspace(0.0, 1.0, len(anchors))
+  xi = np.linspace(0.0, 1.0, 256)
+  lut = np.zeros((256, 3), dtype=np.uint8)
+  for c in range(3):
+    lut[:, c] = np.clip(np.interp(xi, x, anchors[:, c]), 0, 255).astype(np.uint8)
+  return lut
+
+
+_VIRIDIS_LUT = _viridis_lut()
+
+
+def _colorize_depth(depth: np.ndarray, far_clip: float) -> np.ndarray:
+  """Converts depth frames [T, H, W] or [T, H, W, 1] into colourised viridis RGB [T, H, W, 3]."""
+  d = depth[..., 0] if depth.ndim == 4 else depth
+  valid = d < (float(far_clip) * 0.999)
+  if valid.any():
+    d_min = float(d[valid].min())
+    d_max = float(d[valid].max())
+  else:
+    d_min, d_max = 0.0, float(far_clip)
+  if d_max <= d_min:
+    d_max = d_min + 1.0
+
+  # Closer objects (smaller distance) appear brighter/yellow; far objects appear darker/purple.
+  norm = np.clip((d - d_min) / (d_max - d_min), 0.0, 1.0)
+  indices = np.clip(np.rint((1.0 - norm) * 255.0), 0, 255).astype(np.uint8)
+  rgb = _VIRIDIS_LUT[indices].copy()
+  rgb[~valid] = [0, 0, 0]
+  return rgb
+
+
+def _hsv_to_rgb(hsv: np.ndarray) -> np.ndarray:
+  """Vectorized HSV to RGB conversion in pure NumPy for arrays of shape [..., 3]."""
+  h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+  c = v * s
+  x = c * (1.0 - np.abs((h * 6.0) % 2.0 - 1.0))
+  m = v - c
+  i = (h * 6.0).astype(int) % 6
+  r = np.zeros_like(h)
+  g = np.zeros_like(h)
+  b = np.zeros_like(h)
+  for idx, (rc, gc, bc) in enumerate([
+      (c, x, 0.0), (x, c, 0.0), (0.0, c, x), (0.0, x, c), (x, 0.0, c), (c, 0.0, x)
+  ]):
+    mask = (i == idx)
+    r[mask] = rc[mask] if isinstance(rc, np.ndarray) else rc
+    g[mask] = gc[mask] if isinstance(gc, np.ndarray) else gc
+    b[mask] = bc[mask] if isinstance(bc, np.ndarray) else bc
+  return np.stack([r + m, g + m, b + m], axis=-1)
+
+
+def _colorize_flow(flow: np.ndarray) -> np.ndarray:
+  """Converts optical flow vectors [T, H, W, 2] to colourised RGB [T, H, W, 3] (Middlebury wheel)."""
+  u = flow[..., 0]
+  v = flow[..., 1]
+  angle = np.arctan2(v, u)
+  hue = (angle + np.pi) / (2.0 * np.pi)
+  mag = np.sqrt(u**2 + v**2)
+  max_mag = float(np.percentile(mag, 99.0)) if mag.size else 1.0
+  if max_mag < 1.0:
+    max_mag = 1.0
+  val = np.clip(mag / max_mag, 0.0, 1.0)
+  sat = np.ones_like(val)
+  hsv = np.stack([hue, sat, val], axis=-1)
+  rgb = np.clip(_hsv_to_rgb(hsv) * 255.0, 0, 255).astype(np.uint8)
+  return rgb
+
+
 def _tracking(
     kscene, spec: vi.VelocityInstanceSpec, branch: str, log: SimulationLog,
     segmentation: np.ndarray, rendered_frames: Sequence[int],
@@ -488,7 +570,7 @@ def render_branch(
     frames = list(range(kscene.frame_start, kscene.frame_end + 1))
     if max_frames is not None:
       frames = frames[:max_frames]
-    wanted = list(dict.fromkeys(("rgba", "segmentation", *layers)))
+    wanted = list(dict.fromkeys(("rgba", "segmentation", "depth", "forward_flow", *layers)))
     data = renderer.render(frames=frames, return_layers=wanted)
     rgba = data["rgba"]
     # Kubric already maps Cryptomatte hashes to each asset's ``segmentation_id``
@@ -505,7 +587,15 @@ def render_branch(
       depth = np.minimum(np.nan_to_num(data["depth"][..., 0], nan=far, posinf=far), far)
       np.savez_compressed(staging / "depth.npz", depth=depth.astype(np.float16),
                           far_clip=np.float32(far))
-    for layer in ("forward_flow", "backward_flow", "normal"):
+      _encode_mp4(staging / "depth.mp4", _colorize_depth(depth, far), frame_rate)
+      shutil.copyfile(staging / "depth.mp4", staging / "depth_map.mp4")
+    if "forward_flow" in data:
+      flow = data["forward_flow"]
+      np.savez_compressed(staging / "forward_flow.npz", forward_flow=flow.astype(np.float16))
+      np.savez_compressed(staging / "flow.npz", flow=flow.astype(np.float16))
+      _encode_mp4(staging / "flow.mp4", _colorize_flow(flow), frame_rate)
+      shutil.copyfile(staging / "flow.mp4", staging / "optical_flow.mp4")
+    for layer in ("backward_flow", "normal"):
       if layer in data:
         np.savez_compressed(staging / "{}.npz".format(layer), **{layer: data[layer]})
     if save_frames:

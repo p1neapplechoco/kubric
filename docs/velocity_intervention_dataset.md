@@ -56,8 +56,11 @@ without a contact path) and propagation paths.
       graph.json              contact episodes between bodies (+ floor episodes listed separately), in steps and frames
       video.mp4               RGB, 48 frames @ 24 fps (H.264)
       mask.mp4                colourised instance masks
+      depth.mp4               colourised depth map video (viridis colormap)
+      flow.mp4                colourised optical flow video (Middlebury color wheel)
       segmentation.npz        uint8 [T,H,W]; 0 = floor/background, k = index of object_ids[k]
       depth.npz               float16 [T,H,W] clipped at the camera far plane
+      forward_flow.npz        float16 [T,H,W,2] optical flow vectors
       tracking.npz            positions, quaternions (wxyz), velocities, 2D image positions, boxes (yxyx, normalised),
                               visible pixels, presence flags — indexed by the dataset-wide object order
       render_info.json        device actually used (GPU/OptiX, CUDA, … or CPU), resolution, spp, timing

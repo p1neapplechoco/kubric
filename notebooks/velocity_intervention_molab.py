@@ -70,9 +70,12 @@ def _(mo):
            * **camera fixed within a clip, re-sampled between clips**,
            * three branches per scene: `factual`, `counterfactual` (new initial velocity replaces
              the old one), `subject_removed`;
-        4. outputs per branch: `video.mp4`, `mask.mp4` + `segmentation.npz`, `depth.npz`,
+        4. outputs per branch: `video.mp4` (RGB), `mask.mp4` (segmentation), `depth.mp4` (depth map),
+           `flow.mp4` (optical flow) + `segmentation.npz`, `depth.npz`, `forward_flow.npz`,
            `graph.json`, `tracking.npz`, plus `ground_truth.json` / `qc.json` per scene;
-        5. upload everything to a Hugging Face dataset repo with your access token.
+        5. parallel processing: runs multiple video renders and physics simulations concurrently
+           via the `workers` parameter to maximize GPU and CPU saturation;
+        6. upload everything to a Hugging Face dataset repo with your access token.
 
         Pick a **GPU runtime** in molab before running (Cycles renders on OptiX/CUDA; the notebook
         refuses to fall back to CPU rendering unless you untick *require GPU*).
@@ -88,6 +91,7 @@ def _(mo):
     workdir = mo.ui.text(value="/tmp/kubric-work", label="Work directory", full_width=True)
     seed = mo.ui.number(value=0, start=0, stop=2**31 - 1, step=1, label="Master seed")
     count = mo.ui.number(value=8, start=1, stop=100000, step=1, label="Number of scenes")
+    workers = mo.ui.slider(start=1, stop=16, step=1, value=4, label="Parallel video workers (concurrent rendering)")
     resolution = mo.ui.dropdown(options=["256", "384", "512", "768", "1024"], value="512", label="Resolution (primary quality & GPU scaling)")
     samples = mo.ui.dropdown(options=["32", "64", "128", "256"], value="64", label="Cycles samples / pixel")
     require_gpu = mo.ui.checkbox(value=True, label="Require GPU rendering (fail instead of CPU fallback)")
@@ -99,15 +103,15 @@ def _(mo):
         mo.md("## 1. Settings"),
         mo.hstack([repo_url, repo_ref], widths=[3, 1]),
         workdir,
-        mo.hstack([seed, count, resolution, samples]),
-        mo.hstack([require_gpu, prefer_docker]),
+        mo.hstack([seed, count, workers]),
+        mo.hstack([resolution, samples, require_gpu, prefer_docker]),
         hf_repo,
         hf_token,
         hf_private,
     ])
     return (
         count, hf_private, hf_repo, hf_token, prefer_docker, repo_ref, repo_url,
-        require_gpu, resolution, samples, seed, workdir,
+        require_gpu, resolution, samples, seed, workdir, workers,
     )
 
 
@@ -462,14 +466,16 @@ def _(mo):
 
 
 @app.cell
-def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, time, work):
+def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, time, work, workers):
     mo.stop(not build_button.value, mo.md("_Press to generate._"))
     dataset_dir = work / "dataset"
     cmd = (
         "{runner} scripts/build_velocity_dataset.py --output {out} --seed {seed} --count {count} "
-        "--resolution {res} --samples {spp} --layers rgba segmentation depth {gpu}"
+        "--workers {workers} --resolution {res} --samples {spp} "
+        "--layers rgba segmentation depth forward_flow {gpu}"
     ).format(runner=runner, out=dataset_dir, seed=int(seed.value), count=int(count.value),
-             res=resolution.value, spp=samples.value, gpu="--require-gpu --strict" if require_gpu.value else "")
+             workers=int(workers.value), res=resolution.value, spp=samples.value,
+             gpu="--require-gpu --strict" if require_gpu.value else "")
     started = time.time()
     sh(cmd, cwd=repo_dir, stream=True, env={"PYTHONPATH": str(repo_dir), "TF_CPP_MIN_LOG_LEVEL": "3", "KUBRIC_USE_GPU": "true"})
     mo.md("Finished in {:.0f} s → `{}`".format(time.time() - started, dataset_dir))
@@ -494,12 +500,19 @@ def _(dataset_dir, json, mo):
         for branch in ("factual", "counterfactual", "subject_removed"):
             video = first / branch / "video.mp4"
             mask = first / branch / "mask.mp4"
+            depth = first / branch / "depth.mp4"
+            flow = first / branch / "flow.mp4"
+            items = [mo.md("**{}**".format(branch))]
             if video.exists():
-                videos.append(mo.vstack([
-                    mo.md("**{}**".format(branch)),
-                    mo.video(video.open("rb"), autoplay=True, loop=True, muted=True),
-                    mo.video(mask.open("rb"), autoplay=True, loop=True, muted=True),
-                ]))
+                items.extend([mo.md("_RGB_"), mo.video(video.open("rb"), autoplay=True, loop=True, muted=True)])
+            if mask.exists():
+                items.extend([mo.md("_Mask_"), mo.video(mask.open("rb"), autoplay=True, loop=True, muted=True)])
+            if depth.exists():
+                items.extend([mo.md("_Depth Map_"), mo.video(depth.open("rb"), autoplay=True, loop=True, muted=True)])
+            if flow.exists():
+                items.extend([mo.md("_Optical Flow_"), mo.video(flow.open("rb"), autoplay=True, loop=True, muted=True)])
+            if len(items) > 1:
+                videos.append(mo.vstack(items))
     mo.vstack([
         mo.md("## 8. Results"),
         mo.md("```json\n{}\n```".format(json.dumps(summary, indent=2))),
