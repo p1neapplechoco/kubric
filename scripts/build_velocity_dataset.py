@@ -36,6 +36,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -72,6 +73,36 @@ def assign_split(instance_id: str, fractions: Mapping[str, float] = DEFAULT_SPLI
   return names[-1]
 
 
+def _physics_worker_task(
+    args: Tuple[str, int, int, str]
+) -> Tuple[int, str, Optional[Dict[str, Any]], Optional[str]]:
+  """Top-level worker function for ProcessPoolExecutor to avoid PyBullet thread-safety bugs.
+
+  PyBullet's C-API is not thread-safe within the same process. Running each instance
+  in an isolated process guarantees 100% memory isolation and zero segfaults.
+  Arguments are simple strings/ints to avoid pickling non-serializable objects.
+  """
+  config_path_str, seed, index, instances_dir_str = args
+  instance_dir = Path(instances_dir_str) / instance_dirname(index)
+  if (instance_dir / vi.SPEC_FILENAME).exists():
+    return index, "already_exists", None, None
+  try:
+    started = time.time()
+    ranges = vi.load_ranges(Path(config_path_str))
+    generated = vi.generate_instance(ranges, seed, index)
+    vi.write_instance(instance_dir, generated, overwrite=True)
+    stats = {
+        "instance_id": generated.spec.instance_id,
+        "attempts": generated.spec.attempt + 1,
+        "object_count": generated.spec.metadata["object_count"],
+        "factual_struck": generated.qc.metrics["factual_struck"],
+        "elapsed": time.time() - started,
+    }
+    return index, "ok", stats, None
+  except Exception as error:  # pylint: disable=broad-except
+    return index, "error", None, repr(error)
+
+
 def _render_inline(instance_dir: Path, branches: Sequence[str], render_kwargs: Mapping[str, Any]) -> Dict[str, Any]:
   from scripts import render_velocity_intervention as rvi  # pylint: disable=import-outside-toplevel
 
@@ -81,7 +112,9 @@ def _render_inline(instance_dir: Path, branches: Sequence[str], render_kwargs: M
 def _render_subprocess(
     command: Sequence[str], instance_dir: Path, branches: Sequence[str],
     resolution: int, samples: int, layers: Sequence[str], denoise: bool, require_gpu: bool,
+    timeout: int = 1800,
 ) -> None:
+  """Executes rendering in a child process, silencing verbose stdout to avoid pipe deadlocks."""
   argv = list(command) + [str(instance_dir), "--branches", *branches,
                           "--resolution", str(resolution), "--samples", str(samples),
                           "--layers", *layers]
@@ -89,8 +122,25 @@ def _render_subprocess(
     argv.append("--no-denoise")
   if require_gpu:
     argv.append("--require-gpu")
-  env = dict(os.environ, PYTHONPATH=str(_REPO_ROOT))
-  subprocess.run(argv, check=True, env=env)
+  env = dict(
+      os.environ,
+      PYTHONPATH=str(_REPO_ROOT),
+      CUDA_MODULE_LOADING="LAZY",
+      CUDA_CACHE_MAXSIZE="2147483648",
+      PYTHONUNBUFFERED="1",
+  )
+  res = subprocess.run(
+      argv,
+      stdout=subprocess.DEVNULL,
+      stderr=subprocess.PIPE,
+      text=True,
+      check=False,
+      env=env,
+      timeout=timeout,
+  )
+  if res.returncode != 0:
+    err_tail = res.stderr[-2000:] if res.stderr else "no stderr output"
+    raise RuntimeError("Render process exited with code {}:\n{}".format(res.returncode, err_tail))
 
 
 def _rendered(instance_dir: Path, branches: Sequence[str]) -> bool:
@@ -188,13 +238,36 @@ def build_dataset(
     else:
       log("[physics] index={} already generated".format(index))
 
-  # Phase 1: Physics simulation (parallel across CPU threads if workers > 1)
+  # Phase 1: Physics simulation (parallel across CPU processes if workers > 1)
   if workers > 1 and count > 1:
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, count, 16)) as executor:
-      list(executor.map(_generate_physics, range(start, start + count)))
+    max_phys_workers = min(workers, count)
+    log("[physics] generating {} instances across {} processes...".format(count, max_phys_workers))
+    tasks = [(str(config), seed, index, str(instances_dir)) for index in range(start, start + count)]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_phys_workers) as executor:
+      for index, status, stats, error_msg in executor.map(_physics_worker_task, tasks):
+        if status == "already_exists":
+          log("[physics] index={} already generated".format(index))
+        elif status == "ok" and stats:
+          log("[physics] index={} id={} attempts={} objects={} struck={} {:.1f}s".format(
+              index, stats["instance_id"], stats["attempts"],
+              stats["object_count"], stats["factual_struck"], stats["elapsed"]))
+        elif status == "error":
+          log("[physics] index={} FAILED: {}".format(index, error_msg))
+          if strict:
+            raise RuntimeError("Physics generation failed for index {}: {}".format(index, error_msg))
   else:
     for index in range(start, start + count):
-      _generate_physics(index)
+      instance_dir = instances_dir / instance_dirname(index)
+      if not (instance_dir / vi.SPEC_FILENAME).exists():
+        started = time.time()
+        generated = vi.generate_instance(ranges, seed, index)
+        vi.write_instance(instance_dir, generated, overwrite=True)
+        log("[physics] index={} id={} attempts={} objects={} struck={} {:.1f}s".format(
+            index, generated.spec.instance_id, generated.spec.attempt + 1,
+            generated.spec.metadata["object_count"], generated.qc.metrics["factual_struck"],
+            time.time() - started))
+      else:
+        log("[physics] index={} already generated".format(index))
 
   # Phase 2: Blender Cycles GPU rendering (parallel across GPU workers for each video)
   if render:
@@ -205,9 +278,15 @@ def build_dataset(
         if not (instance_dir / branch / "render_info.json").exists():
           pending_tasks.append((index, instance_dir, branch))
 
-    def _render_video_task(task: Tuple[int, Path, str]) -> None:
-      index, instance_dir, branch = task
+    failures_lock = threading.Lock()
+
+    def _render_video_task(entry: Tuple[int, Tuple[int, Path, str]]) -> None:
+      task_idx, (index, instance_dir, branch) = entry
       started = time.time()
+      # Stagger launch slightly to avoid CUDA/OptiX simultaneous initialization lock
+      stagger = 0.15 * (task_idx % max_gpu_workers)
+      if stagger > 0:
+        time.sleep(stagger)
       try:
         if render_command:
           cmd = list(render_command)
@@ -222,24 +301,27 @@ def build_dataset(
               resolution=resolution, samples=samples, layers=layers, denoise=denoise))
           if require_gpu and any(rec["device"]["device"] != "GPU" for rec in info.values()):
             raise RuntimeError("GPU required but Cycles rendered on CPU")
-        log("[render] index={} branch={} completed in {:.1f}s".format(index, branch, time.time() - started))
+        with failures_lock:
+          log("[render] index={} branch={} completed in {:.1f}s".format(index, branch, time.time() - started))
       except Exception as error:  # pylint: disable=broad-except
-        with failures_path.open("a", encoding="utf-8") as handle:
-          handle.write(json.dumps({"index": index, "branch": branch, "error": repr(error)}) + "\n")
-        log("[render] index={} branch={} FAILED: {!r}".format(index, branch, error))
+        with failures_lock:
+          with failures_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"index": index, "branch": branch, "error": repr(error)}) + "\n")
+          log("[render] index={} branch={} FAILED: {!r}".format(index, branch, error))
         if strict:
           raise
 
     if pending_tasks:
+      max_gpu_workers = min(workers, len(pending_tasks)) if workers > 1 else 1
       if workers > 1 and len(pending_tasks) > 1:
-        max_gpu_workers = min(workers, len(pending_tasks))
         log("[render] rendering {} pending videos in parallel with {} workers...".format(
             len(pending_tasks), max_gpu_workers))
+        indexed_tasks = list(enumerate(pending_tasks))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_gpu_workers) as executor:
-          list(executor.map(_render_video_task, pending_tasks))
+          list(executor.map(_render_video_task, indexed_tasks))
       else:
-        for task in pending_tasks:
-          _render_video_task(task)
+        for entry in enumerate(pending_tasks):
+          _render_video_task(entry)
 
   return build_manifest(output)
 
@@ -252,8 +334,9 @@ def _parser() -> argparse.ArgumentParser:
   parser.add_argument("--start", type=int, default=0)
   parser.add_argument("--count", type=int, default=1)
   parser.add_argument("--workers", type=int, default=1,
-                      help="parallel workers for video rendering and physics simulation "
-                           "(set to 2, 4, 8, 16+ to saturate GPU/CPU)")
+                      help="number of parallel workers for physics simulation and video rendering. "
+                           "Scaling guidance: 2-4 for 4-8GB VRAM (RTX 3050/T4), 4-8 for 16GB VRAM (P100/T4x2), "
+                           "8-16 for 24-48GB VRAM (3090/4090/A10G/L4), 16-32+ for 80-96GB VRAM (A100/H100).")
   parser.add_argument("--no-render", action="store_true", help="physics artifacts only")
   parser.add_argument("--render-command", type=str, default=None,
                       help="command prefix that runs scripts/render_velocity_intervention.py "

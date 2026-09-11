@@ -636,6 +636,11 @@ def render_branch(
   finally:
     shutil.rmtree(staging, ignore_errors=True)
     shutil.rmtree(scratch, ignore_errors=True)
+    try:
+      import bpy  # pylint: disable=import-outside-toplevel
+      bpy.ops.wm.read_factory_settings(use_empty=True)
+    except Exception:  # pragma: no cover
+      pass
 
 
 def _blender_version() -> str:

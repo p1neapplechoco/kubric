@@ -91,7 +91,7 @@ def _(mo):
     workdir = mo.ui.text(value="/tmp/kubric-work", label="Work directory", full_width=True)
     seed = mo.ui.number(value=0, start=0, stop=2**31 - 1, step=1, label="Master seed")
     count = mo.ui.number(value=8, start=1, stop=100000, step=1, label="Number of scenes")
-    workers = mo.ui.slider(start=1, stop=16, step=1, value=4, label="Parallel video workers (concurrent rendering)")
+    workers = mo.ui.slider(start=1, stop=32, step=1, value=4, label="Parallel video workers (concurrent rendering)")
     resolution = mo.ui.dropdown(options=["256", "384", "512", "768", "1024"], value="512", label="Resolution (primary quality & GPU scaling)")
     samples = mo.ui.dropdown(options=["32", "64", "128", "256"], value="64", label="Cycles samples / pixel")
     require_gpu = mo.ui.checkbox(value=True, label="Require GPU rendering (fail instead of CPU fallback)")
