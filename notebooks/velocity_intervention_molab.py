@@ -97,7 +97,7 @@ def _(mo):
     samples = mo.ui.dropdown(options=["32", "64", "128", "256"], value="64", label="Cycles samples / pixel")
     require_gpu = mo.ui.checkbox(value=True, label="Require GPU rendering (fail instead of CPU fallback)")
     prefer_docker = mo.ui.checkbox(value=True, label="Prefer Docker when the daemon + NVIDIA runtime are available")
-    hf_repo = mo.ui.text(value="", label="Hugging Face dataset repo id (user/name)", full_width=True)
+    hf_repo = mo.ui.text(value="pineapplechoco/jais", label="Hugging Face dataset repo id (user/name)", full_width=True)
     hf_token = mo.ui.text(value="", label="Hugging Face access token (write)", kind="password", full_width=True)
     hf_private = mo.ui.checkbox(value=True, label="Private dataset repo")
     mo.vstack([
