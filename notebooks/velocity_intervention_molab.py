@@ -90,6 +90,7 @@ def _(mo):
     repo_ref = mo.ui.text(value="artifacts/data-generation-notebook", label="Branch / tag")
     workdir = mo.ui.text(value="/tmp/kubric-work", label="Work directory", full_width=True)
     seed = mo.ui.number(value=0, start=0, stop=2**31 - 1, step=1, label="Master seed")
+    start = mo.ui.number(value=0, start=0, stop=1000000, step=1, label="Start instance index")
     count = mo.ui.number(value=8, start=1, stop=100000, step=1, label="Number of scenes")
     workers = mo.ui.slider(start=1, stop=32, step=1, value=4, label="Parallel video workers (concurrent rendering)")
     resolution = mo.ui.dropdown(options=["256", "384", "512", "768", "1024"], value="512", label="Resolution (primary quality & GPU scaling)")
@@ -103,7 +104,7 @@ def _(mo):
         mo.md("## 1. Settings"),
         mo.hstack([repo_url, repo_ref], widths=[3, 1]),
         workdir,
-        mo.hstack([seed, count, workers]),
+        mo.hstack([seed, start, count, workers]),
         mo.hstack([resolution, samples, require_gpu, prefer_docker]),
         hf_repo,
         hf_token,
@@ -111,7 +112,7 @@ def _(mo):
     ])
     return (
         count, hf_private, hf_repo, hf_token, prefer_docker, repo_ref, repo_url,
-        require_gpu, resolution, samples, seed, workdir, workers,
+        require_gpu, resolution, samples, seed, start, workdir, workers,
     )
 
 
@@ -466,14 +467,14 @@ def _(mo):
 
 
 @app.cell
-def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, time, work, workers):
+def _(build_button, count, mo, repo_dir, require_gpu, resolution, runner, samples, seed, sh, start, time, work, workers):
     mo.stop(not build_button.value, mo.md("_Press to generate._"))
     dataset_dir = work / "dataset"
     cmd = (
-        "{runner} scripts/build_velocity_dataset.py --output {out} --seed {seed} --count {count} "
+        "{runner} scripts/build_velocity_dataset.py --output {out} --seed {seed} --start {start} --count {count} "
         "--workers {workers} --resolution {res} --samples {spp} "
         "--layers rgba segmentation depth forward_flow {gpu}"
-    ).format(runner=runner, out=dataset_dir, seed=int(seed.value), count=int(count.value),
+    ).format(runner=runner, out=dataset_dir, seed=int(seed.value), start=int(start.value), count=int(count.value),
              workers=int(workers.value), res=resolution.value, spp=samples.value,
              gpu="--require-gpu --strict" if require_gpu.value else "")
     started = time.time()

@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -174,10 +175,72 @@ def write_dataset_card(
   return path
 
 
+def sync_remote_manifest(output: Path, repo_id: str, token: Optional[str] = None) -> int:
+  """Merges remote manifest.jsonl (e.g. earlier instances 0-99) into local manifest before upload.
+
+  Returns the total instance count after merging.
+  """
+  try:
+    from huggingface_hub import hf_hub_download  # pylint: disable=import-outside-toplevel
+  except ImportError:
+    return 0
+
+  output = Path(output)
+  manifest_path = output / "manifest.jsonl"
+  summary_path = output / "dataset_summary.json"
+  if not manifest_path.exists():
+    return 0
+
+  local_rows = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+  try:
+    downloaded = hf_hub_download(
+        repo_id=repo_id,
+        filename="manifest.jsonl",
+        repo_type="dataset",
+        token=token,
+    )
+    remote_rows = [json.loads(line) for line in Path(downloaded).read_text(encoding="utf-8").splitlines() if line.strip()]
+  except Exception:
+    # Repo or remote manifest.jsonl does not exist yet.
+    return len(local_rows)
+
+  if not remote_rows:
+    return len(local_rows)
+
+  merged_map = {row["index"]: row for row in remote_rows}
+  merged_map.update({row["index"]: row for row in local_rows})
+  all_rows = [merged_map[idx] for idx in sorted(merged_map)]
+
+  manifest_path.write_text(
+      "".join(json.dumps(row, sort_keys=True) + "\n" for row in all_rows),
+      encoding="utf-8",
+  )
+
+  # Recompute summary with all merged instances
+  splits: dict[str, int] = {}
+  for row in all_rows:
+    s = row.get("split", "train")
+    splits[s] = splits.get(s, 0) + 1
+  devices = sorted({r["device"] for row in all_rows for r in row.get("renders", {}).values() if "device" in r})
+  rendered_count = sum(1 for row in all_rows if len(row.get("rendered_branches", [])) == 3)
+  summary = {
+      "instances": len(all_rows),
+      "rendered": rendered_count,
+      "splits": splits,
+      "render_devices": devices,
+      "branches": ["factual", "counterfactual", "subject_removed"],
+      "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+  }
+  summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+  return len(all_rows)
+
+
 def publish_dataset(
     output: Path, repo_id: str, *, token: Optional[str] = None, private: bool = True,
     commit_message: str = "Upload velocity-intervention dataset", source_repo: str = "p1neapplechoco/kubric",
     seed: Optional[int] = None, ignore_patterns: Sequence[str] = ("**/.render-*", "**/*.tmp", "**/__pycache__/**"),
+    sync_remote: bool = True,
 ) -> str:
   """Creates the dataset repo if needed and uploads ``output``; returns its URL."""
   from huggingface_hub import HfApi  # pylint: disable=import-outside-toplevel
@@ -188,9 +251,15 @@ def publish_dataset(
   resolved = resolve_token(token)
   if not resolved:
     raise RuntimeError("no Hugging Face token: pass --token, set HF_TOKEN, or run `huggingface-cli login`")
-  write_dataset_card(output, repo_id, source_repo=source_repo, seed=seed)
   api = HfApi(token=resolved)
   api.create_repo(repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True)
+  if sync_remote:
+    try:
+      total_count = sync_remote_manifest(output, repo_id, token=resolved)
+      print("[publish] synced with remote manifest: {} total instances across all batches".format(total_count))
+    except Exception as err:  # pylint: disable=broad-except
+      print("[publish] note: remote manifest sync skipped: {}".format(err))
+  write_dataset_card(output, repo_id, source_repo=source_repo, seed=seed)
   if hasattr(api, "upload_large_folder"):
     # Resumable, chunked, and skips files already present with the same hash.
     api.upload_large_folder(
@@ -213,6 +282,8 @@ def _parser() -> argparse.ArgumentParser:
   parser.add_argument("--public", action="store_true", help="create a public repo (default private)")
   parser.add_argument("--seed", type=int, default=None, help="master seed to print in the card")
   parser.add_argument("--source-repo", default="p1neapplechoco/kubric")
+  parser.add_argument("--no-sync-remote", action="store_true",
+                      help="do not merge with existing remote manifest.jsonl on Hugging Face")
   parser.add_argument("--card-only", action="store_true", help="only (re)write README.md, do not upload")
   return parser
 
@@ -225,7 +296,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
   url = publish_dataset(
       args.output, args.repo_id, token=args.token, private=not args.public,
-      source_repo=args.source_repo, seed=args.seed,
+      source_repo=args.source_repo, seed=args.seed, sync_remote=not args.no_sync_remote,
   )
   print(url)
   return 0
