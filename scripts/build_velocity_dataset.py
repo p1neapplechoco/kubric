@@ -178,6 +178,8 @@ def build_manifest(output: Path, splits: Mapping[str, float] = DEFAULT_SPLITS) -
         "subject_shape": next(o["shape"] for o in payload["scene"]["objects"] if o["object_id"] == payload["subject_id"]),
         "roles": payload["roles"],
         "material_families": {oid: p["material_family"] for oid, p in payload["physics"].items()},
+        "masses": {o["object_id"]: round(float(o["mass"]), 3) for o in payload["scene"]["objects"] if not o.get("static", False)},
+        "sizes": {o["object_id"]: [round(float(x), 3) for x in o["size"]] for o in payload["scene"]["objects"] if not o.get("static", False)},
         "factual_velocity": payload["factual_velocity"],
         "counterfactual_velocity": payload["counterfactual_velocity"],
         "heading_change_rad": payload["metadata"]["heading_change_rad"],

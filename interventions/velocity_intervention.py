@@ -552,7 +552,16 @@ def sample_instance(
   scene_ranges = ranges["scene"]
   floor_ranges = ranges["floor"]
   physics_ranges = ranges["physics"]
-  mass = float(ranges["objects"]["mass"])
+  objects_mass_spec = ranges["objects"]["mass"]
+  subject_mass_spec = ranges.get("subject", {}).get("mass", objects_mass_spec)
+
+  def _draw_mass(role: str) -> float:
+    spec = subject_mass_spec if role == "subject" else objects_mass_spec
+    if isinstance(spec, (list, tuple)):
+      return float(_uniform(physics_rng, (float(spec[0]), float(spec[1]))))
+    elif spec == "coupled":
+      return 1.0  # populated in coupled_physics loop below
+    return float(spec)
 
   bodies, factual_velocity, counterfactual_velocity = _sample_layout(ranges, rng)
   floor_id = str(floor_ranges.get("object_id", "floor"))
@@ -571,7 +580,8 @@ def sample_instance(
 
   preliminary_objects = [floor] + [
       ObjectConfig(
-          object_id=body.object_id, shape=body.shape, size=body.size, mass=mass,
+          object_id=body.object_id, shape=body.shape, size=body.size,
+          mass=_draw_mass(body.role),
           position=body.position, quaternion=body.quaternion,
           metadata={"role": body.role},
       )
@@ -605,7 +615,7 @@ def sample_instance(
     visual_objects.append(item)
   family_by_id = {item.object_id: item.material.family for item in visual_objects}
 
-  # Physics coupled to the sampled material family; mass stays fixed.
+  # Physics coupled to the sampled material family.
   physics: Dict[str, Mapping[str, Any]] = {}
   final_objects = []
   for item in preliminary.objects:
@@ -618,6 +628,8 @@ def sample_instance(
       final_objects.append(item)
       continue
     coupled = materials.coupled_physics(physics_rng, family, _volume(item.shape, item.size))
+    item_mass = coupled["mass"] if ranges["objects"].get("mass") == "coupled" else item.mass
+    item_mass = round(float(item_mass), 4)
     physics[item.object_id] = {
         "material_family": family,
         "rolling_friction": _uniform(physics_rng, _pair(physics_ranges, "rolling_friction")),
@@ -625,6 +637,7 @@ def sample_instance(
         "linear_damping": float(physics_ranges.get("linear_damping", 0.0)),
         "angular_damping": float(physics_ranges.get("angular_damping", 0.0)),
         "effective_density": coupled["effective_density"],
+        "mass": item_mass,
     }
     velocity = (0.0, 0.0, 0.0)
     angular = (0.0, 0.0, 0.0)
@@ -636,7 +649,7 @@ def sample_instance(
       if spin and speed > 0.0:
         angular = (-velocity[1] / speed * spin, velocity[0] / speed * spin, 0.0)
     final_objects.append(dataclasses.replace(
-        item, friction=coupled["friction"], restitution=coupled["restitution"],
+        item, mass=item_mass, friction=coupled["friction"], restitution=coupled["restitution"],
         linear_velocity=velocity, angular_velocity=angular,
     ))
   scene = dataclasses.replace(preliminary, objects=tuple(final_objects))

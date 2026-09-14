@@ -32,14 +32,14 @@ floor:
 
 objects:
   count: [4, 6]                 # dynamic bodies INCLUDING the subject (inclusive)
-  mass: 1.0                     # fixed for every dynamic body
+  mass: [0.5, 3.5]              # mass range [low, high] in kg (sampled per dynamic body)
   shapes:                       # non-subject shape weights
     sphere: 0.45
     cube: 0.35
     cylinder: 0.20
-  size: [0.16, 0.30]            # primary half-extent / radius
-  aspect_ratio: [0.7, 1.4]      # z half-extent relative to primary (cube, cylinder)
-  min_gap: 0.12                 # minimum free space between any two bodies at t=0
+  size: [0.12, 0.38]            # primary half-extent / radius (widened for visual & physical diversity)
+  aspect_ratio: [0.6, 1.5]      # z half-extent relative to primary (cube, cylinder)
+  min_gap: 0.10                 # minimum free space between any two bodies at t=0
   require_sphere_and_box: true  # guarantees rolling and sliding bodies in every scene
 
 subject:
@@ -47,7 +47,8 @@ subject:
   shapes:
     sphere: 0.6
     cube: 0.4
-  size: [0.20, 0.30]
+  size: [0.16, 0.36]            # primary half-extent / radius for subject
+  mass: [0.6, 3.5]              # mass range [low, high] in kg for subject
   start_x: [-2.8, -2.2]
   start_y: [-0.5, 0.5]
   speed: [3.5, 6.5]             # |v0| in m/s

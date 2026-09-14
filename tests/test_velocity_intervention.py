@@ -41,8 +41,17 @@ def test_scene_matches_dataset_configuration(ranges, spec):
   dynamic = [item for item in spec.scene.objects if not item.static]
   low, high = ranges["objects"]["count"]
   assert low <= len(dynamic) <= high
-  # Fixed mass for every dynamic body.
-  assert {item.mass for item in dynamic} == {float(ranges["objects"]["mass"])}
+  # Mass bounds for dynamic bodies (sampled per body when range is provided).
+  mass_spec = ranges["objects"]["mass"]
+  if isinstance(mass_spec, (list, tuple)):
+    m_low, m_high = mass_spec
+    for item in dynamic:
+      assert m_low <= item.mass <= m_high
+    assert len({item.mass for item in dynamic}) > 1
+  else:
+    assert {item.mass for item in dynamic} == {float(mass_spec)}
+  # Sizes vary across dynamic bodies.
+  assert len({tuple(item.size) for item in dynamic}) > 1
   # Exactly one subject with a planar initial velocity; nothing else moves at t=0.
   subjects = [item for item in dynamic if spec.roles[item.object_id] == "subject"]
   assert len(subjects) == 1 and subjects[0].object_id == spec.subject_id
